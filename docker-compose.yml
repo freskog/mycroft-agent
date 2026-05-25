@@ -1,0 +1,17 @@
+services:
+  dev:
+    build: .
+    volumes:
+      - .:/workspace
+      - sbt-cache:/root/.sbt
+      - ivy-cache:/root/.cache/coursier
+    ports:
+      - "8080:8080"
+    working_dir: /workspace
+    command: sbt
+    stdin_open: true
+    tty: true
+
+volumes:
+  sbt-cache:
+  ivy-cache:
