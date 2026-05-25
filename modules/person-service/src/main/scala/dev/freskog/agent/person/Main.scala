@@ -20,6 +20,7 @@ object Main extends ZIOAppDefault {
   def run: ZIO[Any, Any, Any] = {
     val dbPath = sys.env.getOrElse("PERSON_SERVICE_DB", defaultDbPath)
     val port   = sys.env.getOrElse("PERSON_SERVICE_PORT", "8080").toInt
+    val host   = sys.env.getOrElse("PERSON_SERVICE_HOST", "0.0.0.0")
     val doSeed = sys.env.getOrElse("PERSON_SERVICE_SEED", "false").toLowerCase == "true"
 
     val program = for {
@@ -47,7 +48,7 @@ object Main extends ZIOAppDefault {
         )
 
         routes = Routes.make(service)
-        _ <- Server.serve(routes).provide(Server.defaultWith(_.binding("127.0.0.1", port)))
+        _ <- Server.serve(routes).provide(Server.defaultWith(_.binding(host, port)))
       } yield ()
     }
   }

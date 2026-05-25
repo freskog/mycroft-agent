@@ -56,7 +56,7 @@ safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
 
 - `fred_private` — Fred's personal items
 - `fred_work` — Fred's work items
-- `wife_private` — Wife's personal items
+- `paula_private` — Paula's personal items
 - `family_shared` — Shared family items
 
 ## Policy Boundaries

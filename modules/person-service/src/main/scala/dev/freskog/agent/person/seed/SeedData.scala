@@ -14,12 +14,12 @@ object SeedData {
 
     val persons = List(
       Person("fred", "Fred", "Europe/London", Some("en-GB"), active = true),
-      Person("wife", "Wife", "Europe/London", None, active = true)
+      Person("paula", "Paula", "Europe/London", None, active = true)
     )
 
     val scopes = List(
       PersonScope("fred_private", "Fred Private", Some("fred"), ScopeKind.Private),
-      PersonScope("wife_private", "Wife Private", Some("wife"), ScopeKind.Private),
+      PersonScope("paula_private", "Paula Private", Some("paula"), ScopeKind.Private),
       PersonScope("family_shared", "Family Shared", None, ScopeKind.Shared),
       PersonScope("fred_work", "Fred Work", Some("fred"), ScopeKind.Work)
     )
@@ -28,8 +28,8 @@ object SeedData {
       PersonScopeRole("fred", "fred_private", ScopeRole.Owner),
       PersonScopeRole("fred", "fred_work", ScopeRole.Owner),
       PersonScopeRole("fred", "family_shared", ScopeRole.Owner),
-      PersonScopeRole("wife", "wife_private", ScopeRole.Owner),
-      PersonScopeRole("wife", "family_shared", ScopeRole.Owner)
+      PersonScopeRole("paula", "paula_private", ScopeRole.Owner),
+      PersonScopeRole("paula", "family_shared", ScopeRole.Owner)
     )
 
     for {

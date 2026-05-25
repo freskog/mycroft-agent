@@ -18,10 +18,15 @@ object Sqlite {
         conn <- ZIO.acquireRelease(
           ZIO.attemptBlocking {
             val c = DriverManager.getConnection(s"jdbc:sqlite:$dbPath")
+            c.setAutoCommit(true)
             if (!dbPath.contains(":memory:")) {
-              c.createStatement().execute("PRAGMA journal_mode=WAL")
+              val s1 = c.createStatement()
+              s1.execute("PRAGMA journal_mode=WAL")
+              s1.close()
             }
-            c.createStatement().execute("PRAGMA foreign_keys=ON")
+            val s2 = c.createStatement()
+            s2.execute("PRAGMA foreign_keys=ON")
+            s2.close()
             c
           }
         )(c => ZIO.attemptBlocking(c.close()).ignore)

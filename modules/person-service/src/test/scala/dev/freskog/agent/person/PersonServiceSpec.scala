@@ -38,7 +38,7 @@ object PersonServiceSpec extends ZIOSpecDefault {
         } yield assertTrue(
           persons.length == 2,
           persons.exists(_.id == "fred"),
-          persons.exists(_.id == "wife")
+          persons.exists(_.id == "paula")
         )
       }
     },
