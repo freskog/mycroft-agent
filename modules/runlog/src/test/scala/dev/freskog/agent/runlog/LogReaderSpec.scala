@@ -62,7 +62,7 @@ object LogReaderSpec extends ZIOSpecDefault {
           runs <- LogReader.list(cwd)
         } yield assertTrue(
           runs.length == 1,
-          runs.head.runId == testRunId
+          runs.headOption.map(_.runId).contains(testRunId)
         )
       }
     },
@@ -86,7 +86,7 @@ object LogReaderSpec extends ZIOSpecDefault {
           matches <- LogReader.grep(cwd, testRunId, "stderr", "error")
         } yield assertTrue(
           matches.length == 1,
-          matches.head == "error: bad thing"
+          matches.headOption.contains("error: bad thing")
         )
       }
     },

@@ -1,3 +1,10 @@
+---
+name: inbox-triage
+description: Process incoming email and messages, extracting commitments and memory proposals from actionable items.
+version: 1.0.0
+capabilities: [person-cli, safe-run]
+---
+
 # Inbox Triage
 
 ## Purpose

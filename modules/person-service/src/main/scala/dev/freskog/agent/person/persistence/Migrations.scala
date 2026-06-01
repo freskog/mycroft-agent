@@ -84,16 +84,94 @@ object Migrations {
       |  scope_id TEXT,
       |  payload_json TEXT NOT NULL,
       |  created_at TEXT NOT NULL
-      |)""".stripMargin
+      |)""".stripMargin,
+
+    // V2: Goals + goal evidence
+    """CREATE TABLE IF NOT EXISTS goals (
+      |  id TEXT PRIMARY KEY,
+      |  owner_person_id TEXT NOT NULL,
+      |  scope_id TEXT NOT NULL,
+      |  title TEXT NOT NULL,
+      |  outcome TEXT NOT NULL,
+      |  evidence_rule TEXT NOT NULL,
+      |  constraints_json TEXT,
+      |  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','blocked','done','cancelled')),
+      |  blocked_reason TEXT,
+      |  source TEXT,
+      |  created_at TEXT NOT NULL,
+      |  updated_at TEXT NOT NULL,
+      |  FOREIGN KEY (owner_person_id) REFERENCES persons(id),
+      |  FOREIGN KEY (scope_id) REFERENCES scopes(id)
+      |)""".stripMargin,
+
+    """CREATE TABLE IF NOT EXISTS goal_evidence (
+      |  id TEXT PRIMARY KEY,
+      |  goal_id TEXT NOT NULL,
+      |  kind TEXT NOT NULL,
+      |  ref TEXT NOT NULL,
+      |  note TEXT,
+      |  recorded_at TEXT NOT NULL,
+      |  FOREIGN KEY (goal_id) REFERENCES goals(id)
+      |)""".stripMargin,
+
+    "CREATE INDEX IF NOT EXISTS idx_goals_owner_scope_status ON goals(owner_person_id, scope_id, status)",
+
+    "CREATE INDEX IF NOT EXISTS idx_goal_evidence_goal ON goal_evidence(goal_id)",
+
+    // V3a: temporal + provenance on memory_items
+    "ALTER TABLE memory_items ADD COLUMN superseded_by_id TEXT",
+    "ALTER TABLE memory_items ADD COLUMN valid_from TEXT",
+    "ALTER TABLE memory_items ADD COLUMN valid_until TEXT",
+    "ALTER TABLE memory_items ADD COLUMN origin_event_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_memory_items_subject ON memory_items(person_id, scope_id, kind, status)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_items_supersed ON memory_items(superseded_by_id)",
+
+    // V3b: broaden audit_events for episodic use
+    "ALTER TABLE audit_events ADD COLUMN category TEXT NOT NULL DEFAULT 'state'",
+    "ALTER TABLE audit_events ADD COLUMN text TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_audit_events_cat ON audit_events(category, scope_id, created_at)",
+
+    // V3c: FTS5 indexes with external-content + sync triggers
+    "CREATE VIRTUAL TABLE IF NOT EXISTS memory_items_fts USING fts5(text, content='memory_items', content_rowid='rowid', tokenize='unicode61 remove_diacritics 1')",
+    "INSERT INTO memory_items_fts(rowid, text) SELECT rowid, text FROM memory_items",
+
+    """CREATE TRIGGER IF NOT EXISTS memory_items_ai AFTER INSERT ON memory_items BEGIN
+      |  INSERT INTO memory_items_fts(rowid, text) VALUES (new.rowid, new.text);
+      |END""".stripMargin,
+
+    """CREATE TRIGGER IF NOT EXISTS memory_items_ad AFTER DELETE ON memory_items BEGIN
+      |  INSERT INTO memory_items_fts(memory_items_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+      |END""".stripMargin,
+
+    """CREATE TRIGGER IF NOT EXISTS memory_items_au AFTER UPDATE ON memory_items BEGIN
+      |  INSERT INTO memory_items_fts(memory_items_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+      |  INSERT INTO memory_items_fts(rowid, text) VALUES (new.rowid, new.text);
+      |END""".stripMargin,
+
+    "CREATE VIRTUAL TABLE IF NOT EXISTS audit_events_fts USING fts5(text, payload_json, content='audit_events', content_rowid='rowid', tokenize='unicode61 remove_diacritics 1')",
+    "INSERT INTO audit_events_fts(rowid, text, payload_json) SELECT rowid, COALESCE(text, ''), payload_json FROM audit_events",
+
+    """CREATE TRIGGER IF NOT EXISTS audit_events_ai AFTER INSERT ON audit_events BEGIN
+      |  INSERT INTO audit_events_fts(rowid, text, payload_json) VALUES (new.rowid, COALESCE(new.text, ''), new.payload_json);
+      |END""".stripMargin,
+
+    """CREATE TRIGGER IF NOT EXISTS audit_events_ad AFTER DELETE ON audit_events BEGIN
+      |  INSERT INTO audit_events_fts(audit_events_fts, rowid, text, payload_json) VALUES ('delete', old.rowid, COALESCE(old.text, ''), old.payload_json);
+      |END""".stripMargin,
+
+    """CREATE TRIGGER IF NOT EXISTS audit_events_au AFTER UPDATE ON audit_events BEGIN
+      |  INSERT INTO audit_events_fts(audit_events_fts, rowid, text, payload_json) VALUES ('delete', old.rowid, COALESCE(old.text, ''), old.payload_json);
+      |  INSERT INTO audit_events_fts(rowid, text, payload_json) VALUES (new.rowid, COALESCE(new.text, ''), new.payload_json);
+      |END""".stripMargin
   )
 
-  def migrate(db: Sqlite): Task[Unit] =
+  def migrate(db: Sqlite): IO[dev.freskog.agent.common.AgentError, Unit] =
     for {
-      _ <- db.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
-      current <- db.queryOne("SELECT version FROM schema_version")(_.getInt("version"))
-      currentVersion = current.getOrElse(0)
-      toApply = migrations.drop(currentVersion)
-      _ <- ZIO.foreach(toApply.zipWithIndex) { case (sql, idx) =>
+      _              <- db.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+      current        <- db.queryOne("SELECT version FROM schema_version")(_.getInt("version"))
+      currentVersion  = current.getOrElse(0)
+      toApply         = migrations.drop(currentVersion)
+      _              <- ZIO.foreach(toApply.zipWithIndex) { case (sql, idx) =>
         val version = currentVersion + idx + 1
         db.execute(sql) *> {
           if (currentVersion == 0 && idx == 0)

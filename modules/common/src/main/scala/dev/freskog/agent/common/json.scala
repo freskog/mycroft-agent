@@ -131,6 +131,62 @@ object JsonCodecs {
   implicit val approvalStatusDecoder: JsonDecoder[ApprovalStatus] =
     JsonDecoder.string.mapOrFail(ApprovalStatus.fromString)
 
+  // --- GoalStatus ---
+  implicit val goalStatusEncoder: JsonEncoder[GoalStatus] =
+    JsonEncoder.string.contramap(GoalStatus.asString)
+
+  implicit val goalStatusDecoder: JsonDecoder[GoalStatus] =
+    JsonDecoder.string.mapOrFail(GoalStatus.fromString)
+
+  // --- AgentError (encoder only; errors flow outward) ---
+  implicit val agentErrorEncoder: JsonEncoder[AgentError] = {
+    import zio.json.ast.Json
+    JsonEncoder[Json].contramap {
+      case e @ AgentError.NotFound(target, id) =>
+        Json.Obj(
+          "type"       -> Json.Str("not_found"),
+          "targetType" -> Json.Str(target),
+          "id"         -> Json.Str(id),
+          "message"    -> Json.Str(e.message)
+        )
+      case AgentError.BadRequest(m) =>
+        Json.Obj("type" -> Json.Str("bad_request"), "message" -> Json.Str(m))
+      case AgentError.Validation(m) =>
+        Json.Obj("type" -> Json.Str("validation"), "message" -> Json.Str(m))
+      case AgentError.Persistence(m, _) =>
+        Json.Obj("type" -> Json.Str("persistence"), "message" -> Json.Str(m))
+      case AgentError.HttpFailed(m, _) =>
+        Json.Obj("type" -> Json.Str("http_failed"), "message" -> Json.Str(m))
+      case AgentError.HttpBadStatus(m, s, body) =>
+        Json.Obj(
+          "type"    -> Json.Str("http_bad_status"),
+          "message" -> Json.Str(m),
+          "status"  -> Json.Num(s),
+          "body"    -> Json.Str(body)
+        )
+      case AgentError.DecodeFailed(m, _) =>
+        Json.Obj("type" -> Json.Str("decode_failed"), "message" -> Json.Str(m))
+      case AgentError.Bug(m, _) =>
+        Json.Obj("type" -> Json.Str("bug"), "message" -> Json.Str(m))
+    }
+  }
+
+  // --- Newtype IDs (bare-string codecs) ---
+  private def idCodec[A](wrap: String => A, unwrap: A => String): JsonCodec[A] =
+    JsonCodec(
+      JsonEncoder.string.contramap(unwrap),
+      JsonDecoder.string.map(wrap)
+    )
+
+  implicit val personIdCodec: JsonCodec[PersonId]               = idCodec(PersonId.apply, _.value)
+  implicit val scopeIdCodec: JsonCodec[ScopeId]                 = idCodec(ScopeId.apply, _.value)
+  implicit val memoryIdCodec: JsonCodec[MemoryId]               = idCodec(MemoryId.apply, _.value)
+  implicit val goalIdCodec: JsonCodec[GoalId]                   = idCodec(GoalId.apply, _.value)
+  implicit val eventIdCodec: JsonCodec[EventId]                 = idCodec(EventId.apply, _.value)
+  implicit val commitmentIdCodec: JsonCodec[CommitmentId]       = idCodec(CommitmentId.apply, _.value)
+  implicit val approvalIdCodec: JsonCodec[ApprovalId]           = idCodec(ApprovalId.apply, _.value)
+  implicit val goalEvidenceIdCodec: JsonCodec[GoalEvidenceId]   = idCodec(GoalEvidenceId.apply, _.value)
+
   // --- Domain types ---
   implicit val runMetadataCodec: JsonCodec[RunMetadata]     = DeriveJsonCodec.gen[RunMetadata]
   implicit val errorResponseCodec: JsonCodec[ErrorResponse] = DeriveJsonCodec.gen[ErrorResponse]
@@ -141,4 +197,10 @@ object JsonCodecs {
   implicit val memoryItemCodec: JsonCodec[MemoryItem]       = DeriveJsonCodec.gen[MemoryItem]
   implicit val approvalCodec: JsonCodec[Approval]           = DeriveJsonCodec.gen[Approval]
   implicit val auditEventCodec: JsonCodec[AuditEvent]       = DeriveJsonCodec.gen[AuditEvent]
+  implicit val goalCodec: JsonCodec[Goal]                   = DeriveJsonCodec.gen[Goal]
+  implicit val goalEvidenceCodec: JsonCodec[GoalEvidence]   = DeriveJsonCodec.gen[GoalEvidence]
+  implicit val goalWithEvidenceCodec: JsonCodec[GoalWithEvidence] = DeriveJsonCodec.gen[GoalWithEvidence]
+  implicit val memoryHitCodec: JsonCodec[MemoryHit]         = DeriveJsonCodec.gen[MemoryHit]
+  implicit val eventHitCodec: JsonCodec[EventHit]           = DeriveJsonCodec.gen[EventHit]
+  implicit val contextBundleCodec: JsonCodec[ContextBundle] = DeriveJsonCodec.gen[ContextBundle]
 }

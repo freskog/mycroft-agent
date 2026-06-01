@@ -1,12 +1,17 @@
-# Person Service API
+---
+name: person-service
+description: Interact with the trusted person-service sidecar for durable family/work state — people, scopes, commitments, memory, approvals, goals, audit.
+version: 1.0.0
+capabilities: [person-cli, safe-run]
+---
+
+# Person Service
 
 ## Purpose
 
-Interact with the trusted person-service sidecar for durable personal/family state.
+Interact with the trusted person-service sidecar for durable personal and family state. The sidecar runs outside the sandbox and owns the database, credentials, and approval policy. The agent never touches the database directly — it always goes through the `person` CLI (which must itself run inside `safe-run`).
 
 ## Commands
-
-All commands go through the `person` CLI, wrapped in `safe-run`.
 
 ### Health check
 
@@ -36,40 +41,17 @@ safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
     --payload-json '{\"summary\":\"Family dinner\",\"date\":\"2026-05-30\"}'"
 ```
 
-## Memory Kinds
-
-- `preference` — how the person likes things done
-- `fact` — factual information about the person or their world
-- `project_note` — context about ongoing work
-- `procedure_note` — how to do a specific recurring task
+Commitments are covered in the dedicated `commitments` skill. Goals and plans are covered in `goals` and `plans`. Semantic facts and the episodic event log are covered in `memory` and `events`.
 
 ## Rules
 
-1. Always check health first if unsure whether service is running.
+1. Always check health first if unsure whether the service is running.
 2. Memory proposals are not automatically accepted — they require human review.
 3. Never propose memory that contains credentials, tokens, or passwords.
 4. Approval requests are for actions that need human authorization before execution.
 5. The `person` CLI must be used inside `safe-run` — never call the HTTP API directly.
 6. If the service is unavailable, report the error and stop — do not retry endlessly.
 
-## Available Scopes
+## Reference
 
-- `fred_private` — Fred's personal items
-- `fred_work` — Fred's work items
-- `paula_private` — Paula's personal items
-- `family_shared` — Shared family items
-
-## Policy Boundaries
-
-The agent **can**:
-- Propose commitments
-- List commitments
-- Propose memory
-- Request approval
-
-The agent **cannot**:
-- Accept or mark commitments done
-- Delete commitments or memory
-- Write calendar events
-- Send email
-- Mutate credentials
+For memory kinds, scope ids, and full policy boundaries see `references/api.md` in this skill directory.

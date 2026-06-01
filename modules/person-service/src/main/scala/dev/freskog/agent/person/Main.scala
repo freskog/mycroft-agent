@@ -35,7 +35,7 @@ object Main extends ZIOAppDefault {
       for {
         db <- Sqlite.live(dbPath).build.map(_.get[Sqlite])
         _  <- Migrations.migrate(db)
-        _  <- ZIO.when(doSeed)(SeedData.seed(db).catchAll(e => ZIO.logWarning(s"Seed skipped: ${e.getMessage}")))
+        _  <- ZIO.when(doSeed)(SeedData.seed(db).catchAll(e => ZIO.logWarning(s"Seed skipped: ${e.message}")))
 
         service = PersonService.live(
           Repos.sqlitePersonRepo(db),
@@ -44,7 +44,9 @@ object Main extends ZIOAppDefault {
           Repos.sqliteCommitmentRepo(db),
           Repos.sqliteMemoryRepo(db),
           Repos.sqliteApprovalRepo(db),
-          Repos.sqliteAuditRepo(db)
+          Repos.sqliteAuditRepo(db),
+          Repos.sqliteGoalRepo(db),
+          Repos.sqliteGoalEvidenceRepo(db)
         )
 
         routes = Routes.make(service)

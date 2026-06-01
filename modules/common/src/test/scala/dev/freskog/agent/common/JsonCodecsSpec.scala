@@ -106,25 +106,29 @@ object JsonCodecsSpec extends ZIOSpecDefault {
     ),
     suite("Person")(
       test("round-trip with optional locale") {
-        val p = Person("p1", "Fred", "Europe/London", Some("en-GB"), active = true)
+        val p = Person(PersonId("p1"), "Fred", "Europe/London", Some("en-GB"), active = true)
         val json = p.toJson
         val back = json.fromJson[Person]
         assertTrue(back == Right(p))
       },
       test("round-trip without locale") {
-        val p = Person("p2", "Wife", "Europe/London", None, active = true)
+        val p = Person(PersonId("p2"), "Paula", "Europe/London", None, active = true)
         val json = p.toJson
         val back = json.fromJson[Person]
         assertTrue(back == Right(p))
+      },
+      test("Person.id encodes as bare string") {
+        val p = Person(PersonId("p1"), "Fred", "Europe/London", None, active = true)
+        assertTrue(p.toJson.contains("\"id\":\"p1\""))
       }
     ),
     suite("Commitment")(
       test("round-trip") {
         val now = Instant.parse("2026-05-25T12:00:00Z")
         val c = Commitment(
-          id = "c1",
-          ownerPersonId = "p1",
-          scopeId = "s1",
+          id = CommitmentId("c1"),
+          ownerPersonId = PersonId("p1"),
+          scopeId = ScopeId("s1"),
           status = CommitmentStatus.Proposed,
           text = "Send update",
           source = "email:123",
@@ -142,9 +146,9 @@ object JsonCodecsSpec extends ZIOSpecDefault {
       test("round-trip") {
         val now = Instant.parse("2026-05-25T12:00:00Z")
         val m = MemoryItem(
-          id = "m1",
-          personId = Some("p1"),
-          scopeId = Some("s1"),
+          id = MemoryId("m1"),
+          personId = Some(PersonId("p1")),
+          scopeId = Some(ScopeId("s1")),
           status = MemoryStatus.Proposed,
           kind = MemoryKind.Preference,
           text = "Prefer draft-only email actions",
@@ -162,10 +166,10 @@ object JsonCodecsSpec extends ZIOSpecDefault {
       test("round-trip") {
         val now = Instant.parse("2026-05-25T12:00:00Z")
         val a = Approval(
-          id = "a1",
+          id = ApprovalId("a1"),
           requestedBy = "agent",
-          requiredPersonId = Some("p1"),
-          scopeId = Some("s1"),
+          requiredPersonId = Some(PersonId("p1")),
+          scopeId = Some(ScopeId("s1")),
           actionType = "calendar.propose_event",
           payloadJson = """{"summary":"meeting"}""",
           status = ApprovalStatus.Requested,
@@ -181,18 +185,35 @@ object JsonCodecsSpec extends ZIOSpecDefault {
       test("round-trip") {
         val now = Instant.parse("2026-05-25T12:00:00Z")
         val e = AuditEvent(
-          id = "e1",
+          id = EventId("e1"),
           actor = "agent",
           action = "commitment.propose",
+          category = "state",
           targetType = "commitment",
           targetId = Some("c1"),
-          scopeId = Some("s1"),
+          scopeId = Some(ScopeId("s1")),
+          text = None,
           payloadJson = "{}",
           createdAt = now
         )
         val json = e.toJson
         val back = json.fromJson[AuditEvent]
         assertTrue(back == Right(e))
+      }
+    ),
+    suite("AgentError")(
+      test("NotFound encodes structured shape") {
+        val e: AgentError = AgentError.NotFound("memory_item", "m1")
+        val s = e.toJson
+        assertTrue(
+          s.contains("\"type\":\"not_found\""),
+          s.contains("\"targetType\":\"memory_item\""),
+          s.contains("\"id\":\"m1\"")
+        )
+      },
+      test("BadRequest encodes type+message") {
+        val e: AgentError = AgentError.BadRequest("bad")
+        assertTrue(e.toJson.contains("\"type\":\"bad_request\""), e.toJson.contains("\"message\":\"bad\""))
       }
     )
   )

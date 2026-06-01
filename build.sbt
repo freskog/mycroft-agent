@@ -19,7 +19,7 @@ lazy val commonSettings = Seq(
 )
 
 lazy val root = (project in file("."))
-  .aggregate(common, safeRun, runlog, personCli, personService)
+  .aggregate(common, safeRun, runlog, personCli, personService, runtime)
   .settings(
     name := "personal-agent",
     publish / skip := true
@@ -106,6 +106,25 @@ lazy val personCli = (project in file("modules/person-cli"))
       "dev.zio" %% "zio-json"     % zioJsonVersion,
       "dev.zio" %% "zio-test"     % zioVersion % Test,
       "dev.zio" %% "zio-test-sbt" % zioVersion % Test
+    ),
+    nativeImageOptions ++= Seq(
+      "--no-fallback",
+      "-H:+ReportExceptionStackTraces"
+    )
+  )
+
+lazy val runtime = (project in file("modules/runtime"))
+  .dependsOn(common)
+  .enablePlugins(NativeImagePlugin)
+  .settings(commonSettings)
+  .settings(
+    name := "runtime",
+    Compile / mainClass := Some("dev.freskog.agent.runtime.Main"),
+    libraryDependencies ++= Seq(
+      "dev.zio"    %% "zio-cli"      % zioCliVersion,
+      "org.xerial"  % "sqlite-jdbc"  % sqliteVersion,
+      "dev.zio"    %% "zio-test"     % zioVersion % Test,
+      "dev.zio"    %% "zio-test-sbt" % zioVersion % Test
     ),
     nativeImageOptions ++= Seq(
       "--no-fallback",

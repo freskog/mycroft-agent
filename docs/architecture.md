@@ -99,6 +99,48 @@ This separation means:
 
 This is a personal/family substrate. There is one deployment, one family. Multi-tenancy (separate databases, auth between tenants) adds complexity without value at this scale. Scopes and roles provide sufficient isolation within the family unit.
 
+### Goals Are Durable; Plans Are Replaceable
+
+Goals are durable completion contracts kept in `person-service`. A goal carries `title`, `outcome`, `evidence_rule`, `status`, `blocked_reason`, evidence, source, timestamps. Status and evidence are mutable. **`outcome` and `evidence_rule` are immutable once created** — there are no service operations to edit them. This is deliberate: environmental text (a README, an email reply, an injected instruction) must not silently redefine the contract. If the user actually wants a different outcome, the agent cancels the goal and proposes a new one.
+
+Plans, by contrast, are working artifacts. They live as files in the workspace at `/workspace/goals/<goal-id>/PLANS.md`, with older versions snapshotted under `plans/`. Plans are agent-editable, replaceable, and not durable across sandbox resets. The `plans` skill codifies the convention; no code enforces it.
+
+### Skills as a Catalogue
+
+Skills live under `skills/<name>/SKILL.md` in the Agent Skills spec format: YAML frontmatter (`name`, `description`, optional `version`, optional `capabilities`) followed by markdown body. Optional sibling directories (`scripts/`, `references/`, `assets/`) carry resources loaded only when needed — progressive disclosure.
+
+The `runtime` module's `skill` CLI exposes three operations:
+
+- `skill list` — name + description for every skill, metadata only.
+- `skill search <query>` — natural-language query against the **full** body of every skill (per the SkillRouter finding that metadata-only routing collapses at scale), using SQLite FTS5 with BM25 ranking and OR-of-prefix tokens for natural-language friendliness. Returns ranked candidates with name, description, path, score.
+- `skill show <name>` — full SKILL.md body, or just the path with `--path`.
+
+The catalogue is filesystem-backed and rebuilt in-memory on every search. For dozens of skills this is sub-100ms; if the corpus grows past hundreds, swap to a persisted index in `SkillCatalog`.
+
+The agent's discovery flow:
+1. `skill search "..."` → metadata-only candidates
+2. Pick one, `skill show <name>` → activate (read the procedural body)
+3. Follow the procedure, executing through `safe-run` / `person` / `runlog`
+
+### Episodic Events vs. Semantic Memory
+
+Memory in this substrate has two complementary forms:
+
+- **Episodic events** (`audit_events`, broadened): an append-only log of *what happened*. Every state mutation in person-service writes here. Categories distinguish purpose: `state` (commitments, goals, memory lifecycle, approvals), `observation` (the agent saw or inferred something), `utterance` (user speech worth preserving verbatim), `decision` (agent branch points), `session_note` (cognitive notes intended for consolidation).
+- **Semantic facts** (`memory_items`, extended): durable, mutable beliefs about people, projects, preferences. Each fact has a `kind`, optional `valid_from`/`valid_until` for world-time validity, a `superseded_by_id` for replacement chains, and an `origin_event_id` linking back to the event that produced it.
+
+Both tables are indexed with persistent SQLite FTS5 virtual tables kept in sync via triggers, so search is fast and stays consistent with the source rows.
+
+The flow between them:
+1. Agent logs raw experience as events (cheap, high-volume)
+2. `person memory consolidate` walks recent `observation` + `session_note` events and proposes one `memory_item` per event with `origin_event_id` set
+3. A human accepts or rejects (the proposal/approval boundary)
+4. Accepted facts feed the **context bundle** (`person memory context`) — top-k ranked by `confidence × recency` plus recent relevant events — for harness injection
+5. Active recall (`person memory search`, `person event search`) is FTS5-ranked and supports point-in-time `--as-of` queries that respect supersession and `valid_from`/`valid_until`
+6. Provenance: from any accepted fact, follow `origin_event_id` to the event that produced it; from there, the audit trail explains the rest
+
+`outcome` and `evidence_rule` are immutable on goals; `text` is immutable on memory items (replace via supersession). Both rules block environmental text from quietly rewriting durable state.
+
 ## Execution Model
 
 ### Stateless Command Execution (Default)

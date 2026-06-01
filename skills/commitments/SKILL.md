@@ -1,3 +1,10 @@
+---
+name: commitments
+description: Propose and list durable obligations (commitments) for people via the person-service.
+version: 1.0.0
+capabilities: [person-cli, safe-run]
+---
+
 # Commitment Tracking
 
 ## Purpose

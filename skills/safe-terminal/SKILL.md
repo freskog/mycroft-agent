@@ -1,3 +1,10 @@
+---
+name: safe-terminal
+description: Execute shell commands safely with bounded output, timeouts, and a log inspector for large results.
+version: 1.0.0
+capabilities: [safe-run, runlog]
+---
+
 # Safe Terminal Execution
 
 ## Purpose

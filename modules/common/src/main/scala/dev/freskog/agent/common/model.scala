@@ -1,6 +1,18 @@
 package dev.freskog.agent.common
 
-import java.time.Instant
+import java.time.{Instant, ZoneOffset}
+import java.time.format.DateTimeFormatter
+
+/** Canonical ISO-8601 timestamp formatter with fixed nanosecond precision so
+ *  values stored as TEXT compare lexicographically against each other.
+ *  `Instant.toString` is variable-precision and would break SQL `<=` ordering. */
+object Time {
+  private val Iso = DateTimeFormatter
+    .ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSS'Z'")
+    .withZone(ZoneOffset.UTC)
+
+  def format(i: Instant): String = Iso.format(i)
+}
 
 sealed trait Shell
 object Shell {
@@ -58,6 +70,18 @@ case class ErrorResponse(
 )
 
 // --- Person-service domain types shared between service and CLI ---
+
+/** Zero-cost newtype wrappers prevent accidentally swapping `PersonId` for
+ *  `ScopeId` etc. through method signatures. JSON encoding is bare-string
+ *  (see JsonCodecs). */
+final case class PersonId(value: String)       extends AnyVal
+final case class ScopeId(value: String)        extends AnyVal
+final case class MemoryId(value: String)       extends AnyVal
+final case class GoalId(value: String)         extends AnyVal
+final case class EventId(value: String)        extends AnyVal
+final case class CommitmentId(value: String)   extends AnyVal
+final case class ApprovalId(value: String)     extends AnyVal
+final case class GoalEvidenceId(value: String) extends AnyVal
 
 sealed trait ScopeKind
 object ScopeKind {
@@ -127,6 +151,13 @@ object MemoryStatus {
     case "archived" => Right(Archived)
     case _          => Left(s"Unknown memory status: $s")
   }
+
+  def asString(s: MemoryStatus): String = s match {
+    case Proposed => "proposed"
+    case Accepted => "accepted"
+    case Rejected => "rejected"
+    case Archived => "archived"
+  }
 }
 
 sealed trait MemoryKind
@@ -143,6 +174,23 @@ object MemoryKind {
     case "procedure_note"  => Right(ProcedureNote)
     case _                 => Left(s"Unknown memory kind: $s")
   }
+
+  def asString(k: MemoryKind): String = k match {
+    case Preference    => "preference"
+    case Fact          => "fact"
+    case ProjectNote   => "project_note"
+    case ProcedureNote => "procedure_note"
+  }
+}
+
+object EventCategory {
+  val State       = "state"
+  val Observation = "observation"
+  val Utterance   = "utterance"
+  val Decision    = "decision"
+  val SessionNote = "session_note"
+
+  val All: Set[String] = Set(State, Observation, Utterance, Decision, SessionNote)
 }
 
 sealed trait ApprovalStatus
@@ -162,7 +210,7 @@ object ApprovalStatus {
 }
 
 case class Person(
-  id: String,
+  id: PersonId,
   displayName: String,
   timezone: String,
   defaultLocale: Option[String],
@@ -170,22 +218,22 @@ case class Person(
 )
 
 case class Scope(
-  id: String,
+  id: ScopeId,
   name: String,
-  ownerPersonId: Option[String],
+  ownerPersonId: Option[PersonId],
   kind: ScopeKind
 )
 
 case class PersonScopeRole(
-  personId: String,
-  scopeId: String,
+  personId: PersonId,
+  scopeId: ScopeId,
   role: ScopeRole
 )
 
 case class Commitment(
-  id: String,
-  ownerPersonId: String,
-  scopeId: String,
+  id: CommitmentId,
+  ownerPersonId: PersonId,
+  scopeId: ScopeId,
   status: CommitmentStatus,
   text: String,
   source: String,
@@ -196,23 +244,27 @@ case class Commitment(
 )
 
 case class MemoryItem(
-  id: String,
-  personId: Option[String],
-  scopeId: Option[String],
+  id: MemoryId,
+  personId: Option[PersonId],
+  scopeId: Option[ScopeId],
   status: MemoryStatus,
   kind: MemoryKind,
   text: String,
   source: String,
   confidence: Option[Double],
   createdAt: Instant,
-  updatedAt: Instant
+  updatedAt: Instant,
+  supersededById: Option[MemoryId] = None,
+  validFrom: Option[Instant] = None,
+  validUntil: Option[Instant] = None,
+  originEventId: Option[EventId] = None
 )
 
 case class Approval(
-  id: String,
+  id: ApprovalId,
   requestedBy: String,
-  requiredPersonId: Option[String],
-  scopeId: Option[String],
+  requiredPersonId: Option[PersonId],
+  scopeId: Option[ScopeId],
   actionType: String,
   payloadJson: String,
   status: ApprovalStatus,
@@ -220,13 +272,76 @@ case class Approval(
   decidedAt: Option[Instant]
 )
 
+/** Note: `targetId` is intentionally a `String` — it's a polymorphic foreign
+ *  key whose interpretation depends on `targetType`. `actor` is also a String
+ *  because it can be `"agent"`, a person id, or another synthetic principal. */
 case class AuditEvent(
-  id: String,
+  id: EventId,
   actor: String,
   action: String,
+  category: String,
   targetType: String,
   targetId: Option[String],
-  scopeId: Option[String],
+  scopeId: Option[ScopeId],
+  text: Option[String],
   payloadJson: String,
   createdAt: Instant
+)
+
+case class MemoryHit(item: MemoryItem, score: Double)
+
+case class EventHit(event: AuditEvent, score: Double)
+
+case class ContextBundle(facts: List[MemoryHit], events: List[AuditEvent])
+
+sealed trait GoalStatus
+object GoalStatus {
+  case object Open      extends GoalStatus
+  case object Blocked   extends GoalStatus
+  case object Done      extends GoalStatus
+  case object Cancelled extends GoalStatus
+
+  def fromString(s: String): Either[String, GoalStatus] = s.toLowerCase match {
+    case "open"      => Right(Open)
+    case "blocked"   => Right(Blocked)
+    case "done"      => Right(Done)
+    case "cancelled" => Right(Cancelled)
+    case _           => Left(s"Unknown goal status: $s")
+  }
+
+  def asString(g: GoalStatus): String = g match {
+    case Open      => "open"
+    case Blocked   => "blocked"
+    case Done      => "done"
+    case Cancelled => "cancelled"
+  }
+}
+
+case class Goal(
+  id: GoalId,
+  ownerPersonId: PersonId,
+  scopeId: ScopeId,
+  title: String,
+  outcome: String,
+  evidenceRule: String,
+  constraintsJson: Option[String],
+  status: GoalStatus,
+  blockedReason: Option[String],
+  source: Option[String],
+  createdAt: Instant,
+  updatedAt: Instant
+)
+
+case class GoalEvidence(
+  id: GoalEvidenceId,
+  goalId: GoalId,
+  kind: String,
+  ref: String,
+  note: Option[String],
+  recordedAt: Instant
+)
+
+case class GoalWithEvidence(
+  goal: Goal,
+  evidence: List[GoalEvidence]
 )

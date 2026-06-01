@@ -4,261 +4,472 @@ import dev.freskog.agent.common.{Scope => PersonScope, _}
 
 import zio._
 
+import java.sql.ResultSet
 import java.time.Instant
 
 trait PersonRepo {
-  def create(person: Person): Task[Unit]
-  def findAll: Task[List[Person]]
-  def findById(id: String): Task[Option[Person]]
+  def create(person: Person): IO[AgentError, Unit]
+  def findAll: IO[AgentError, List[Person]]
+  def findById(id: PersonId): IO[AgentError, Option[Person]]
 }
 
 trait ScopeRepo {
-  def create(scope: PersonScope): Task[Unit]
-  def findAll: Task[List[PersonScope]]
+  def create(scope: PersonScope): IO[AgentError, Unit]
+  def findAll: IO[AgentError, List[PersonScope]]
 }
 
 trait ScopeRoleRepo {
-  def create(role: PersonScopeRole): Task[Unit]
-  def findByPerson(personId: String): Task[List[PersonScopeRole]]
+  def create(role: PersonScopeRole): IO[AgentError, Unit]
+  def findByPerson(personId: PersonId): IO[AgentError, List[PersonScopeRole]]
 }
 
 trait CommitmentRepo {
-  def create(commitment: Commitment): Task[Unit]
-  def findAll(ownerPersonId: Option[String], scopeId: Option[String], status: Option[String]): Task[List[Commitment]]
+  def create(commitment: Commitment): IO[AgentError, Unit]
+  def findAll(ownerPersonId: Option[PersonId], scopeId: Option[ScopeId], status: Option[String]): IO[AgentError, List[Commitment]]
 }
 
 trait MemoryRepo {
-  def create(item: MemoryItem): Task[Unit]
-  def findAll(personId: Option[String], scopeId: Option[String]): Task[List[MemoryItem]]
+  def create(item: MemoryItem): IO[AgentError, Unit]
+  def findAll(personId: Option[PersonId], scopeId: Option[ScopeId]): IO[AgentError, List[MemoryItem]]
+  def findById(id: MemoryId): IO[AgentError, Option[MemoryItem]]
+  def updateStatus(id: MemoryId, status: MemoryStatus, updatedAt: Instant): IO[AgentError, Unit]
+  def setSupersededBy(oldId: MemoryId, newId: MemoryId, updatedAt: Instant): IO[AgentError, Unit]
+  def searchFts(query: String, scopeId: Option[ScopeId], personId: Option[PersonId], kind: Option[String], statusEq: Option[String], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryItem]]
+  def listAccepted(scopeId: Option[ScopeId], personId: Option[PersonId], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryItem]]
+  def findEventsWithMemory(eventIds: List[EventId]): IO[AgentError, Set[EventId]]
 }
 
 trait ApprovalRepo {
-  def create(approval: Approval): Task[Unit]
-  def findAll(scopeId: Option[String], status: Option[String]): Task[List[Approval]]
+  def create(approval: Approval): IO[AgentError, Unit]
+  def findAll(scopeId: Option[ScopeId], status: Option[String]): IO[AgentError, List[Approval]]
 }
 
 trait AuditRepo {
-  def create(event: AuditEvent): Task[Unit]
+  def create(event: AuditEvent): IO[AgentError, Unit]
+  def list(scopeId: Option[ScopeId], category: Option[String], since: Option[Instant], until: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]]
+  def searchFts(query: String, scopeId: Option[ScopeId], category: Option[String], since: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]]
+}
+
+trait GoalRepo {
+  def create(goal: Goal): IO[AgentError, Unit]
+  def findAll(ownerPersonId: Option[PersonId], scopeId: Option[ScopeId], status: Option[String]): IO[AgentError, List[Goal]]
+  def findById(id: GoalId): IO[AgentError, Option[Goal]]
+  def updateStatus(id: GoalId, status: GoalStatus, blockedReason: Option[String], updatedAt: Instant): IO[AgentError, Unit]
+}
+
+trait GoalEvidenceRepo {
+  def create(evidence: GoalEvidence): IO[AgentError, Unit]
+  def findByGoal(goalId: GoalId): IO[AgentError, List[GoalEvidence]]
 }
 
 object Repos {
 
+  // --- Row extractors (safe, newtype-aware) ---
+
+  private def col(rs: ResultSet, name: String): String = rs.getString(name)
+  private def opt(rs: ResultSet, name: String): Option[String] = Option(rs.getString(name))
+  private def optDouble(rs: ResultSet, name: String): Option[Double] = {
+    val d = rs.getDouble(name)
+    if (rs.wasNull()) None else Some(d)
+  }
+  private def instant(rs: ResultSet, name: String): Instant         = Instant.parse(col(rs, name))
+  private def optInstant(rs: ResultSet, name: String): Option[Instant] = opt(rs, name).map(Instant.parse)
+
+  private def extractPerson(rs: ResultSet): Person =
+    Person(
+      id = PersonId(col(rs, "id")),
+      displayName = col(rs, "display_name"),
+      timezone = col(rs, "timezone"),
+      defaultLocale = opt(rs, "default_locale"),
+      active = rs.getInt("active") != 0
+    )
+
+  private def extractScope(rs: ResultSet): PersonScope =
+    PersonScope(
+      id = ScopeId(col(rs, "id")),
+      name = col(rs, "name"),
+      ownerPersonId = opt(rs, "owner_person_id").map(PersonId),
+      kind = ScopeKind.fromString(col(rs, "kind")).getOrElse(ScopeKind.Other)
+    )
+
+  private def extractRole(rs: ResultSet): PersonScopeRole =
+    PersonScopeRole(
+      personId = PersonId(col(rs, "person_id")),
+      scopeId = ScopeId(col(rs, "scope_id")),
+      role = ScopeRole.fromString(col(rs, "role")).getOrElse(ScopeRole.Viewer)
+    )
+
+  private def extractCommitment(rs: ResultSet): Commitment =
+    Commitment(
+      id = CommitmentId(col(rs, "id")),
+      ownerPersonId = PersonId(col(rs, "owner_person_id")),
+      scopeId = ScopeId(col(rs, "scope_id")),
+      status = CommitmentStatus.fromString(col(rs, "status")).getOrElse(CommitmentStatus.Proposed),
+      text = col(rs, "text"),
+      source = col(rs, "source"),
+      evidence = col(rs, "evidence"),
+      dueAt = optInstant(rs, "due_at"),
+      createdAt = instant(rs, "created_at"),
+      updatedAt = instant(rs, "updated_at")
+    )
+
+  private def extractMemory(rs: ResultSet): MemoryItem =
+    MemoryItem(
+      id = MemoryId(col(rs, "id")),
+      personId = opt(rs, "person_id").map(PersonId),
+      scopeId = opt(rs, "scope_id").map(ScopeId),
+      status = MemoryStatus.fromString(col(rs, "status")).getOrElse(MemoryStatus.Proposed),
+      kind = MemoryKind.fromString(col(rs, "kind")).getOrElse(MemoryKind.Fact),
+      text = col(rs, "text"),
+      source = col(rs, "source"),
+      confidence = optDouble(rs, "confidence"),
+      createdAt = instant(rs, "created_at"),
+      updatedAt = instant(rs, "updated_at"),
+      supersededById = opt(rs, "superseded_by_id").map(MemoryId),
+      validFrom = optInstant(rs, "valid_from"),
+      validUntil = optInstant(rs, "valid_until"),
+      originEventId = opt(rs, "origin_event_id").map(EventId)
+    )
+
+  private def extractApproval(rs: ResultSet): Approval =
+    Approval(
+      id = ApprovalId(col(rs, "id")),
+      requestedBy = col(rs, "requested_by"),
+      requiredPersonId = opt(rs, "required_person_id").map(PersonId),
+      scopeId = opt(rs, "scope_id").map(ScopeId),
+      actionType = col(rs, "action_type"),
+      payloadJson = col(rs, "payload_json"),
+      status = ApprovalStatus.fromString(col(rs, "status")).getOrElse(ApprovalStatus.Requested),
+      createdAt = instant(rs, "created_at"),
+      decidedAt = optInstant(rs, "decided_at")
+    )
+
+  private def extractEvent(rs: ResultSet): AuditEvent =
+    AuditEvent(
+      id = EventId(col(rs, "id")),
+      actor = col(rs, "actor"),
+      action = col(rs, "action"),
+      category = opt(rs, "category").getOrElse(EventCategory.State),
+      targetType = col(rs, "target_type"),
+      targetId = opt(rs, "target_id"),
+      scopeId = opt(rs, "scope_id").map(ScopeId),
+      text = opt(rs, "text"),
+      payloadJson = col(rs, "payload_json"),
+      createdAt = instant(rs, "created_at")
+    )
+
+  private def extractGoal(rs: ResultSet): Goal =
+    Goal(
+      id = GoalId(col(rs, "id")),
+      ownerPersonId = PersonId(col(rs, "owner_person_id")),
+      scopeId = ScopeId(col(rs, "scope_id")),
+      title = col(rs, "title"),
+      outcome = col(rs, "outcome"),
+      evidenceRule = col(rs, "evidence_rule"),
+      constraintsJson = opt(rs, "constraints_json"),
+      status = GoalStatus.fromString(col(rs, "status")).getOrElse(GoalStatus.Open),
+      blockedReason = opt(rs, "blocked_reason"),
+      source = opt(rs, "source"),
+      createdAt = instant(rs, "created_at"),
+      updatedAt = instant(rs, "updated_at")
+    )
+
+  private def extractGoalEvidence(rs: ResultSet): GoalEvidence =
+    GoalEvidence(
+      id = GoalEvidenceId(col(rs, "id")),
+      goalId = GoalId(col(rs, "goal_id")),
+      kind = col(rs, "kind"),
+      ref = col(rs, "ref"),
+      note = opt(rs, "note"),
+      recordedAt = instant(rs, "recorded_at")
+    )
+
+  // --- Composable WHERE-clause builder ---
+
+  /** A SQL filter fragment plus the ordered parameters its `?`s consume.
+   *  A clause with no binds is allowed (e.g. literal-only `status = 'accepted'`). */
+  private final case class Clause(sql: String, params: List[Any] = Nil)
+  private object Clause {
+    def of[A](sql: String)(value: Option[A]): Option[Clause] =
+      value.map(v => Clause(sql, List(v)))
+  }
+
+  private def whereSql(prefix: String, clauses: List[Clause]): String =
+    if (clauses.isEmpty) "" else clauses.iterator.map(_.sql).mkString(s" $prefix ", " AND ", "")
+
+  private def paramsOf(clauses: List[Clause]): List[Any] =
+    clauses.flatMap(_.params)
+
+  // --- Repo implementations ---
+
   def sqlitePersonRepo(db: Sqlite): PersonRepo = new PersonRepo {
-    def create(p: Person): Task[Unit] =
+    def create(p: Person): IO[AgentError, Unit] =
       db.execute(
         "INSERT INTO persons (id, display_name, timezone, default_locale, active) VALUES (?, ?, ?, ?, ?)",
-        p.id, p.displayName, p.timezone, p.defaultLocale.orNull, if (p.active) 1 else 0
+        p.id, p.displayName, p.timezone, p.defaultLocale, if (p.active) 1 else 0
       )
 
-    def findAll: Task[List[Person]] =
-      db.query("SELECT * FROM persons") { rs =>
-        Person(
-          id = rs.getString("id"),
-          displayName = rs.getString("display_name"),
-          timezone = rs.getString("timezone"),
-          defaultLocale = Option(rs.getString("default_locale")),
-          active = rs.getInt("active") != 0
-        )
-      }
+    def findAll: IO[AgentError, List[Person]] =
+      db.query("SELECT * FROM persons")(extractPerson)
 
-    def findById(id: String): Task[Option[Person]] =
-      db.queryOne("SELECT * FROM persons WHERE id = ?", id) { rs =>
-        Person(
-          id = rs.getString("id"),
-          displayName = rs.getString("display_name"),
-          timezone = rs.getString("timezone"),
-          defaultLocale = Option(rs.getString("default_locale")),
-          active = rs.getInt("active") != 0
-        )
-      }
+    def findById(id: PersonId): IO[AgentError, Option[Person]] =
+      db.queryOne("SELECT * FROM persons WHERE id = ?", id)(extractPerson)
   }
 
   def sqliteScopeRepo(db: Sqlite): ScopeRepo = new ScopeRepo {
-    def create(s: PersonScope): Task[Unit] = {
-      val kindStr = s.kind match {
-        case ScopeKind.Private   => "private"
-        case ScopeKind.Shared    => "shared"
-        case ScopeKind.Work      => "work"
-        case ScopeKind.Household => "household"
-        case ScopeKind.School    => "school"
-        case ScopeKind.Other     => "other"
-      }
-      db.execute(
-        "INSERT INTO scopes (id, name, owner_person_id, kind) VALUES (?, ?, ?, ?)",
-        s.id, s.name, s.ownerPersonId.orNull, kindStr
-      )
+    private def kindStr(k: ScopeKind): String = k match {
+      case ScopeKind.Private   => "private"
+      case ScopeKind.Shared    => "shared"
+      case ScopeKind.Work      => "work"
+      case ScopeKind.Household => "household"
+      case ScopeKind.School    => "school"
+      case ScopeKind.Other     => "other"
     }
 
-    def findAll: Task[List[PersonScope]] =
-      db.query("SELECT * FROM scopes") { rs =>
-        PersonScope(
-          id = rs.getString("id"),
-          name = rs.getString("name"),
-          ownerPersonId = Option(rs.getString("owner_person_id")),
-          kind = ScopeKind.fromString(rs.getString("kind")).getOrElse(ScopeKind.Other)
-        )
-      }
+    def create(s: PersonScope): IO[AgentError, Unit] =
+      db.execute(
+        "INSERT INTO scopes (id, name, owner_person_id, kind) VALUES (?, ?, ?, ?)",
+        s.id, s.name, s.ownerPersonId, kindStr(s.kind)
+      )
+
+    def findAll: IO[AgentError, List[PersonScope]] =
+      db.query("SELECT * FROM scopes")(extractScope)
   }
 
   def sqliteScopeRoleRepo(db: Sqlite): ScopeRoleRepo = new ScopeRoleRepo {
-    def create(r: PersonScopeRole): Task[Unit] = {
-      val roleStr = r.role match {
-        case ScopeRole.Owner    => "owner"
-        case ScopeRole.Editor   => "editor"
-        case ScopeRole.Viewer   => "viewer"
-        case ScopeRole.Proposer => "proposer"
-      }
-      db.execute(
-        "INSERT INTO person_scope_roles (person_id, scope_id, role) VALUES (?, ?, ?)",
-        r.personId, r.scopeId, roleStr
-      )
+    private def roleStr(r: ScopeRole): String = r match {
+      case ScopeRole.Owner    => "owner"
+      case ScopeRole.Editor   => "editor"
+      case ScopeRole.Viewer   => "viewer"
+      case ScopeRole.Proposer => "proposer"
     }
 
-    def findByPerson(personId: String): Task[List[PersonScopeRole]] =
-      db.query("SELECT * FROM person_scope_roles WHERE person_id = ?", personId) { rs =>
-        PersonScopeRole(
-          personId = rs.getString("person_id"),
-          scopeId = rs.getString("scope_id"),
-          role = ScopeRole.fromString(rs.getString("role")).getOrElse(ScopeRole.Viewer)
-        )
-      }
+    def create(r: PersonScopeRole): IO[AgentError, Unit] =
+      db.execute(
+        "INSERT INTO person_scope_roles (person_id, scope_id, role) VALUES (?, ?, ?)",
+        r.personId, r.scopeId, roleStr(r.role)
+      )
+
+    def findByPerson(personId: PersonId): IO[AgentError, List[PersonScopeRole]] =
+      db.query("SELECT * FROM person_scope_roles WHERE person_id = ?", personId)(extractRole)
   }
 
   def sqliteCommitmentRepo(db: Sqlite): CommitmentRepo = new CommitmentRepo {
-    def create(c: Commitment): Task[Unit] = {
-      val statusStr = c.status match {
-        case CommitmentStatus.Proposed  => "proposed"
-        case CommitmentStatus.Open      => "open"
-        case CommitmentStatus.Done      => "done"
-        case CommitmentStatus.Ignored   => "ignored"
-        case CommitmentStatus.Cancelled => "cancelled"
-      }
-      db.execute(
-        "INSERT INTO commitments (id, owner_person_id, scope_id, status, text, source, evidence, due_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        c.id, c.ownerPersonId, c.scopeId, statusStr, c.text, c.source, c.evidence,
-        c.dueAt.map(_.toString).orNull, c.createdAt.toString, c.updatedAt.toString
-      )
+    private def statusStr(s: CommitmentStatus): String = s match {
+      case CommitmentStatus.Proposed  => "proposed"
+      case CommitmentStatus.Open      => "open"
+      case CommitmentStatus.Done      => "done"
+      case CommitmentStatus.Ignored   => "ignored"
+      case CommitmentStatus.Cancelled => "cancelled"
     }
 
-    def findAll(ownerPersonId: Option[String], scopeId: Option[String], status: Option[String]): Task[List[Commitment]] = {
-      val filters = List(
-        ownerPersonId.map(v => ("owner_person_id = ?", v)),
-        scopeId.map(v => ("scope_id = ?", v)),
-        status.map(v => ("status = ?", v))
+    def create(c: Commitment): IO[AgentError, Unit] =
+      db.execute(
+        "INSERT INTO commitments (id, owner_person_id, scope_id, status, text, source, evidence, due_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        c.id, c.ownerPersonId, c.scopeId, statusStr(c.status), c.text, c.source, c.evidence,
+        c.dueAt, c.createdAt, c.updatedAt
+      )
+
+    def findAll(ownerPersonId: Option[PersonId], scopeId: Option[ScopeId], status: Option[String]): IO[AgentError, List[Commitment]] = {
+      val clauses = List(
+        Clause.of("owner_person_id = ?")(ownerPersonId),
+        Clause.of("scope_id = ?")(scopeId),
+        Clause.of("status = ?")(status)
       ).flatten
-
-      val where = if (filters.isEmpty) "" else " WHERE " + filters.map(_._1).mkString(" AND ")
-      val params = filters.map(_._2)
-
-      db.query(s"SELECT * FROM commitments$where ORDER BY created_at DESC", params: _*) { rs =>
-        Commitment(
-          id = rs.getString("id"),
-          ownerPersonId = rs.getString("owner_person_id"),
-          scopeId = rs.getString("scope_id"),
-          status = CommitmentStatus.fromString(rs.getString("status")).getOrElse(CommitmentStatus.Proposed),
-          text = rs.getString("text"),
-          source = rs.getString("source"),
-          evidence = rs.getString("evidence"),
-          dueAt = Option(rs.getString("due_at")).map(Instant.parse),
-          createdAt = Instant.parse(rs.getString("created_at")),
-          updatedAt = Instant.parse(rs.getString("updated_at"))
-        )
-      }
+      val sql = s"SELECT * FROM commitments${whereSql("WHERE", clauses)} ORDER BY created_at DESC"
+      db.query(sql, paramsOf(clauses): _*)(extractCommitment)
     }
   }
 
   def sqliteMemoryRepo(db: Sqlite): MemoryRepo = new MemoryRepo {
-    def create(m: MemoryItem): Task[Unit] = {
-      val statusStr = m.status match {
-        case MemoryStatus.Proposed => "proposed"
-        case MemoryStatus.Accepted => "accepted"
-        case MemoryStatus.Rejected => "rejected"
-        case MemoryStatus.Archived => "archived"
-      }
-      val kindStr = m.kind match {
-        case MemoryKind.Preference    => "preference"
-        case MemoryKind.Fact          => "fact"
-        case MemoryKind.ProjectNote   => "project_note"
-        case MemoryKind.ProcedureNote => "procedure_note"
-      }
+    def create(m: MemoryItem): IO[AgentError, Unit] =
       db.execute(
-        "INSERT INTO memory_items (id, person_id, scope_id, status, kind, text, source, confidence, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        m.id, m.personId.orNull, m.scopeId.orNull, statusStr, kindStr, m.text, m.source,
-        m.confidence.map(java.lang.Double.valueOf).orNull, m.createdAt.toString, m.updatedAt.toString
+        "INSERT INTO memory_items (id, person_id, scope_id, status, kind, text, source, confidence, created_at, updated_at, superseded_by_id, valid_from, valid_until, origin_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        m.id, m.personId, m.scopeId, MemoryStatus.asString(m.status), MemoryKind.asString(m.kind),
+        m.text, m.source, m.confidence, m.createdAt, m.updatedAt,
+        m.supersededById, m.validFrom, m.validUntil, m.originEventId
       )
+
+    def findAll(personId: Option[PersonId], scopeId: Option[ScopeId]): IO[AgentError, List[MemoryItem]] = {
+      val clauses = List(
+        Clause.of("person_id = ?")(personId),
+        Clause.of("scope_id = ?")(scopeId)
+      ).flatten
+      val sql = s"SELECT * FROM memory_items${whereSql("WHERE", clauses)} ORDER BY created_at DESC"
+      db.query(sql, paramsOf(clauses): _*)(extractMemory)
     }
 
-    def findAll(personId: Option[String], scopeId: Option[String]): Task[List[MemoryItem]] = {
-      val filters = List(
-        personId.map(v => ("person_id = ?", v)),
-        scopeId.map(v => ("scope_id = ?", v))
-      ).flatten
+    def findById(id: MemoryId): IO[AgentError, Option[MemoryItem]] =
+      db.queryOne("SELECT * FROM memory_items WHERE id = ?", id)(extractMemory)
 
-      val where = if (filters.isEmpty) "" else " WHERE " + filters.map(_._1).mkString(" AND ")
-      val params = filters.map(_._2)
+    def updateStatus(id: MemoryId, status: MemoryStatus, updatedAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE memory_items SET status = ?, updated_at = ? WHERE id = ?",
+        MemoryStatus.asString(status), updatedAt, id
+      )
 
-      db.query(s"SELECT * FROM memory_items$where ORDER BY created_at DESC", params: _*) { rs =>
-        MemoryItem(
-          id = rs.getString("id"),
-          personId = Option(rs.getString("person_id")),
-          scopeId = Option(rs.getString("scope_id")),
-          status = MemoryStatus.fromString(rs.getString("status")).getOrElse(MemoryStatus.Proposed),
-          kind = MemoryKind.fromString(rs.getString("kind")).getOrElse(MemoryKind.Fact),
-          text = rs.getString("text"),
-          source = rs.getString("source"),
-          confidence = Option(rs.getObject("confidence")).map(_.asInstanceOf[java.lang.Number].doubleValue()),
-          createdAt = Instant.parse(rs.getString("created_at")),
-          updatedAt = Instant.parse(rs.getString("updated_at"))
-        )
+    def setSupersededBy(oldId: MemoryId, newId: MemoryId, updatedAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE memory_items SET superseded_by_id = ?, updated_at = ? WHERE id = ?",
+        newId, updatedAt, oldId
+      )
+
+    def searchFts(query: String, scopeId: Option[ScopeId], personId: Option[PersonId], kind: Option[String], statusEq: Option[String], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryItem]] = {
+      val clauses = List(
+        Some(Clause("memory_items_fts MATCH ?", List(query))),
+        Clause.of("m.scope_id = ?")(scopeId),
+        Clause.of("m.person_id = ?")(personId),
+        Clause.of("m.kind = ?")(kind),
+        Clause.of("m.status = ?")(statusEq)
+      ).flatten ::: temporalClauses("m", asOf)
+      val joinSupersede = if (asOf.isDefined) " LEFT JOIN memory_items ms ON m.superseded_by_id = ms.id" else ""
+      val sql =
+        s"""SELECT m.* FROM memory_items_fts f
+           | JOIN memory_items m ON m.rowid = f.rowid$joinSupersede
+           | WHERE ${clauses.map(_.sql).mkString(" AND ")}
+           | ORDER BY bm25(memory_items_fts) LIMIT ?""".stripMargin
+      db.query(sql, (paramsOf(clauses) :+ limit): _*)(extractMemory)
+    }
+
+    def listAccepted(scopeId: Option[ScopeId], personId: Option[PersonId], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryItem]] = {
+      val clauses = Clause("m1.status = 'accepted'") :: List(
+        Clause.of("m1.scope_id = ?")(scopeId),
+        Clause.of("m1.person_id = ?")(personId)
+      ).flatten ::: temporalClauses("m1", asOf)
+      val sql =
+        s"""SELECT m1.* FROM memory_items m1
+           | LEFT JOIN memory_items m2 ON m1.superseded_by_id = m2.id
+           | WHERE ${clauses.map(_.sql).mkString(" AND ")}
+           | ORDER BY m1.created_at DESC LIMIT ?""".stripMargin
+      db.query(sql, (paramsOf(clauses) :+ limit): _*)(extractMemory)
+    }
+
+    def findEventsWithMemory(eventIds: List[EventId]): IO[AgentError, Set[EventId]] =
+      if (eventIds.isEmpty) ZIO.succeed(Set.empty)
+      else {
+        val placeholders = List.fill(eventIds.size)("?").mkString(",")
+        db.query(
+          s"SELECT DISTINCT origin_event_id FROM memory_items WHERE origin_event_id IN ($placeholders)",
+          eventIds: _*
+        )(rs => EventId(col(rs, "origin_event_id"))).map(_.toSet)
       }
+
+    /** Same supersession + valid_from/until filtering used by FTS search and
+     *  accepted-list. The supersession-join alias (`ms` vs `m2`) is selected
+     *  from the table alias to match the joined LEFT JOIN above each query. */
+    private def temporalClauses(alias: String, asOf: Option[Instant]): List[Clause] = asOf match {
+      case None =>
+        List(Clause(s"$alias.superseded_by_id IS NULL"))
+      case Some(ts) =>
+        val supersedeAlias = if (alias == "m") "ms" else "m2"
+        List(
+          Clause(s"$alias.created_at <= ?", List(ts)),
+          Clause(s"($alias.superseded_by_id IS NULL OR $supersedeAlias.created_at > ?)", List(ts)),
+          Clause(s"($alias.valid_from IS NULL OR $alias.valid_from <= ?)", List(ts)),
+          Clause(s"($alias.valid_until IS NULL OR $alias.valid_until > ?)", List(ts))
+        )
     }
   }
 
   def sqliteApprovalRepo(db: Sqlite): ApprovalRepo = new ApprovalRepo {
-    def create(a: Approval): Task[Unit] = {
-      val statusStr = a.status match {
-        case ApprovalStatus.Requested => "requested"
-        case ApprovalStatus.Approved  => "approved"
-        case ApprovalStatus.Rejected  => "rejected"
-        case ApprovalStatus.Expired   => "expired"
-      }
-      db.execute(
-        "INSERT INTO approvals (id, requested_by, required_person_id, scope_id, action_type, payload_json, status, created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        a.id, a.requestedBy, a.requiredPersonId.orNull, a.scopeId.orNull,
-        a.actionType, a.payloadJson, statusStr, a.createdAt.toString, a.decidedAt.map(_.toString).orNull
-      )
+    private def statusStr(s: ApprovalStatus): String = s match {
+      case ApprovalStatus.Requested => "requested"
+      case ApprovalStatus.Approved  => "approved"
+      case ApprovalStatus.Rejected  => "rejected"
+      case ApprovalStatus.Expired   => "expired"
     }
 
-    def findAll(scopeId: Option[String], status: Option[String]): Task[List[Approval]] = {
-      val filters = List(
-        scopeId.map(v => ("scope_id = ?", v)),
-        status.map(v => ("status = ?", v))
+    def create(a: Approval): IO[AgentError, Unit] =
+      db.execute(
+        "INSERT INTO approvals (id, requested_by, required_person_id, scope_id, action_type, payload_json, status, created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        a.id, a.requestedBy, a.requiredPersonId, a.scopeId,
+        a.actionType, a.payloadJson, statusStr(a.status), a.createdAt, a.decidedAt
+      )
+
+    def findAll(scopeId: Option[ScopeId], status: Option[String]): IO[AgentError, List[Approval]] = {
+      val clauses = List(
+        Clause.of("scope_id = ?")(scopeId),
+        Clause.of("status = ?")(status)
       ).flatten
-
-      val where = if (filters.isEmpty) "" else " WHERE " + filters.map(_._1).mkString(" AND ")
-      val params = filters.map(_._2)
-
-      db.query(s"SELECT * FROM approvals$where ORDER BY created_at DESC", params: _*) { rs =>
-        Approval(
-          id = rs.getString("id"),
-          requestedBy = rs.getString("requested_by"),
-          requiredPersonId = Option(rs.getString("required_person_id")),
-          scopeId = Option(rs.getString("scope_id")),
-          actionType = rs.getString("action_type"),
-          payloadJson = rs.getString("payload_json"),
-          status = ApprovalStatus.fromString(rs.getString("status")).getOrElse(ApprovalStatus.Requested),
-          createdAt = Instant.parse(rs.getString("created_at")),
-          decidedAt = Option(rs.getString("decided_at")).map(Instant.parse)
-        )
-      }
+      val sql = s"SELECT * FROM approvals${whereSql("WHERE", clauses)} ORDER BY created_at DESC"
+      db.query(sql, paramsOf(clauses): _*)(extractApproval)
     }
   }
 
   def sqliteAuditRepo(db: Sqlite): AuditRepo = new AuditRepo {
-    def create(e: AuditEvent): Task[Unit] =
+    def create(e: AuditEvent): IO[AgentError, Unit] =
       db.execute(
-        "INSERT INTO audit_events (id, actor, action, target_type, target_id, scope_id, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        e.id, e.actor, e.action, e.targetType, e.targetId.orNull, e.scopeId.orNull, e.payloadJson, e.createdAt.toString
+        "INSERT INTO audit_events (id, actor, action, category, target_type, target_id, scope_id, text, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        e.id, e.actor, e.action, e.category, e.targetType, e.targetId, e.scopeId,
+        e.text, e.payloadJson, e.createdAt
       )
+
+    def list(scopeId: Option[ScopeId], category: Option[String], since: Option[Instant], until: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]] = {
+      val clauses = List(
+        Clause.of("scope_id = ?")(scopeId),
+        Clause.of("category = ?")(category),
+        Clause.of("created_at >= ?")(since),
+        Clause.of("created_at < ?")(until)
+      ).flatten
+      val sql = s"SELECT * FROM audit_events${whereSql("WHERE", clauses)} ORDER BY created_at DESC LIMIT ?"
+      db.query(sql, (paramsOf(clauses) :+ limit): _*)(extractEvent)
+    }
+
+    def searchFts(query: String, scopeId: Option[ScopeId], category: Option[String], since: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]] = {
+      val clauses = Clause("audit_events_fts MATCH ?", List(query)) :: List(
+        Clause.of("e.scope_id = ?")(scopeId),
+        Clause.of("e.category = ?")(category),
+        Clause.of("e.created_at >= ?")(since)
+      ).flatten
+      val sql =
+        s"""SELECT e.* FROM audit_events_fts f
+           | JOIN audit_events e ON e.rowid = f.rowid
+           | WHERE ${clauses.map(_.sql).mkString(" AND ")}
+           | ORDER BY bm25(audit_events_fts) LIMIT ?""".stripMargin
+      db.query(sql, (paramsOf(clauses) :+ limit): _*)(extractEvent)
+    }
+  }
+
+  def sqliteGoalRepo(db: Sqlite): GoalRepo = new GoalRepo {
+    def create(g: Goal): IO[AgentError, Unit] =
+      db.execute(
+        "INSERT INTO goals (id, owner_person_id, scope_id, title, outcome, evidence_rule, constraints_json, status, blocked_reason, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        g.id, g.ownerPersonId, g.scopeId, g.title, g.outcome, g.evidenceRule,
+        g.constraintsJson, GoalStatus.asString(g.status), g.blockedReason,
+        g.source, g.createdAt, g.updatedAt
+      )
+
+    def findAll(ownerPersonId: Option[PersonId], scopeId: Option[ScopeId], status: Option[String]): IO[AgentError, List[Goal]] = {
+      val clauses = List(
+        Clause.of("owner_person_id = ?")(ownerPersonId),
+        Clause.of("scope_id = ?")(scopeId),
+        Clause.of("status = ?")(status)
+      ).flatten
+      val sql = s"SELECT * FROM goals${whereSql("WHERE", clauses)} ORDER BY created_at DESC"
+      db.query(sql, paramsOf(clauses): _*)(extractGoal)
+    }
+
+    def findById(id: GoalId): IO[AgentError, Option[Goal]] =
+      db.queryOne("SELECT * FROM goals WHERE id = ?", id)(extractGoal)
+
+    def updateStatus(id: GoalId, status: GoalStatus, blockedReason: Option[String], updatedAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE goals SET status = ?, blocked_reason = ?, updated_at = ? WHERE id = ?",
+        GoalStatus.asString(status), blockedReason, updatedAt, id
+      )
+  }
+
+  def sqliteGoalEvidenceRepo(db: Sqlite): GoalEvidenceRepo = new GoalEvidenceRepo {
+    def create(e: GoalEvidence): IO[AgentError, Unit] =
+      db.execute(
+        "INSERT INTO goal_evidence (id, goal_id, kind, ref, note, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+        e.id, e.goalId, e.kind, e.ref, e.note, e.recordedAt
+      )
+
+    def findByGoal(goalId: GoalId): IO[AgentError, List[GoalEvidence]] =
+      db.query(
+        "SELECT * FROM goal_evidence WHERE goal_id = ? ORDER BY recorded_at ASC",
+        goalId
+      )(extractGoalEvidence)
   }
 }
