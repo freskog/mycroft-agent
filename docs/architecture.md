@@ -194,6 +194,112 @@ When connecting to Hermes, OpenClaw, or another harness:
 4. `person-service` runs on the host, accessible from the container
 5. The harness orchestrates the LLM loop; this substrate provides the tools
 
+## Mycroft and Channels
+
+Mycroft is the first concrete agent harness over the substrate. It accepts
+inbound messages from one or more *channel adapters* (the REPL today, a future
+WhatsApp/Signal gateway tomorrow), drives an LLM turn against LM Studio, and
+emits a stream of typed events back. The substrate stays harness-neutral; only
+this module knows about LLMs, channels, and conversation history.
+
+### Topology
+
+```
+external apps ── messaging clients (whatsapp, signal, …)
+                          │
+                          ▼  (their protocols; gateway translates)
+                ┌────────────────────┐
+                │ gateway container  │  (future; not part of v1)
+                └─────────┬──────────┘
+                          │  POST /inbound, GET /outbound/stream
+                          ▼  internal docker network only
+                ┌────────────────────┐
+                │   mycroft (v1)     │  modules/mycroft, port 8090
+                └─────────┬──────────┘
+                          │  HTTP
+                          ▼
+                ┌────────────────────┐    ┌──────────────────────┐
+                │  person-service    │    │  LM Studio (off-host)│
+                └────────────────────┘    └──────────────────────┘
+```
+
+Trust is the network: mycroft and person-service expose ports only to the
+internal docker network. Gateways (and the REPL) are the only thing that can
+reach mycroft. No per-message auth in v1; the magic-link 2FA approval flow is
+the future direction for human-consent gates.
+
+### Channels
+
+A *channel* is a durable conversation grouping with an audience. Per-message
+`from` carries the sender. The scopes mycroft may read or write in a given turn
+are derived from the sender's roles (`ScopeRoleRepo.findByPerson(from)`), not
+from a single `channel.scope_id`. This means the family channel can flow into
+the family scope when Fred speaks and into a different scope when Paula does;
+a personal channel constrains naturally to the sender's private scopes.
+
+The gateway maps external IDs (phone numbers, Signal UUIDs) → channel names;
+mycroft maps channel names → audiences and senders → scopes. Two layers of
+indirection, but each has one responsibility.
+
+### Wire protocol
+
+`POST /inbound` is a synchronous ack; the assistant's reply streams as
+Server-Sent Events on the long-lived `GET /outbound/stream`. Event types:
+
+| event | meaning |
+|---|---|
+| `started` | turn opened (carries model, channel, message_id) |
+| `reasoning` | reasoning-token chunk (from LM Studio's `reasoning_content`) |
+| `content` | user-visible token chunk |
+| `tool_call` | mycroft is about to invoke a tool |
+| `tool_result` | tool returned |
+| `done` | reply complete — deliver via the channel transport |
+| `error` | terminal failure for this turn |
+
+`done` is the unambiguous "send this now" signal. SSE deltas are ephemeral;
+durable replay is via `GET /messages?channel=X&since=…` against persisted
+assistant messages — gateways track the last delivered `message_id` per
+channel and backfill on reconnect, rather than relying on event IDs.
+
+### Tool surface
+
+Mycroft uses **native OpenAI tool calls** (reasoning models on this build
+return reasoning in a dedicated `reasoning_content` field, not inline
+`<think>` tags). The native tool set is intentionally tiny:
+
+- `shell_run(command, timeout?)` — executes a bash command via the in-process
+  `safe-run` `ProcessRunner` and returns bounded preview + `runlog` reference.
+- `skill_search(query, limit?)` / `skill_show(name)` — bootstrap procedure
+  lookup so the agent finds CLI vocabulary by retrieval, not by enumeration.
+
+Everything else — `person memory propose`, `person goal list`, `runlog show`,
+unix utilities — is invoked through `shell_run`. Command vocabulary lives in
+skills; the system prompt mentions only the available binaries. This is
+progressive disclosure of tools, mirroring the substrate's progressive
+disclosure of skills.
+
+Every tool invocation writes a `decision`-category audit event so the turn is
+fully reconstructable from the event log.
+
+### Compaction
+
+Two-tier context on every turn:
+
+- **Long-term**: the durable knowledge in person-service — top-ranked accepted
+  memory items + recent observation/decision/session_note events for each
+  scope the sender has access to. Always injected as a context bundle.
+- **Short-term**: a rolling window of recent user/assistant messages from this
+  channel, sized to fit the dynamic budget
+  `model_context − system − bundle − max_output − margin`.
+
+Intra-turn `tool` and assistant-tool_call messages are kept in-memory for the
+turn only — never persisted as part of the conversation history that re-enters
+the window on the next turn, which avoids malformed tool sequences on reload.
+
+Auto-summarize-on-drop (rolling-out messages become `session_note` events that
+later consolidate into memory items) is deferred to v1.1; for now, important
+context must be promoted explicitly via `person memory propose`.
+
 ## GraalVM Native-Image Notes
 
 - **zio-json**: Uses compile-time macro derivation. No reflection. Native-image safe.

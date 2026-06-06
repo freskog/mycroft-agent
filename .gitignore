@@ -5,3 +5,11 @@ project/target/
 project/project/
 *.class
 *.log
+
+.metals/
+.vscode/
+.cursor/
+.bloop/
+
+# safe-run / shell_run command logs
+.agent/

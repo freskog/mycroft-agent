@@ -162,7 +162,36 @@ object Migrations {
     """CREATE TRIGGER IF NOT EXISTS audit_events_au AFTER UPDATE ON audit_events BEGIN
       |  INSERT INTO audit_events_fts(audit_events_fts, rowid, text, payload_json) VALUES ('delete', old.rowid, COALESCE(old.text, ''), old.payload_json);
       |  INSERT INTO audit_events_fts(rowid, text, payload_json) VALUES (new.rowid, COALESCE(new.text, ''), new.payload_json);
-      |END""".stripMargin
+      |END""".stripMargin,
+
+    // V4: mycroft channels, audience, and message log
+    """CREATE TABLE IF NOT EXISTS channels (
+      |  id TEXT PRIMARY KEY,
+      |  default_model TEXT,
+      |  created_at TEXT NOT NULL
+      |)""".stripMargin,
+
+    """CREATE TABLE IF NOT EXISTS channel_members (
+      |  channel_id TEXT NOT NULL,
+      |  person_id TEXT NOT NULL,
+      |  PRIMARY KEY (channel_id, person_id),
+      |  FOREIGN KEY (channel_id) REFERENCES channels(id),
+      |  FOREIGN KEY (person_id) REFERENCES persons(id)
+      |)""".stripMargin,
+
+    """CREATE TABLE IF NOT EXISTS messages (
+      |  id TEXT PRIMARY KEY,
+      |  channel_id TEXT NOT NULL,
+      |  role TEXT NOT NULL CHECK (role IN ('user','assistant','tool','system')),
+      |  person_id_from TEXT,
+      |  content TEXT NOT NULL,
+      |  tool_calls_json TEXT,
+      |  external_id TEXT,
+      |  created_at TEXT NOT NULL,
+      |  FOREIGN KEY (channel_id) REFERENCES channels(id)
+      |)""".stripMargin,
+
+    "CREATE INDEX IF NOT EXISTS idx_messages_channel_time ON messages(channel_id, created_at DESC)"
   )
 
   def migrate(db: Sqlite): IO[dev.freskog.agent.common.AgentError, Unit] =

@@ -1,6 +1,10 @@
 services:
+  # Dev shell: GraalVM + sbt with the source mounted in. Fast to build because
+  # it stops at the `base` stage and does not compile native images.
   dev:
-    build: .
+    build:
+      context: .
+      target: base
     volumes:
       - .:/workspace
       - sbt-cache:/root/.sbt
@@ -12,6 +16,76 @@ services:
     stdin_open: true
     tty: true
 
+  # Minimal image that ships the compiled GraalVM native binaries (no JVM).
+  # Build with: docker compose build native
+  native:
+    build:
+      context: .
+      target: runtime
+    image: personal-agent:native
+
+  # Authoritative sidecar. Internal-network only by default; uncomment ports
+  # to inspect from the host. Persistence at /state, seeded data on first start.
+  person-service:
+    image: personal-agent:native
+    command: ["person-service"]
+    environment:
+      PERSON_SERVICE_HOST: "0.0.0.0"
+      PERSON_SERVICE_PORT: "8080"
+      PERSON_SERVICE_DB:   "/state/person.sqlite"
+      PERSON_SERVICE_SEED: "true"
+    volumes:
+      - person-state:/state
+    networks:
+      - agentnet
+    # ports: ["8080:8080"]   # uncomment for host-side debugging
+
+  # Local-LLM agent harness. Talks to person-service on the internal network
+  # and to LM Studio at MYCROFT_LM_STUDIO_URL (default Fred's mac mini).
+  mycroft:
+    image: personal-agent:native
+    command: ["mycroft"]
+    environment:
+      MYCROFT_HOST:             "0.0.0.0"
+      MYCROFT_PORT:             "8090"
+      PERSON_SERVICE_URL:       "http://person-service:8080"
+      MYCROFT_LM_STUDIO_URL:    "http://fredriks-mac-mini.gledswood.org:1234"
+      # qwen3.6 cleanly separates reasoning into `reasoning_content`; the gemma
+      # MLX build leaks `<|channel>` harmony markers into `content`, which we
+      # don't parse — so qwen is the working default until we add that handling.
+      MYCROFT_DEFAULT_MODEL:    "qwen3.6-35b-a3b-ud-mlx"
+      # Tighter rolling window so new conversations stay focused.
+      MYCROFT_CONTEXT_WINDOW_MSGS: "6"
+    depends_on:
+      - person-service
+    networks:
+      - agentnet
+    # ports: ["8090:8090"]   # uncomment for host-side debugging
+
+  # REPL channel adapter (interactive). Runs on a JVM (JLine terminal UI), not
+  # native — it is started once and latency does not matter. Build once with
+  #   docker compose build repl
+  # then run on demand:
+  #   docker compose run --rm repl --channel fred --as fred
+  repl:
+    build:
+      context: .
+      target: repl
+    image: personal-agent:repl
+    environment:
+      MYCROFT_URL: "http://mycroft:8090"
+    depends_on:
+      - mycroft
+    networks:
+      - agentnet
+    stdin_open: true
+    tty: true
+
 volumes:
   sbt-cache:
   ivy-cache:
+  person-state:
+
+networks:
+  agentnet:
+    driver: bridge

@@ -82,6 +82,8 @@ final case class EventId(value: String)        extends AnyVal
 final case class CommitmentId(value: String)   extends AnyVal
 final case class ApprovalId(value: String)     extends AnyVal
 final case class GoalEvidenceId(value: String) extends AnyVal
+final case class ChannelId(value: String)      extends AnyVal
+final case class MessageId(value: String)      extends AnyVal
 
 sealed trait ScopeKind
 object ScopeKind {
@@ -344,4 +346,56 @@ case class GoalEvidence(
 case class GoalWithEvidence(
   goal: Goal,
   evidence: List[GoalEvidence]
+)
+
+// --- Channels & messages (mycroft / harness state) ---
+
+sealed trait MessageRole
+object MessageRole {
+  case object User      extends MessageRole
+  case object Assistant extends MessageRole
+  case object Tool      extends MessageRole
+  case object System    extends MessageRole
+
+  def fromString(s: String): Either[String, MessageRole] = s.toLowerCase match {
+    case "user"      => Right(User)
+    case "assistant" => Right(Assistant)
+    case "tool"      => Right(Tool)
+    case "system"    => Right(System)
+    case _           => Left(s"Unknown message role: $s")
+  }
+
+  def asString(r: MessageRole): String = r match {
+    case User      => "user"
+    case Assistant => "assistant"
+    case Tool      => "tool"
+    case System    => "system"
+  }
+}
+
+case class Channel(
+  id: ChannelId,
+  defaultModel: Option[String],
+  createdAt: Instant
+)
+
+case class ChannelMember(
+  channelId: ChannelId,
+  personId: PersonId
+)
+
+case class ChannelWithMembers(
+  channel: Channel,
+  members: List[PersonId]
+)
+
+case class Message(
+  id: MessageId,
+  channelId: ChannelId,
+  role: MessageRole,
+  personIdFrom: Option[PersonId],
+  content: String,
+  toolCallsJson: Option[String],
+  externalId: Option[String],
+  createdAt: Instant
 )

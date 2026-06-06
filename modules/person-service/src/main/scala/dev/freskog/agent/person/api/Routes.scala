@@ -38,6 +38,43 @@ object Routes {
       Method.POST / "scope-roles" -> handler { (req: Request) =>
         handlePost[CreateScopeRoleRequest, PersonScopeRole](req)(service.createScopeRole)
       },
+      Method.GET / "scope-roles" -> handler { (req: Request) =>
+        queryParam(req, "person") match {
+          case None    => ZIO.succeed(errorToResponse(AgentError.BadRequest("person is required")))
+          case Some(p) => handleGet(service.listScopeRoles(PersonId(p)))
+        }
+      },
+
+      // --- channels & messages (mycroft) ---
+      Method.POST / "channels" -> handler { (req: Request) =>
+        handlePost[CreateChannelRequest, ChannelWithMembers](req)(service.createChannel)
+      },
+      Method.GET / "channels" -> handler { (_: Request) =>
+        handleGet(service.listChannels)
+      },
+      Method.GET / "channels" / string("id") -> handler { (id: String, _: Request) =>
+        handleGetOption(service.getChannel(ChannelId(id)), "channel", id)
+      },
+      Method.POST / "channels" / string("id") / "members" -> handler { (id: String, req: Request) =>
+        handlePost[AddMemberRequest, ChannelWithMembers](req)(r => service.addChannelMember(ChannelId(id), r.personId))
+      },
+      Method.POST / "messages" -> handler { (req: Request) =>
+        handlePost[AppendMessageRequest, Message](req)(service.appendMessage)
+      },
+      Method.GET / "messages" -> handler { (req: Request) =>
+        queryParam(req, "channel") match {
+          case None => ZIO.succeed(errorToResponse(AgentError.BadRequest("channel is required")))
+          case Some(ch) =>
+            parseInstantParam(req, "since").flatMap {
+              case Left(err)    => ZIO.succeed(errorToResponse(err))
+              case Right(since) =>
+                handleGet(service.listMessages(
+                  ChannelId(ch), since,
+                  queryParam(req, "limit").flatMap(_.toIntOption).getOrElse(50)
+                ))
+            }
+        }
+      },
 
       // --- commitments ---
       Method.POST / "commitments" / "propose" -> handler { (req: Request) =>

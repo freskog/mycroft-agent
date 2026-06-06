@@ -117,7 +117,15 @@ object Main extends ZIOCliDefault {
     Args.text("id")
   ).map { case ((kind, ref, note), id) => Cmd.GoalEvidenceAppend(id, kind, ref, note) }
 
-  private val goal = Command("goal").subcommands(goalPropose, goalList, goalShow, goalStatus, goalEvidence)
+  // Discoverable alias for `status --to cancelled`: a soft-remove that keeps the
+  // audit trail. Reuses the GoalStatusUpdate handler / endpoint.
+  private val goalCancel = Command(
+    "cancel",
+    Options.text("reason").optional,
+    Args.text("id")
+  ).map { case (reason, id) => Cmd.GoalStatusUpdate(id, "cancelled", reason) }
+
+  private val goal = Command("goal").subcommands(goalPropose, goalList, goalShow, goalStatus, goalCancel, goalEvidence)
 
   // --- memory (extended) ---
   private val memoryAccept    = Command("accept",  Args.text("id")).map(id => Cmd.MemoryAccept(id))

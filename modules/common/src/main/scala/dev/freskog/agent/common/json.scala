@@ -186,6 +186,15 @@ object JsonCodecs {
   implicit val commitmentIdCodec: JsonCodec[CommitmentId]       = idCodec(CommitmentId.apply, _.value)
   implicit val approvalIdCodec: JsonCodec[ApprovalId]           = idCodec(ApprovalId.apply, _.value)
   implicit val goalEvidenceIdCodec: JsonCodec[GoalEvidenceId]   = idCodec(GoalEvidenceId.apply, _.value)
+  implicit val channelIdCodec: JsonCodec[ChannelId]             = idCodec(ChannelId.apply, _.value)
+  implicit val messageIdCodec: JsonCodec[MessageId]             = idCodec(MessageId.apply, _.value)
+
+  // --- MessageRole ---
+  implicit val messageRoleEncoder: JsonEncoder[MessageRole] =
+    JsonEncoder.string.contramap(MessageRole.asString)
+
+  implicit val messageRoleDecoder: JsonDecoder[MessageRole] =
+    JsonDecoder.string.mapOrFail(MessageRole.fromString)
 
   // --- Domain types ---
   implicit val runMetadataCodec: JsonCodec[RunMetadata]     = DeriveJsonCodec.gen[RunMetadata]
@@ -203,4 +212,8 @@ object JsonCodecs {
   implicit val memoryHitCodec: JsonCodec[MemoryHit]         = DeriveJsonCodec.gen[MemoryHit]
   implicit val eventHitCodec: JsonCodec[EventHit]           = DeriveJsonCodec.gen[EventHit]
   implicit val contextBundleCodec: JsonCodec[ContextBundle] = DeriveJsonCodec.gen[ContextBundle]
+  implicit val channelCodec: JsonCodec[Channel]             = DeriveJsonCodec.gen[Channel]
+  implicit val channelMemberCodec: JsonCodec[ChannelMember] = DeriveJsonCodec.gen[ChannelMember]
+  implicit val channelWithMembersCodec: JsonCodec[ChannelWithMembers] = DeriveJsonCodec.gen[ChannelWithMembers]
+  implicit val messageCodec: JsonCodec[Message]             = DeriveJsonCodec.gen[Message]
 }

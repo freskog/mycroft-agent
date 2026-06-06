@@ -47,6 +47,17 @@ trait PersonService {
 
   // Consolidation
   def consolidateMemory(scopeId: ScopeId, since: Option[Instant]): IO[AgentError, List[MemoryItem]]
+
+  // Scope access (for harnesses resolving a sender's reachable scopes)
+  def listScopeRoles(personId: PersonId): IO[AgentError, List[PersonScopeRole]]
+
+  // Channels & messages (mycroft conversation state)
+  def createChannel(req: CreateChannelRequest): IO[AgentError, ChannelWithMembers]
+  def listChannels: IO[AgentError, List[Channel]]
+  def getChannel(id: ChannelId): IO[AgentError, Option[ChannelWithMembers]]
+  def addChannelMember(id: ChannelId, personId: PersonId): IO[AgentError, ChannelWithMembers]
+  def appendMessage(req: AppendMessageRequest): IO[AgentError, Message]
+  def listMessages(channelId: ChannelId, since: Option[Instant], limit: Int): IO[AgentError, List[Message]]
 }
 
 object PersonService {
@@ -64,7 +75,10 @@ object PersonService {
     approvalRepo: ApprovalRepo,
     auditRepo: AuditRepo,
     goalRepo: GoalRepo,
-    goalEvidenceRepo: GoalEvidenceRepo
+    goalEvidenceRepo: GoalEvidenceRepo,
+    channelRepo: ChannelRepo,
+    channelMemberRepo: ChannelMemberRepo,
+    messageRepo: MessageRepo
   ): PersonService = new PersonService {
 
     // --- Persons / Scopes / Roles ---
@@ -325,6 +339,52 @@ object PersonService {
       )
       memoryRepo.create(item).as(item)
     }
+
+    // --- Scope access ---
+
+    def listScopeRoles(personId: PersonId): IO[AgentError, List[PersonScopeRole]] =
+      scopeRoleRepo.findByPerson(personId)
+
+    // --- Channels & messages ---
+
+    def createChannel(req: CreateChannelRequest): IO[AgentError, ChannelWithMembers] =
+      for {
+        now <- Clock.instant
+        ch   = Channel(req.id, req.defaultModel, now)
+        _   <- channelRepo.create(ch)
+        _   <- ZIO.foreachDiscard(req.members)(p => channelMemberRepo.add(ChannelMember(req.id, p)))
+        members <- channelMemberRepo.findByChannel(req.id)
+      } yield ChannelWithMembers(ch, members.map(_.personId))
+
+    val listChannels: IO[AgentError, List[Channel]] = channelRepo.findAll
+
+    def getChannel(id: ChannelId): IO[AgentError, Option[ChannelWithMembers]] =
+      channelRepo.findById(id).flatMap {
+        case None     => ZIO.succeed(None)
+        case Some(ch) => channelMemberRepo.findByChannel(id).map(ms => Some(ChannelWithMembers(ch, ms.map(_.personId))))
+      }
+
+    def addChannelMember(id: ChannelId, personId: PersonId): IO[AgentError, ChannelWithMembers] =
+      for {
+        ch      <- channelRepo.findById(id).someOrFail(AgentError.NotFound("channel", id.value))
+        _       <- channelMemberRepo.add(ChannelMember(id, personId))
+        members <- channelMemberRepo.findByChannel(id)
+      } yield ChannelWithMembers(ch, members.map(_.personId))
+
+    def appendMessage(req: AppendMessageRequest): IO[AgentError, Message] =
+      for {
+        now <- Clock.instant
+        m    = Message(
+                 id = MessageId(newUuid), channelId = req.channelId, role = req.role,
+                 personIdFrom = req.personIdFrom, content = req.content,
+                 toolCallsJson = req.toolCallsJson, externalId = req.externalId,
+                 createdAt = now
+               )
+        _   <- messageRepo.create(m)
+      } yield m
+
+    def listMessages(channelId: ChannelId, since: Option[Instant], limit: Int): IO[AgentError, List[Message]] =
+      messageRepo.findByChannel(channelId, since, limit)
 
     // --- Audit helpers ---
 

@@ -46,7 +46,10 @@ object Main extends ZIOAppDefault {
           Repos.sqliteApprovalRepo(db),
           Repos.sqliteAuditRepo(db),
           Repos.sqliteGoalRepo(db),
-          Repos.sqliteGoalEvidenceRepo(db)
+          Repos.sqliteGoalEvidenceRepo(db),
+          Repos.sqliteChannelRepo(db),
+          Repos.sqliteChannelMemberRepo(db),
+          Repos.sqliteMessageRepo(db)
         )
 
         routes = Routes.make(service)

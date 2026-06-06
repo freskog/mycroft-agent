@@ -135,6 +135,32 @@ object ConsolidateRequest {
   implicit val codec: JsonCodec[ConsolidateRequest] = DeriveJsonCodec.gen[ConsolidateRequest]
 }
 
+case class CreateChannelRequest(
+  id: ChannelId,
+  defaultModel: Option[String],
+  members: List[PersonId] = Nil
+)
+object CreateChannelRequest {
+  implicit val codec: JsonCodec[CreateChannelRequest] = DeriveJsonCodec.gen[CreateChannelRequest]
+}
+
+case class AddMemberRequest(personId: PersonId)
+object AddMemberRequest {
+  implicit val codec: JsonCodec[AddMemberRequest] = DeriveJsonCodec.gen[AddMemberRequest]
+}
+
+case class AppendMessageRequest(
+  channelId: ChannelId,
+  role: MessageRole,
+  personIdFrom: Option[PersonId],
+  content: String,
+  toolCallsJson: Option[String] = None,
+  externalId: Option[String] = None
+)
+object AppendMessageRequest {
+  implicit val codec: JsonCodec[AppendMessageRequest] = DeriveJsonCodec.gen[AppendMessageRequest]
+}
+
 // --- Audit payload codecs ---
 
 /** Recorded on `goal.status.*` / `memory.reject` events. */

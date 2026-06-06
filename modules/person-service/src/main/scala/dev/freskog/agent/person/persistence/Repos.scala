@@ -62,6 +62,22 @@ trait GoalEvidenceRepo {
   def findByGoal(goalId: GoalId): IO[AgentError, List[GoalEvidence]]
 }
 
+trait ChannelRepo {
+  def create(channel: Channel): IO[AgentError, Unit]
+  def findAll: IO[AgentError, List[Channel]]
+  def findById(id: ChannelId): IO[AgentError, Option[Channel]]
+}
+
+trait ChannelMemberRepo {
+  def add(member: ChannelMember): IO[AgentError, Unit]
+  def findByChannel(channelId: ChannelId): IO[AgentError, List[ChannelMember]]
+}
+
+trait MessageRepo {
+  def create(message: Message): IO[AgentError, Unit]
+  def findByChannel(channelId: ChannelId, since: Option[Instant], limit: Int): IO[AgentError, List[Message]]
+}
+
 object Repos {
 
   // --- Row extractors (safe, newtype-aware) ---
@@ -182,6 +198,31 @@ object Repos {
       ref = col(rs, "ref"),
       note = opt(rs, "note"),
       recordedAt = instant(rs, "recorded_at")
+    )
+
+  private def extractChannel(rs: ResultSet): Channel =
+    Channel(
+      id = ChannelId(col(rs, "id")),
+      defaultModel = opt(rs, "default_model"),
+      createdAt = instant(rs, "created_at")
+    )
+
+  private def extractChannelMember(rs: ResultSet): ChannelMember =
+    ChannelMember(
+      channelId = ChannelId(col(rs, "channel_id")),
+      personId = PersonId(col(rs, "person_id"))
+    )
+
+  private def extractMessage(rs: ResultSet): Message =
+    Message(
+      id = MessageId(col(rs, "id")),
+      channelId = ChannelId(col(rs, "channel_id")),
+      role = MessageRole.fromString(col(rs, "role")).getOrElse(MessageRole.User),
+      personIdFrom = opt(rs, "person_id_from").map(PersonId),
+      content = col(rs, "content"),
+      toolCallsJson = opt(rs, "tool_calls_json"),
+      externalId = opt(rs, "external_id"),
+      createdAt = instant(rs, "created_at")
     )
 
   // --- Composable WHERE-clause builder ---
@@ -471,5 +512,47 @@ object Repos {
         "SELECT * FROM goal_evidence WHERE goal_id = ? ORDER BY recorded_at ASC",
         goalId
       )(extractGoalEvidence)
+  }
+
+  def sqliteChannelRepo(db: Sqlite): ChannelRepo = new ChannelRepo {
+    def create(c: Channel): IO[AgentError, Unit] =
+      db.execute(
+        "INSERT INTO channels (id, default_model, created_at) VALUES (?, ?, ?)",
+        c.id, c.defaultModel, c.createdAt
+      )
+
+    def findAll: IO[AgentError, List[Channel]] =
+      db.query("SELECT * FROM channels ORDER BY created_at DESC")(extractChannel)
+
+    def findById(id: ChannelId): IO[AgentError, Option[Channel]] =
+      db.queryOne("SELECT * FROM channels WHERE id = ?", id)(extractChannel)
+  }
+
+  def sqliteChannelMemberRepo(db: Sqlite): ChannelMemberRepo = new ChannelMemberRepo {
+    def add(m: ChannelMember): IO[AgentError, Unit] =
+      db.execute(
+        "INSERT OR IGNORE INTO channel_members (channel_id, person_id) VALUES (?, ?)",
+        m.channelId, m.personId
+      )
+
+    def findByChannel(channelId: ChannelId): IO[AgentError, List[ChannelMember]] =
+      db.query("SELECT * FROM channel_members WHERE channel_id = ?", channelId)(extractChannelMember)
+  }
+
+  def sqliteMessageRepo(db: Sqlite): MessageRepo = new MessageRepo {
+    def create(m: Message): IO[AgentError, Unit] =
+      db.execute(
+        "INSERT INTO messages (id, channel_id, role, person_id_from, content, tool_calls_json, external_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        m.id, m.channelId, MessageRole.asString(m.role), m.personIdFrom,
+        m.content, m.toolCallsJson, m.externalId, m.createdAt
+      )
+
+    def findByChannel(channelId: ChannelId, since: Option[Instant], limit: Int): IO[AgentError, List[Message]] = {
+      val clauses = Clause("channel_id = ?", List(channelId)) :: List(
+        Clause.of("created_at >= ?")(since)
+      ).flatten
+      val sql = s"SELECT * FROM messages WHERE ${clauses.map(_.sql).mkString(" AND ")} ORDER BY created_at DESC LIMIT ?"
+      db.query(sql, (paramsOf(clauses) :+ limit): _*)(extractMessage)
+    }
   }
 }
