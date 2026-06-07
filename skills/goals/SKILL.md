@@ -39,7 +39,6 @@ The immutability of `outcome` and `evidence-rule` is by design: it prevents envi
 safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
   "person goal propose \
     --owner fred \
-    --scope fred_work \
     --title 'Approve Q3 report' \
     --outcome 'Q3 report committed to main branch and acknowledged by stakeholders' \
     --evidence-rule 'Git commit hash on main + stakeholder confirmation email' \
@@ -50,7 +49,7 @@ safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
 
 ```
 safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
-  "person goal list --owner fred --scope fred_work --status open"
+  "person goal list --owner fred --status open"
 ```
 
 ### Show a goal (with evidence)

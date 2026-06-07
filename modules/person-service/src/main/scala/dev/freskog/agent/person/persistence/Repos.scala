@@ -1,8 +1,10 @@
 package dev.freskog.agent.person.persistence
 
-import dev.freskog.agent.common.{Scope => PersonScope, _}
+import dev.freskog.agent.common._
+import dev.freskog.agent.common.JsonCodecs._
 
 import zio._
+import zio.json._
 
 import java.sql.ResultSet
 import java.time.Instant
@@ -13,48 +15,62 @@ trait PersonRepo {
   def findById(id: PersonId): IO[AgentError, Option[Person]]
 }
 
-trait ScopeRepo {
-  def create(scope: PersonScope): IO[AgentError, Unit]
-  def findAll: IO[AgentError, List[PersonScope]]
-}
-
-trait ScopeRoleRepo {
-  def create(role: PersonScopeRole): IO[AgentError, Unit]
-  def findByPerson(personId: PersonId): IO[AgentError, List[PersonScopeRole]]
-}
-
 trait CommitmentRepo {
   def create(commitment: Commitment): IO[AgentError, Unit]
-  def findAll(ownerPersonId: Option[PersonId], scopeId: Option[ScopeId], status: Option[String]): IO[AgentError, List[Commitment]]
+  def findAll(ownerPersonId: Option[PersonId], status: Option[String]): IO[AgentError, List[Commitment]]
+  def findBySource(ownerPersonId: PersonId, source: String): IO[AgentError, Option[Commitment]]
+  def updateContent(id: CommitmentId, text: String, evidence: String, dueAt: Option[Instant], updatedAt: Instant): IO[AgentError, Unit]
 }
 
 trait MemoryRepo {
   def create(item: MemoryItem): IO[AgentError, Unit]
-  def findAll(personId: Option[PersonId], scopeId: Option[ScopeId]): IO[AgentError, List[MemoryItem]]
+  def findAll(personId: Option[PersonId]): IO[AgentError, List[MemoryItem]]
   def findById(id: MemoryId): IO[AgentError, Option[MemoryItem]]
   def updateStatus(id: MemoryId, status: MemoryStatus, updatedAt: Instant): IO[AgentError, Unit]
   def setSupersededBy(oldId: MemoryId, newId: MemoryId, updatedAt: Instant): IO[AgentError, Unit]
-  def searchFts(query: String, scopeId: Option[ScopeId], personId: Option[PersonId], kind: Option[String], statusEq: Option[String], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryItem]]
-  def listAccepted(scopeId: Option[ScopeId], personId: Option[PersonId], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryItem]]
+  def searchFts(query: String, personId: Option[PersonId], kind: Option[String], statusEq: Option[String], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryItem]]
+  def listAccepted(personId: Option[PersonId], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryItem]]
+  /** Accepted, currently-valid, non-superseded facts whose source begins with
+   *  `prefix` (e.g. `onboarding`) — the pinned profile, ordered oldest-first. */
+  def listBySourcePrefix(prefix: String, asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryItem]]
   def findEventsWithMemory(eventIds: List[EventId]): IO[AgentError, Set[EventId]]
 }
 
 trait ApprovalRepo {
   def create(approval: Approval): IO[AgentError, Unit]
-  def findAll(scopeId: Option[ScopeId], status: Option[String]): IO[AgentError, List[Approval]]
+  def findAll(status: Option[String]): IO[AgentError, List[Approval]]
 }
 
 trait AuditRepo {
   def create(event: AuditEvent): IO[AgentError, Unit]
-  def list(scopeId: Option[ScopeId], category: Option[String], since: Option[Instant], until: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]]
-  def searchFts(query: String, scopeId: Option[ScopeId], category: Option[String], since: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]]
+  def list(category: Option[String], since: Option[Instant], until: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]]
+  def searchFts(query: String, category: Option[String], since: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]]
 }
 
 trait GoalRepo {
   def create(goal: Goal): IO[AgentError, Unit]
-  def findAll(ownerPersonId: Option[PersonId], scopeId: Option[ScopeId], status: Option[String]): IO[AgentError, List[Goal]]
+  def findAll(ownerPersonId: Option[PersonId], status: Option[String]): IO[AgentError, List[Goal]]
   def findById(id: GoalId): IO[AgentError, Option[Goal]]
+  def findBySource(ownerPersonId: PersonId, source: String): IO[AgentError, Option[Goal]]
   def updateStatus(id: GoalId, status: GoalStatus, blockedReason: Option[String], updatedAt: Instant): IO[AgentError, Unit]
+  def updateContent(id: GoalId, title: String, constraintsJson: Option[String], updatedAt: Instant): IO[AgentError, Unit]
+}
+
+trait EntityRepo {
+  def create(entity: Entity): IO[AgentError, Unit]
+  def findById(id: EntityId): IO[AgentError, Option[Entity]]
+  def findAll(kind: Option[String], status: Option[String]): IO[AgentError, List[Entity]]
+  def findByName(name: String, status: Option[String]): IO[AgentError, List[Entity]]
+  def updateStatus(id: EntityId, status: MemoryStatus, updatedAt: Instant): IO[AgentError, Unit]
+  def setSupersededBy(oldId: EntityId, newId: EntityId, updatedAt: Instant): IO[AgentError, Unit]
+}
+
+trait RelationshipRepo {
+  def create(rel: Relationship): IO[AgentError, Unit]
+  def findById(id: RelationshipId): IO[AgentError, Option[Relationship]]
+  def findAll(fromId: Option[String], toId: Option[String], relType: Option[String], status: Option[String], asOf: Option[Instant]): IO[AgentError, List[Relationship]]
+  def updateStatus(id: RelationshipId, status: MemoryStatus, updatedAt: Instant): IO[AgentError, Unit]
+  def setSupersededBy(oldId: RelationshipId, newId: RelationshipId, updatedAt: Instant): IO[AgentError, Unit]
 }
 
 trait GoalEvidenceRepo {
@@ -76,6 +92,20 @@ trait ChannelMemberRepo {
 trait MessageRepo {
   def create(message: Message): IO[AgentError, Unit]
   def findByChannel(channelId: ChannelId, since: Option[Instant], limit: Int): IO[AgentError, List[Message]]
+}
+
+trait CredentialRepo {
+  def upsert(credential: Credential): IO[AgentError, Unit]
+  def findByOwner(provider: String, ownerPersonId: PersonId): IO[AgentError, Option[Credential]]
+}
+
+trait InboxMessageRepo {
+  def upsert(message: InboxMessage): IO[AgentError, Unit]
+  def findById(id: InboxMessageId): IO[AgentError, Option[InboxMessage]]
+  def findAll(ownerPersonId: Option[PersonId], status: Option[String], limit: Int, oldestFirst: Boolean = false): IO[AgentError, List[InboxMessage]]
+  def existsExternal(provider: String, externalId: String, ownerPersonId: PersonId): IO[AgentError, Boolean]
+  def updateStatus(id: InboxMessageId, status: TriageStatus, triagedAt: Instant, sourceEventId: Option[EventId]): IO[AgentError, Unit]
+  def countPending(ownerPersonId: PersonId): IO[AgentError, Int]
 }
 
 object Repos {
@@ -100,26 +130,10 @@ object Repos {
       active = rs.getInt("active") != 0
     )
 
-  private def extractScope(rs: ResultSet): PersonScope =
-    PersonScope(
-      id = ScopeId(col(rs, "id")),
-      name = col(rs, "name"),
-      ownerPersonId = opt(rs, "owner_person_id").map(PersonId),
-      kind = ScopeKind.fromString(col(rs, "kind")).getOrElse(ScopeKind.Other)
-    )
-
-  private def extractRole(rs: ResultSet): PersonScopeRole =
-    PersonScopeRole(
-      personId = PersonId(col(rs, "person_id")),
-      scopeId = ScopeId(col(rs, "scope_id")),
-      role = ScopeRole.fromString(col(rs, "role")).getOrElse(ScopeRole.Viewer)
-    )
-
   private def extractCommitment(rs: ResultSet): Commitment =
     Commitment(
       id = CommitmentId(col(rs, "id")),
       ownerPersonId = PersonId(col(rs, "owner_person_id")),
-      scopeId = ScopeId(col(rs, "scope_id")),
       status = CommitmentStatus.fromString(col(rs, "status")).getOrElse(CommitmentStatus.Proposed),
       text = col(rs, "text"),
       source = col(rs, "source"),
@@ -133,7 +147,6 @@ object Repos {
     MemoryItem(
       id = MemoryId(col(rs, "id")),
       personId = opt(rs, "person_id").map(PersonId),
-      scopeId = opt(rs, "scope_id").map(ScopeId),
       status = MemoryStatus.fromString(col(rs, "status")).getOrElse(MemoryStatus.Proposed),
       kind = MemoryKind.fromString(col(rs, "kind")).getOrElse(MemoryKind.Fact),
       text = col(rs, "text"),
@@ -152,7 +165,6 @@ object Repos {
       id = ApprovalId(col(rs, "id")),
       requestedBy = col(rs, "requested_by"),
       requiredPersonId = opt(rs, "required_person_id").map(PersonId),
-      scopeId = opt(rs, "scope_id").map(ScopeId),
       actionType = col(rs, "action_type"),
       payloadJson = col(rs, "payload_json"),
       status = ApprovalStatus.fromString(col(rs, "status")).getOrElse(ApprovalStatus.Requested),
@@ -168,7 +180,6 @@ object Repos {
       category = opt(rs, "category").getOrElse(EventCategory.State),
       targetType = col(rs, "target_type"),
       targetId = opt(rs, "target_id"),
-      scopeId = opt(rs, "scope_id").map(ScopeId),
       text = opt(rs, "text"),
       payloadJson = col(rs, "payload_json"),
       createdAt = instant(rs, "created_at")
@@ -178,7 +189,6 @@ object Repos {
     Goal(
       id = GoalId(col(rs, "id")),
       ownerPersonId = PersonId(col(rs, "owner_person_id")),
-      scopeId = ScopeId(col(rs, "scope_id")),
       title = col(rs, "title"),
       outcome = col(rs, "outcome"),
       evidenceRule = col(rs, "evidence_rule"),
@@ -198,6 +208,39 @@ object Repos {
       ref = col(rs, "ref"),
       note = opt(rs, "note"),
       recordedAt = instant(rs, "recorded_at")
+    )
+
+  private def extractEntity(rs: ResultSet): Entity =
+    Entity(
+      id = EntityId(col(rs, "id")),
+      kind = EntityKind.fromString(col(rs, "kind")).getOrElse(EntityKind.Other),
+      name = col(rs, "name"),
+      attributesJson = opt(rs, "attributes_json"),
+      status = MemoryStatus.fromString(col(rs, "status")).getOrElse(MemoryStatus.Proposed),
+      source = col(rs, "source"),
+      confidence = optDouble(rs, "confidence"),
+      supersededById = opt(rs, "superseded_by_id").map(EntityId),
+      createdAt = instant(rs, "created_at"),
+      updatedAt = instant(rs, "updated_at")
+    )
+
+  private def extractRelationship(rs: ResultSet): Relationship =
+    Relationship(
+      id = RelationshipId(col(rs, "id")),
+      fromId = col(rs, "from_id"),
+      fromKind = NodeKind.fromString(col(rs, "from_kind")).getOrElse(NodeKind.Person),
+      relType = col(rs, "rel_type"),
+      toId = col(rs, "to_id"),
+      toKind = NodeKind.fromString(col(rs, "to_kind")).getOrElse(NodeKind.Person),
+      status = MemoryStatus.fromString(col(rs, "status")).getOrElse(MemoryStatus.Proposed),
+      source = col(rs, "source"),
+      confidence = optDouble(rs, "confidence"),
+      note = opt(rs, "note"),
+      supersededById = opt(rs, "superseded_by_id").map(RelationshipId),
+      validFrom = optInstant(rs, "valid_from"),
+      validUntil = optInstant(rs, "valid_until"),
+      createdAt = instant(rs, "created_at"),
+      updatedAt = instant(rs, "updated_at")
     )
 
   private def extractChannel(rs: ResultSet): Channel =
@@ -224,6 +267,39 @@ object Repos {
       externalId = opt(rs, "external_id"),
       createdAt = instant(rs, "created_at")
     )
+
+  private def extractCredential(rs: ResultSet): Credential =
+    Credential(
+      id = CredentialId(col(rs, "id")),
+      provider = col(rs, "provider"),
+      accountEmail = col(rs, "account_email"),
+      ownerPersonId = PersonId(col(rs, "owner_person_id")),
+      accessToken = col(rs, "access_token"),
+      refreshToken = col(rs, "refresh_token"),
+      expiresAt = instant(rs, "expires_at"),
+      scopes = col(rs, "scopes"),
+      updatedAt = instant(rs, "updated_at")
+    )
+
+  private def extractInboxMessage(rs: ResultSet): InboxMessage =
+    InboxMessage(
+      id = InboxMessageId(col(rs, "id")),
+      provider = col(rs, "provider"),
+      externalId = col(rs, "external_id"),
+      threadId = opt(rs, "thread_id"),
+      fromAddr = col(rs, "from_addr"),
+      subject = col(rs, "subject"),
+      bodyText = col(rs, "body_text"),
+      receivedAt = instant(rs, "received_at"),
+      ownerPersonId = PersonId(col(rs, "owner_person_id")),
+      triageStatus = TriageStatus.fromString(col(rs, "triage_status")).getOrElse(TriageStatus.Pending),
+      triagedAt = optInstant(rs, "triaged_at"),
+      sourceEventId = opt(rs, "source_event_id").map(EventId),
+      attachments = decodeAttachments(opt(rs, "attachments_json"))
+    )
+
+  private def decodeAttachments(json: Option[String]): List[InboxAttachment] =
+    json.flatMap(_.fromJson[List[InboxAttachment]].toOption).getOrElse(Nil)
 
   // --- Composable WHERE-clause builder ---
 
@@ -257,44 +333,6 @@ object Repos {
       db.queryOne("SELECT * FROM persons WHERE id = ?", id)(extractPerson)
   }
 
-  def sqliteScopeRepo(db: Sqlite): ScopeRepo = new ScopeRepo {
-    private def kindStr(k: ScopeKind): String = k match {
-      case ScopeKind.Private   => "private"
-      case ScopeKind.Shared    => "shared"
-      case ScopeKind.Work      => "work"
-      case ScopeKind.Household => "household"
-      case ScopeKind.School    => "school"
-      case ScopeKind.Other     => "other"
-    }
-
-    def create(s: PersonScope): IO[AgentError, Unit] =
-      db.execute(
-        "INSERT INTO scopes (id, name, owner_person_id, kind) VALUES (?, ?, ?, ?)",
-        s.id, s.name, s.ownerPersonId, kindStr(s.kind)
-      )
-
-    def findAll: IO[AgentError, List[PersonScope]] =
-      db.query("SELECT * FROM scopes")(extractScope)
-  }
-
-  def sqliteScopeRoleRepo(db: Sqlite): ScopeRoleRepo = new ScopeRoleRepo {
-    private def roleStr(r: ScopeRole): String = r match {
-      case ScopeRole.Owner    => "owner"
-      case ScopeRole.Editor   => "editor"
-      case ScopeRole.Viewer   => "viewer"
-      case ScopeRole.Proposer => "proposer"
-    }
-
-    def create(r: PersonScopeRole): IO[AgentError, Unit] =
-      db.execute(
-        "INSERT INTO person_scope_roles (person_id, scope_id, role) VALUES (?, ?, ?)",
-        r.personId, r.scopeId, roleStr(r.role)
-      )
-
-    def findByPerson(personId: PersonId): IO[AgentError, List[PersonScopeRole]] =
-      db.query("SELECT * FROM person_scope_roles WHERE person_id = ?", personId)(extractRole)
-  }
-
   def sqliteCommitmentRepo(db: Sqlite): CommitmentRepo = new CommitmentRepo {
     private def statusStr(s: CommitmentStatus): String = s match {
       case CommitmentStatus.Proposed  => "proposed"
@@ -306,35 +344,45 @@ object Repos {
 
     def create(c: Commitment): IO[AgentError, Unit] =
       db.execute(
-        "INSERT INTO commitments (id, owner_person_id, scope_id, status, text, source, evidence, due_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        c.id, c.ownerPersonId, c.scopeId, statusStr(c.status), c.text, c.source, c.evidence,
+        "INSERT INTO commitments (id, owner_person_id, status, text, source, evidence, due_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        c.id, c.ownerPersonId, statusStr(c.status), c.text, c.source, c.evidence,
         c.dueAt, c.createdAt, c.updatedAt
       )
 
-    def findAll(ownerPersonId: Option[PersonId], scopeId: Option[ScopeId], status: Option[String]): IO[AgentError, List[Commitment]] = {
+    def findAll(ownerPersonId: Option[PersonId], status: Option[String]): IO[AgentError, List[Commitment]] = {
       val clauses = List(
         Clause.of("owner_person_id = ?")(ownerPersonId),
-        Clause.of("scope_id = ?")(scopeId),
         Clause.of("status = ?")(status)
       ).flatten
       val sql = s"SELECT * FROM commitments${whereSql("WHERE", clauses)} ORDER BY created_at DESC"
       db.query(sql, paramsOf(clauses): _*)(extractCommitment)
     }
+
+    def findBySource(ownerPersonId: PersonId, source: String): IO[AgentError, Option[Commitment]] =
+      db.queryOne(
+        "SELECT * FROM commitments WHERE owner_person_id = ? AND source = ? ORDER BY created_at DESC LIMIT 1",
+        ownerPersonId, source
+      )(extractCommitment)
+
+    def updateContent(id: CommitmentId, text: String, evidence: String, dueAt: Option[Instant], updatedAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE commitments SET text = ?, evidence = ?, due_at = ?, updated_at = ? WHERE id = ?",
+        text, evidence, dueAt, updatedAt, id
+      )
   }
 
   def sqliteMemoryRepo(db: Sqlite): MemoryRepo = new MemoryRepo {
     def create(m: MemoryItem): IO[AgentError, Unit] =
       db.execute(
-        "INSERT INTO memory_items (id, person_id, scope_id, status, kind, text, source, confidence, created_at, updated_at, superseded_by_id, valid_from, valid_until, origin_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        m.id, m.personId, m.scopeId, MemoryStatus.asString(m.status), MemoryKind.asString(m.kind),
+        "INSERT INTO memory_items (id, person_id, status, kind, text, source, confidence, created_at, updated_at, superseded_by_id, valid_from, valid_until, origin_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        m.id, m.personId, MemoryStatus.asString(m.status), MemoryKind.asString(m.kind),
         m.text, m.source, m.confidence, m.createdAt, m.updatedAt,
         m.supersededById, m.validFrom, m.validUntil, m.originEventId
       )
 
-    def findAll(personId: Option[PersonId], scopeId: Option[ScopeId]): IO[AgentError, List[MemoryItem]] = {
+    def findAll(personId: Option[PersonId]): IO[AgentError, List[MemoryItem]] = {
       val clauses = List(
-        Clause.of("person_id = ?")(personId),
-        Clause.of("scope_id = ?")(scopeId)
+        Clause.of("person_id = ?")(personId)
       ).flatten
       val sql = s"SELECT * FROM memory_items${whereSql("WHERE", clauses)} ORDER BY created_at DESC"
       db.query(sql, paramsOf(clauses): _*)(extractMemory)
@@ -355,10 +403,9 @@ object Repos {
         newId, updatedAt, oldId
       )
 
-    def searchFts(query: String, scopeId: Option[ScopeId], personId: Option[PersonId], kind: Option[String], statusEq: Option[String], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryItem]] = {
+    def searchFts(query: String, personId: Option[PersonId], kind: Option[String], statusEq: Option[String], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryItem]] = {
       val clauses = List(
         Some(Clause("memory_items_fts MATCH ?", List(query))),
-        Clause.of("m.scope_id = ?")(scopeId),
         Clause.of("m.person_id = ?")(personId),
         Clause.of("m.kind = ?")(kind),
         Clause.of("m.status = ?")(statusEq)
@@ -372,9 +419,8 @@ object Repos {
       db.query(sql, (paramsOf(clauses) :+ limit): _*)(extractMemory)
     }
 
-    def listAccepted(scopeId: Option[ScopeId], personId: Option[PersonId], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryItem]] = {
+    def listAccepted(personId: Option[PersonId], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryItem]] = {
       val clauses = Clause("m1.status = 'accepted'") :: List(
-        Clause.of("m1.scope_id = ?")(scopeId),
         Clause.of("m1.person_id = ?")(personId)
       ).flatten ::: temporalClauses("m1", asOf)
       val sql =
@@ -382,6 +428,19 @@ object Repos {
            | LEFT JOIN memory_items m2 ON m1.superseded_by_id = m2.id
            | WHERE ${clauses.map(_.sql).mkString(" AND ")}
            | ORDER BY m1.created_at DESC LIMIT ?""".stripMargin
+      db.query(sql, (paramsOf(clauses) :+ limit): _*)(extractMemory)
+    }
+
+    def listBySourcePrefix(prefix: String, asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryItem]] = {
+      val clauses = List(
+        Clause("m1.status = 'accepted'"),
+        Clause("m1.source LIKE ?", List(prefix + "%"))
+      ) ::: temporalClauses("m1", asOf)
+      val sql =
+        s"""SELECT m1.* FROM memory_items m1
+           | LEFT JOIN memory_items m2 ON m1.superseded_by_id = m2.id
+           | WHERE ${clauses.map(_.sql).mkString(" AND ")}
+           | ORDER BY m1.created_at ASC LIMIT ?""".stripMargin
       db.query(sql, (paramsOf(clauses) :+ limit): _*)(extractMemory)
     }
 
@@ -422,14 +481,13 @@ object Repos {
 
     def create(a: Approval): IO[AgentError, Unit] =
       db.execute(
-        "INSERT INTO approvals (id, requested_by, required_person_id, scope_id, action_type, payload_json, status, created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        a.id, a.requestedBy, a.requiredPersonId, a.scopeId,
+        "INSERT INTO approvals (id, requested_by, required_person_id, action_type, payload_json, status, created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        a.id, a.requestedBy, a.requiredPersonId,
         a.actionType, a.payloadJson, statusStr(a.status), a.createdAt, a.decidedAt
       )
 
-    def findAll(scopeId: Option[ScopeId], status: Option[String]): IO[AgentError, List[Approval]] = {
+    def findAll(status: Option[String]): IO[AgentError, List[Approval]] = {
       val clauses = List(
-        Clause.of("scope_id = ?")(scopeId),
         Clause.of("status = ?")(status)
       ).flatten
       val sql = s"SELECT * FROM approvals${whereSql("WHERE", clauses)} ORDER BY created_at DESC"
@@ -440,14 +498,13 @@ object Repos {
   def sqliteAuditRepo(db: Sqlite): AuditRepo = new AuditRepo {
     def create(e: AuditEvent): IO[AgentError, Unit] =
       db.execute(
-        "INSERT INTO audit_events (id, actor, action, category, target_type, target_id, scope_id, text, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        e.id, e.actor, e.action, e.category, e.targetType, e.targetId, e.scopeId,
+        "INSERT INTO audit_events (id, actor, action, category, target_type, target_id, text, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        e.id, e.actor, e.action, e.category, e.targetType, e.targetId,
         e.text, e.payloadJson, e.createdAt
       )
 
-    def list(scopeId: Option[ScopeId], category: Option[String], since: Option[Instant], until: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]] = {
+    def list(category: Option[String], since: Option[Instant], until: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]] = {
       val clauses = List(
-        Clause.of("scope_id = ?")(scopeId),
         Clause.of("category = ?")(category),
         Clause.of("created_at >= ?")(since),
         Clause.of("created_at < ?")(until)
@@ -456,9 +513,8 @@ object Repos {
       db.query(sql, (paramsOf(clauses) :+ limit): _*)(extractEvent)
     }
 
-    def searchFts(query: String, scopeId: Option[ScopeId], category: Option[String], since: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]] = {
+    def searchFts(query: String, category: Option[String], since: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]] = {
       val clauses = Clause("audit_events_fts MATCH ?", List(query)) :: List(
-        Clause.of("e.scope_id = ?")(scopeId),
         Clause.of("e.category = ?")(category),
         Clause.of("e.created_at >= ?")(since)
       ).flatten
@@ -474,16 +530,15 @@ object Repos {
   def sqliteGoalRepo(db: Sqlite): GoalRepo = new GoalRepo {
     def create(g: Goal): IO[AgentError, Unit] =
       db.execute(
-        "INSERT INTO goals (id, owner_person_id, scope_id, title, outcome, evidence_rule, constraints_json, status, blocked_reason, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        g.id, g.ownerPersonId, g.scopeId, g.title, g.outcome, g.evidenceRule,
+        "INSERT INTO goals (id, owner_person_id, title, outcome, evidence_rule, constraints_json, status, blocked_reason, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        g.id, g.ownerPersonId, g.title, g.outcome, g.evidenceRule,
         g.constraintsJson, GoalStatus.asString(g.status), g.blockedReason,
         g.source, g.createdAt, g.updatedAt
       )
 
-    def findAll(ownerPersonId: Option[PersonId], scopeId: Option[ScopeId], status: Option[String]): IO[AgentError, List[Goal]] = {
+    def findAll(ownerPersonId: Option[PersonId], status: Option[String]): IO[AgentError, List[Goal]] = {
       val clauses = List(
         Clause.of("owner_person_id = ?")(ownerPersonId),
-        Clause.of("scope_id = ?")(scopeId),
         Clause.of("status = ?")(status)
       ).flatten
       val sql = s"SELECT * FROM goals${whereSql("WHERE", clauses)} ORDER BY created_at DESC"
@@ -493,10 +548,24 @@ object Repos {
     def findById(id: GoalId): IO[AgentError, Option[Goal]] =
       db.queryOne("SELECT * FROM goals WHERE id = ?", id)(extractGoal)
 
+    def findBySource(ownerPersonId: PersonId, source: String): IO[AgentError, Option[Goal]] =
+      db.queryOne(
+        "SELECT * FROM goals WHERE owner_person_id = ? AND source = ? ORDER BY created_at DESC LIMIT 1",
+        ownerPersonId, source
+      )(extractGoal)
+
     def updateStatus(id: GoalId, status: GoalStatus, blockedReason: Option[String], updatedAt: Instant): IO[AgentError, Unit] =
       db.execute(
         "UPDATE goals SET status = ?, blocked_reason = ?, updated_at = ? WHERE id = ?",
         GoalStatus.asString(status), blockedReason, updatedAt, id
+      )
+
+    /** Re-propose-by-source updates only mutable display fields; `outcome` and
+     *  `evidence_rule` are immutable by design and are deliberately left alone. */
+    def updateContent(id: GoalId, title: String, constraintsJson: Option[String], updatedAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE goals SET title = ?, constraints_json = ?, updated_at = ? WHERE id = ?",
+        title, constraintsJson, updatedAt, id
       )
   }
 
@@ -512,6 +581,95 @@ object Repos {
         "SELECT * FROM goal_evidence WHERE goal_id = ? ORDER BY recorded_at ASC",
         goalId
       )(extractGoalEvidence)
+  }
+
+  def sqliteEntityRepo(db: Sqlite): EntityRepo = new EntityRepo {
+    def create(e: Entity): IO[AgentError, Unit] =
+      db.execute(
+        "INSERT INTO entities (id, kind, name, attributes_json, status, source, confidence, superseded_by_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        e.id, EntityKind.asString(e.kind), e.name, e.attributesJson, MemoryStatus.asString(e.status),
+        e.source, e.confidence, e.supersededById, e.createdAt, e.updatedAt
+      )
+
+    def findById(id: EntityId): IO[AgentError, Option[Entity]] =
+      db.queryOne("SELECT * FROM entities WHERE id = ?", id)(extractEntity)
+
+    def findAll(kind: Option[String], status: Option[String]): IO[AgentError, List[Entity]] = {
+      val clauses = List(
+        Clause.of("kind = ?")(kind),
+        Clause.of("status = ?")(status)
+      ).flatten
+      val sql = s"SELECT * FROM entities${whereSql("WHERE", clauses)} ORDER BY created_at DESC"
+      db.query(sql, paramsOf(clauses): _*)(extractEntity)
+    }
+
+    /** Case-insensitive substring match for entity resolution. */
+    def findByName(name: String, status: Option[String]): IO[AgentError, List[Entity]] = {
+      val clauses = Clause("name LIKE ? COLLATE NOCASE", List("%" + name + "%")) :: List(
+        Clause.of("status = ?")(status)
+      ).flatten
+      val sql = s"SELECT * FROM entities WHERE ${clauses.map(_.sql).mkString(" AND ")} ORDER BY created_at DESC"
+      db.query(sql, paramsOf(clauses): _*)(extractEntity)
+    }
+
+    def updateStatus(id: EntityId, status: MemoryStatus, updatedAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE entities SET status = ?, updated_at = ? WHERE id = ?",
+        MemoryStatus.asString(status), updatedAt, id
+      )
+
+    def setSupersededBy(oldId: EntityId, newId: EntityId, updatedAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE entities SET superseded_by_id = ?, updated_at = ? WHERE id = ?",
+        newId, updatedAt, oldId
+      )
+  }
+
+  def sqliteRelationshipRepo(db: Sqlite): RelationshipRepo = new RelationshipRepo {
+    def create(r: Relationship): IO[AgentError, Unit] =
+      db.execute(
+        "INSERT INTO relationships (id, from_id, from_kind, rel_type, to_id, to_kind, status, source, confidence, note, superseded_by_id, valid_from, valid_until, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        r.id, r.fromId, NodeKind.asString(r.fromKind), r.relType, r.toId, NodeKind.asString(r.toKind),
+        MemoryStatus.asString(r.status), r.source, r.confidence, r.note, r.supersededById,
+        r.validFrom, r.validUntil, r.createdAt, r.updatedAt
+      )
+
+    def findById(id: RelationshipId): IO[AgentError, Option[Relationship]] =
+      db.queryOne("SELECT * FROM relationships WHERE id = ?", id)(extractRelationship)
+
+    /** `asOf` (when set) keeps only edges currently active at that instant
+     *  (non-superseded, within valid_from/valid_until). With `None`, only the
+     *  non-superseded edges are returned (validity is left to the caller). */
+    def findAll(fromId: Option[String], toId: Option[String], relType: Option[String], status: Option[String], asOf: Option[Instant]): IO[AgentError, List[Relationship]] = {
+      val asOfClauses = asOf match {
+        case None     => List(Clause("superseded_by_id IS NULL"))
+        case Some(ts) => List(
+          Clause("superseded_by_id IS NULL"),
+          Clause("(valid_from IS NULL OR valid_from <= ?)", List(ts)),
+          Clause("(valid_until IS NULL OR valid_until > ?)", List(ts))
+        )
+      }
+      val clauses = List(
+        Clause.of("from_id = ?")(fromId),
+        Clause.of("to_id = ?")(toId),
+        Clause.of("rel_type = ?")(relType),
+        Clause.of("status = ?")(status)
+      ).flatten ::: asOfClauses
+      val sql = s"SELECT * FROM relationships WHERE ${clauses.map(_.sql).mkString(" AND ")} ORDER BY created_at DESC"
+      db.query(sql, paramsOf(clauses): _*)(extractRelationship)
+    }
+
+    def updateStatus(id: RelationshipId, status: MemoryStatus, updatedAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE relationships SET status = ?, updated_at = ? WHERE id = ?",
+        MemoryStatus.asString(status), updatedAt, id
+      )
+
+    def setSupersededBy(oldId: RelationshipId, newId: RelationshipId, updatedAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE relationships SET superseded_by_id = ?, updated_at = ? WHERE id = ?",
+        newId, updatedAt, oldId
+      )
   }
 
   def sqliteChannelRepo(db: Sqlite): ChannelRepo = new ChannelRepo {
@@ -554,5 +712,72 @@ object Repos {
       val sql = s"SELECT * FROM messages WHERE ${clauses.map(_.sql).mkString(" AND ")} ORDER BY created_at DESC LIMIT ?"
       db.query(sql, (paramsOf(clauses) :+ limit): _*)(extractMessage)
     }
+  }
+
+  def sqliteCredentialRepo(db: Sqlite): CredentialRepo = new CredentialRepo {
+    def upsert(c: Credential): IO[AgentError, Unit] =
+      db.execute(
+        """INSERT INTO credentials (id, provider, account_email, owner_person_id, access_token, refresh_token, expires_at, scopes, updated_at)
+          | VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          | ON CONFLICT(provider, owner_person_id) DO UPDATE SET
+          |   account_email = excluded.account_email,
+          |   access_token = excluded.access_token,
+          |   refresh_token = excluded.refresh_token,
+          |   expires_at = excluded.expires_at,
+          |   scopes = excluded.scopes,
+          |   updated_at = excluded.updated_at""".stripMargin,
+        c.id, c.provider, c.accountEmail, c.ownerPersonId, c.accessToken, c.refreshToken,
+        c.expiresAt, c.scopes, c.updatedAt
+      )
+
+    def findByOwner(provider: String, ownerPersonId: PersonId): IO[AgentError, Option[Credential]] =
+      db.queryOne(
+        "SELECT * FROM credentials WHERE provider = ? AND owner_person_id = ?",
+        provider, ownerPersonId
+      )(extractCredential)
+  }
+
+  def sqliteInboxMessageRepo(db: Sqlite): InboxMessageRepo = new InboxMessageRepo {
+    def upsert(m: InboxMessage): IO[AgentError, Unit] =
+      db.execute(
+        """INSERT INTO inbox_messages (id, provider, external_id, thread_id, from_addr, subject, body_text,
+          | received_at, owner_person_id, triage_status, triaged_at, source_event_id, attachments_json)
+          | VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          | ON CONFLICT(provider, external_id, owner_person_id) DO NOTHING""".stripMargin,
+        m.id, m.provider, m.externalId, m.threadId, m.fromAddr, m.subject, m.bodyText,
+        m.receivedAt, m.ownerPersonId, TriageStatus.asString(m.triageStatus),
+        m.triagedAt, m.sourceEventId, m.attachments.toJson
+      )
+
+    def findById(id: InboxMessageId): IO[AgentError, Option[InboxMessage]] =
+      db.queryOne("SELECT * FROM inbox_messages WHERE id = ?", id)(extractInboxMessage)
+
+    def findAll(ownerPersonId: Option[PersonId], status: Option[String], limit: Int, oldestFirst: Boolean = false): IO[AgentError, List[InboxMessage]] = {
+      val clauses = List(
+        Clause.of("owner_person_id = ?")(ownerPersonId),
+        Clause.of("triage_status = ?")(status)
+      ).flatten
+      val order = if (oldestFirst) "ASC" else "DESC"
+      val sql = s"SELECT * FROM inbox_messages${whereSql("WHERE", clauses)} ORDER BY received_at $order LIMIT ?"
+      db.query(sql, (paramsOf(clauses) :+ limit): _*)(extractInboxMessage)
+    }
+
+    def existsExternal(provider: String, externalId: String, ownerPersonId: PersonId): IO[AgentError, Boolean] =
+      db.queryOne(
+        "SELECT 1 FROM inbox_messages WHERE provider = ? AND external_id = ? AND owner_person_id = ?",
+        provider, externalId, ownerPersonId
+      )(_ => 1).map(_.isDefined)
+
+    def updateStatus(id: InboxMessageId, status: TriageStatus, triagedAt: Instant, sourceEventId: Option[EventId]): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE inbox_messages SET triage_status = ?, triaged_at = ?, source_event_id = ? WHERE id = ?",
+        TriageStatus.asString(status), triagedAt, sourceEventId, id
+      )
+
+    def countPending(ownerPersonId: PersonId): IO[AgentError, Int] =
+      db.queryOne(
+        "SELECT COUNT(*) AS cnt FROM inbox_messages WHERE owner_person_id = ? AND triage_status = 'pending'",
+        ownerPersonId
+      )(_.getInt("cnt")).map(_.getOrElse(0))
   }
 }

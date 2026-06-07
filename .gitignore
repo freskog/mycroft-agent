@@ -11,5 +11,21 @@ project/project/
 .cursor/
 .bloop/
 
-# safe-run / shell_run command logs
+# safe-run / safe_run command logs
 .agent/
+
+# Gmail OAuth client secret
+modules/person-service/src/main/resources/client-secret.json
+
+# SQLite databases (hold OAuth refresh tokens + personal state) — never commit,
+# even if PERSON_SERVICE_DB is pointed somewhere inside the repo.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# Generic secret/credential drops
+*.env
+.env
+client-secret*.json
+*-credentials.json

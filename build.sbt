@@ -115,7 +115,7 @@ lazy val personCli = (project in file("modules/person-cli"))
   )
 
 lazy val mycroft = (project in file("modules/mycroft"))
-  .dependsOn(common, safeRun)
+  .dependsOn(common, safeRun, runtime)
   .enablePlugins(NativeImagePlugin)
   .settings(commonSettings)
   .settings(

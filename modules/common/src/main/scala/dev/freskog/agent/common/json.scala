@@ -56,31 +56,19 @@ object JsonCodecs {
       }
     }
 
-  // --- ScopeKind ---
-  implicit val scopeKindEncoder: JsonEncoder[ScopeKind] =
-    JsonEncoder.string.contramap {
-      case ScopeKind.Private   => "private"
-      case ScopeKind.Shared    => "shared"
-      case ScopeKind.Work      => "work"
-      case ScopeKind.Household => "household"
-      case ScopeKind.School    => "school"
-      case ScopeKind.Other     => "other"
-    }
+  // --- NodeKind ---
+  implicit val nodeKindEncoder: JsonEncoder[NodeKind] =
+    JsonEncoder.string.contramap(NodeKind.asString)
 
-  implicit val scopeKindDecoder: JsonDecoder[ScopeKind] =
-    JsonDecoder.string.mapOrFail(ScopeKind.fromString)
+  implicit val nodeKindDecoder: JsonDecoder[NodeKind] =
+    JsonDecoder.string.mapOrFail(NodeKind.fromString)
 
-  // --- ScopeRole ---
-  implicit val scopeRoleEncoder: JsonEncoder[ScopeRole] =
-    JsonEncoder.string.contramap {
-      case ScopeRole.Owner    => "owner"
-      case ScopeRole.Editor   => "editor"
-      case ScopeRole.Viewer   => "viewer"
-      case ScopeRole.Proposer => "proposer"
-    }
+  // --- EntityKind ---
+  implicit val entityKindEncoder: JsonEncoder[EntityKind] =
+    JsonEncoder.string.contramap(EntityKind.asString)
 
-  implicit val scopeRoleDecoder: JsonDecoder[ScopeRole] =
-    JsonDecoder.string.mapOrFail(ScopeRole.fromString)
+  implicit val entityKindDecoder: JsonDecoder[EntityKind] =
+    JsonDecoder.string.mapOrFail(EntityKind.fromString)
 
   // --- CommitmentStatus ---
   implicit val commitmentStatusEncoder: JsonEncoder[CommitmentStatus] =
@@ -179,15 +167,25 @@ object JsonCodecs {
     )
 
   implicit val personIdCodec: JsonCodec[PersonId]               = idCodec(PersonId.apply, _.value)
-  implicit val scopeIdCodec: JsonCodec[ScopeId]                 = idCodec(ScopeId.apply, _.value)
   implicit val memoryIdCodec: JsonCodec[MemoryId]               = idCodec(MemoryId.apply, _.value)
   implicit val goalIdCodec: JsonCodec[GoalId]                   = idCodec(GoalId.apply, _.value)
   implicit val eventIdCodec: JsonCodec[EventId]                 = idCodec(EventId.apply, _.value)
   implicit val commitmentIdCodec: JsonCodec[CommitmentId]       = idCodec(CommitmentId.apply, _.value)
   implicit val approvalIdCodec: JsonCodec[ApprovalId]           = idCodec(ApprovalId.apply, _.value)
   implicit val goalEvidenceIdCodec: JsonCodec[GoalEvidenceId]   = idCodec(GoalEvidenceId.apply, _.value)
+  implicit val credentialIdCodec: JsonCodec[CredentialId]       = idCodec(CredentialId.apply, _.value)
+  implicit val inboxMessageIdCodec: JsonCodec[InboxMessageId]   = idCodec(InboxMessageId.apply, _.value)
+  implicit val calendarEventIdCodec: JsonCodec[CalendarEventId] = idCodec(CalendarEventId.apply, _.value)
   implicit val channelIdCodec: JsonCodec[ChannelId]             = idCodec(ChannelId.apply, _.value)
   implicit val messageIdCodec: JsonCodec[MessageId]             = idCodec(MessageId.apply, _.value)
+  implicit val entityIdCodec: JsonCodec[EntityId]               = idCodec(EntityId.apply, _.value)
+  implicit val relationshipIdCodec: JsonCodec[RelationshipId]   = idCodec(RelationshipId.apply, _.value)
+
+  implicit val triageStatusEncoder: JsonEncoder[TriageStatus] =
+    JsonEncoder.string.contramap(TriageStatus.asString)
+
+  implicit val triageStatusDecoder: JsonDecoder[TriageStatus] =
+    JsonDecoder.string.mapOrFail(TriageStatus.fromString)
 
   // --- MessageRole ---
   implicit val messageRoleEncoder: JsonEncoder[MessageRole] =
@@ -200,8 +198,9 @@ object JsonCodecs {
   implicit val runMetadataCodec: JsonCodec[RunMetadata]     = DeriveJsonCodec.gen[RunMetadata]
   implicit val errorResponseCodec: JsonCodec[ErrorResponse] = DeriveJsonCodec.gen[ErrorResponse]
   implicit val personCodec: JsonCodec[Person]               = DeriveJsonCodec.gen[Person]
-  implicit val scopeCodec: JsonCodec[Scope]                 = DeriveJsonCodec.gen[Scope]
-  implicit val personScopeRoleCodec: JsonCodec[PersonScopeRole] = DeriveJsonCodec.gen[PersonScopeRole]
+  implicit val entityCodec: JsonCodec[Entity]               = DeriveJsonCodec.gen[Entity]
+  implicit val relationshipCodec: JsonCodec[Relationship]   = DeriveJsonCodec.gen[Relationship]
+  implicit val householdGraphCodec: JsonCodec[HouseholdGraph] = DeriveJsonCodec.gen[HouseholdGraph]
   implicit val commitmentCodec: JsonCodec[Commitment]       = DeriveJsonCodec.gen[Commitment]
   implicit val memoryItemCodec: JsonCodec[MemoryItem]       = DeriveJsonCodec.gen[MemoryItem]
   implicit val approvalCodec: JsonCodec[Approval]           = DeriveJsonCodec.gen[Approval]
@@ -216,4 +215,8 @@ object JsonCodecs {
   implicit val channelMemberCodec: JsonCodec[ChannelMember] = DeriveJsonCodec.gen[ChannelMember]
   implicit val channelWithMembersCodec: JsonCodec[ChannelWithMembers] = DeriveJsonCodec.gen[ChannelWithMembers]
   implicit val messageCodec: JsonCodec[Message]             = DeriveJsonCodec.gen[Message]
+  implicit val credentialCodec: JsonCodec[Credential]       = DeriveJsonCodec.gen[Credential]
+  implicit val inboxAttachmentCodec: JsonCodec[InboxAttachment] = DeriveJsonCodec.gen[InboxAttachment]
+  implicit val inboxMessageCodec: JsonCodec[InboxMessage]   = DeriveJsonCodec.gen[InboxMessage]
+  implicit val calendarEventCodec: JsonCodec[CalendarEvent] = DeriveJsonCodec.gen[CalendarEvent]
 }

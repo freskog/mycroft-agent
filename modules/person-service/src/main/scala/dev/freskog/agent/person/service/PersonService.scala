@@ -1,9 +1,11 @@
 package dev.freskog.agent.person.service
 
-import dev.freskog.agent.common.{Scope => PersonScope, _}
+import dev.freskog.agent.common._
 import dev.freskog.agent.common.JsonCodecs._
 import dev.freskog.agent.person.domain._
 import dev.freskog.agent.person.persistence._
+import dev.freskog.agent.person.gmail._
+import dev.freskog.agent.person.calendar._
 
 import zio._
 import zio.json._
@@ -14,17 +16,14 @@ import java.util.UUID
 trait PersonService {
   def createPerson(req: CreatePersonRequest): IO[AgentError, Person]
   def listPersons: IO[AgentError, List[Person]]
-  def createScope(req: CreateScopeRequest): IO[AgentError, PersonScope]
-  def listScopes: IO[AgentError, List[PersonScope]]
-  def createScopeRole(req: CreateScopeRoleRequest): IO[AgentError, PersonScopeRole]
   def proposeCommitment(req: ProposeCommitmentRequest): IO[AgentError, Commitment]
-  def listCommitments(owner: Option[PersonId], scope: Option[ScopeId], status: Option[String]): IO[AgentError, List[Commitment]]
+  def listCommitments(owner: Option[PersonId], status: Option[String]): IO[AgentError, List[Commitment]]
   def proposeMemory(req: ProposeMemoryRequest): IO[AgentError, MemoryItem]
-  def listMemory(personId: Option[PersonId], scopeId: Option[ScopeId]): IO[AgentError, List[MemoryItem]]
+  def listMemory(personId: Option[PersonId]): IO[AgentError, List[MemoryItem]]
   def requestApproval(req: RequestApprovalRequest): IO[AgentError, Approval]
-  def listApprovals(scopeId: Option[ScopeId], status: Option[String]): IO[AgentError, List[Approval]]
+  def listApprovals(status: Option[String]): IO[AgentError, List[Approval]]
   def proposeGoal(req: ProposeGoalRequest): IO[AgentError, Goal]
-  def listGoals(owner: Option[PersonId], scope: Option[ScopeId], status: Option[String]): IO[AgentError, List[Goal]]
+  def listGoals(owner: Option[PersonId], status: Option[String]): IO[AgentError, List[Goal]]
   def getGoal(id: GoalId): IO[AgentError, Option[GoalWithEvidence]]
   def updateGoalStatus(id: GoalId, req: UpdateGoalStatusRequest): IO[AgentError, Goal]
   def appendGoalEvidence(id: GoalId, req: AppendGoalEvidenceRequest): IO[AgentError, GoalEvidence]
@@ -36,20 +35,38 @@ trait PersonService {
   def supersedeMemory(newId: MemoryId, oldId: MemoryId): IO[AgentError, MemoryItem]
 
   // Memory recall
-  def searchMemory(query: String, scopeId: Option[ScopeId], personId: Option[PersonId], kind: Option[String], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryHit]]
-  def contextBundle(scopeId: Option[ScopeId], personId: Option[PersonId], factLimit: Int, eventLimit: Int): IO[AgentError, ContextBundle]
-  def findConflicts(scopeId: Option[ScopeId], personId: Option[PersonId], kind: String, text: String): IO[AgentError, List[MemoryItem]]
+  def searchMemory(query: String, personId: Option[PersonId], kind: Option[String], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryHit]]
+  def contextBundle(personId: Option[PersonId], factLimit: Int, eventLimit: Int): IO[AgentError, ContextBundle]
+  def findConflicts(personId: Option[PersonId], kind: String, text: String): IO[AgentError, List[MemoryItem]]
+  /** Pinned owner/household profile facts: accepted, currently-valid,
+   *  non-superseded facts sourced from onboarding. Non-decaying — injected
+   *  into every turn regardless of recency. */
+  def profileFacts(limit: Int): IO[AgentError, List[MemoryItem]]
+
+  // Household graph: entities + relationships (propose -> accept lifecycle)
+  def proposeEntity(req: ProposeEntityRequest): IO[AgentError, Entity]
+  def acceptEntity(id: EntityId): IO[AgentError, Entity]
+  def rejectEntity(id: EntityId, reason: Option[String]): IO[AgentError, Entity]
+  def supersedeEntity(newId: EntityId, oldId: EntityId): IO[AgentError, Entity]
+  def listEntities(kind: Option[String], status: Option[String]): IO[AgentError, List[Entity]]
+  /** Entity resolution: candidates matching a name (substring, accepted only). */
+  def resolveEntities(name: String): IO[AgentError, List[Entity]]
+
+  def proposeRelationship(req: ProposeRelationshipRequest): IO[AgentError, Relationship]
+  def acceptRelationship(id: RelationshipId): IO[AgentError, Relationship]
+  def rejectRelationship(id: RelationshipId, reason: Option[String]): IO[AgentError, Relationship]
+  def supersedeRelationship(newId: RelationshipId, oldId: RelationshipId): IO[AgentError, Relationship]
+  def listRelationships(fromId: Option[String], toId: Option[String], relType: Option[String], status: Option[String], asOf: Option[Instant]): IO[AgentError, List[Relationship]]
+  /** Accepted, currently-active household graph for context injection. */
+  def household: IO[AgentError, HouseholdGraph]
 
   // Generic event log
   def logEvent(req: LogEventRequest): IO[AgentError, AuditEvent]
-  def listEvents(scopeId: Option[ScopeId], category: Option[String], since: Option[Instant], until: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]]
-  def searchEvents(query: String, scopeId: Option[ScopeId], category: Option[String], since: Option[Instant], limit: Int): IO[AgentError, List[EventHit]]
+  def listEvents(category: Option[String], since: Option[Instant], until: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]]
+  def searchEvents(query: String, category: Option[String], since: Option[Instant], limit: Int): IO[AgentError, List[EventHit]]
 
   // Consolidation
-  def consolidateMemory(scopeId: ScopeId, since: Option[Instant]): IO[AgentError, List[MemoryItem]]
-
-  // Scope access (for harnesses resolving a sender's reachable scopes)
-  def listScopeRoles(personId: PersonId): IO[AgentError, List[PersonScopeRole]]
+  def consolidateMemory(since: Option[Instant]): IO[AgentError, List[MemoryItem]]
 
   // Channels & messages (mycroft conversation state)
   def createChannel(req: CreateChannelRequest): IO[AgentError, ChannelWithMembers]
@@ -58,6 +75,19 @@ trait PersonService {
   def addChannelMember(id: ChannelId, personId: PersonId): IO[AgentError, ChannelWithMembers]
   def appendMessage(req: AppendMessageRequest): IO[AgentError, Message]
   def listMessages(channelId: ChannelId, since: Option[Instant], limit: Int): IO[AgentError, List[Message]]
+
+  // Gmail / inbox ingestion
+  def gmailAuthUrl(ownerPersonId: PersonId): IO[AgentError, GmailAuthUrlResponse]
+  def gmailOAuthExchange(req: GmailOAuthExchangeRequest): IO[AgentError, GmailCredentialSummary]
+  def gmailSync(ownerPersonId: PersonId, since: Option[Instant]): IO[AgentError, GmailSyncResult]
+  def listInbox(ownerPersonId: PersonId, status: Option[String], limit: Int, oldestFirst: Boolean = false): IO[AgentError, List[InboxMessage]]
+  def getInbox(id: InboxMessageId): IO[AgentError, Option[InboxMessage]]
+  def downloadAttachment(id: InboxMessageId, attachmentId: String): IO[AgentError, AttachmentDownload]
+  def skipInbox(id: InboxMessageId): IO[AgentError, InboxMessage]
+  def markInboxTriaged(id: InboxMessageId, sourceEventId: Option[EventId]): IO[AgentError, InboxMessage]
+
+  // Calendar (read-only)
+  def calendarAgenda(ownerPersonId: PersonId, timeMin: Instant, timeMax: Instant): IO[AgentError, List[CalendarEvent]]
 }
 
 object PersonService {
@@ -68,20 +98,22 @@ object PersonService {
 
   def live(
     personRepo: PersonRepo,
-    scopeRepo: ScopeRepo,
-    scopeRoleRepo: ScopeRoleRepo,
     commitmentRepo: CommitmentRepo,
     memoryRepo: MemoryRepo,
     approvalRepo: ApprovalRepo,
     auditRepo: AuditRepo,
     goalRepo: GoalRepo,
     goalEvidenceRepo: GoalEvidenceRepo,
+    entityRepo: EntityRepo,
+    relationshipRepo: RelationshipRepo,
     channelRepo: ChannelRepo,
     channelMemberRepo: ChannelMemberRepo,
-    messageRepo: MessageRepo
+    messageRepo: MessageRepo,
+    credentialRepo: CredentialRepo,
+    inboxRepo: InboxMessageRepo
   ): PersonService = new PersonService {
 
-    // --- Persons / Scopes / Roles ---
+    // --- Persons ---
 
     def createPerson(req: CreatePersonRequest): IO[AgentError, Person] = {
       val p = Person(req.id, req.displayName, req.timezone, req.defaultLocale, active = true)
@@ -90,32 +122,34 @@ object PersonService {
 
     val listPersons: IO[AgentError, List[Person]] = personRepo.findAll
 
-    def createScope(req: CreateScopeRequest): IO[AgentError, PersonScope] = {
-      val s = PersonScope(req.id, req.name, req.ownerPersonId, req.kind)
-      scopeRepo.create(s).as(s)
-    }
-
-    val listScopes: IO[AgentError, List[PersonScope]] = scopeRepo.findAll
-
-    def createScopeRole(req: CreateScopeRoleRequest): IO[AgentError, PersonScopeRole] = {
-      val r = PersonScopeRole(req.personId, req.scopeId, req.role)
-      scopeRoleRepo.create(r).as(r)
-    }
-
     // --- Commitments ---
 
+    /** Propose-by-source is idempotent: re-proposing the same external source
+     *  (e.g. `email:gmail-msg-X`) updates the existing item instead of creating a
+     *  duplicate. Dedup is a server-side tool guarantee, so callers never need to
+     *  check-before-propose. Generic sources (no namespace, e.g. `chat`) always
+     *  create a fresh item. */
     def proposeCommitment(req: ProposeCommitmentRequest): IO[AgentError, Commitment] =
       for {
-        now <- Clock.instant
-        c    = Commitment(CommitmentId(newUuid), req.ownerPersonId, req.scopeId,
-                          CommitmentStatus.Proposed, req.text, req.source, req.evidence,
-                          req.dueAt, now, now)
-        _   <- commitmentRepo.create(c)
-        _   <- audit("commitment.propose", "commitment", Some(c.id.value), Some(req.scopeId), now)
-      } yield c
+        now      <- Clock.instant
+        existing <- if (isDedupSource(req.source)) commitmentRepo.findBySource(req.ownerPersonId, req.source)
+                    else ZIO.none
+        result   <- existing match {
+                      case Some(c) =>
+                        commitmentRepo.updateContent(c.id, req.text, req.evidence, req.dueAt, now) *>
+                          audit("commitment.propose.update", "commitment", Some(c.id.value), now)
+                            .as(c.copy(text = req.text, evidence = req.evidence, dueAt = req.dueAt, updatedAt = now))
+                      case None =>
+                        val c = Commitment(CommitmentId(newUuid), req.ownerPersonId,
+                                           CommitmentStatus.Proposed, req.text, req.source, req.evidence,
+                                           req.dueAt, now, now)
+                        commitmentRepo.create(c) *>
+                          audit("commitment.propose", "commitment", Some(c.id.value), now).as(c)
+                    }
+      } yield result
 
-    def listCommitments(owner: Option[PersonId], scope: Option[ScopeId], status: Option[String]): IO[AgentError, List[Commitment]] =
-      commitmentRepo.findAll(owner, scope, status)
+    def listCommitments(owner: Option[PersonId], status: Option[String]): IO[AgentError, List[Commitment]] =
+      commitmentRepo.findAll(owner, status)
 
     // --- Memory ---
 
@@ -124,7 +158,7 @@ object PersonService {
         now <- Clock.instant
         m    = MemoryItem(
                  id = MemoryId(newUuid),
-                 personId = req.personId, scopeId = req.scopeId,
+                 personId = req.personId,
                  status = MemoryStatus.Proposed, kind = req.kind,
                  text = req.text, source = req.source, confidence = req.confidence,
                  createdAt = now, updatedAt = now,
@@ -132,11 +166,11 @@ object PersonService {
                  originEventId = req.originEventId
                )
         _   <- memoryRepo.create(m)
-        _   <- audit("memory.propose", "memory_item", Some(m.id.value), req.scopeId, now)
+        _   <- audit("memory.propose", "memory_item", Some(m.id.value), now)
       } yield m
 
-    def listMemory(personId: Option[PersonId], scopeId: Option[ScopeId]): IO[AgentError, List[MemoryItem]] =
-      memoryRepo.findAll(personId, scopeId)
+    def listMemory(personId: Option[PersonId]): IO[AgentError, List[MemoryItem]] =
+      memoryRepo.findAll(personId)
 
     def acceptMemory(id: MemoryId): IO[AgentError, MemoryItem]              = transitionMemory(id, MemoryStatus.Accepted, "memory.accept", None)
     def rejectMemory(id: MemoryId, reason: Option[String]): IO[AgentError, MemoryItem] =
@@ -145,20 +179,20 @@ object PersonService {
 
     private def transitionMemory(id: MemoryId, to: MemoryStatus, action: String, reason: Option[String]): IO[AgentError, MemoryItem] =
       for {
-        existing <- requireMemory(id)
+        _        <- requireMemory(id)
         now      <- Clock.instant
         _        <- memoryRepo.updateStatus(id, to, now)
-        _        <- auditPayload(action, "memory_item", Some(id.value), existing.scopeId, now, StatusChangePayload(reason))
+        _        <- auditPayload(action, "memory_item", Some(id.value), now, StatusChangePayload(reason))
         updated  <- requireMemory(id)
       } yield updated
 
     def supersedeMemory(newId: MemoryId, oldId: MemoryId): IO[AgentError, MemoryItem] =
       for {
-        newItem <- requireMemory(newId)
+        _       <- requireMemory(newId)
         _       <- requireMemory(oldId)
         now     <- Clock.instant
         _       <- memoryRepo.setSupersededBy(oldId, newId, now)
-        _       <- auditPayload("memory.supersede", "memory_item", Some(oldId.value), newItem.scopeId, now, SupersedePayload(newId))
+        _       <- auditPayload("memory.supersede", "memory_item", Some(oldId.value), now, SupersedePayload(newId))
         result  <- requireMemory(oldId)
       } yield result
 
@@ -167,40 +201,141 @@ object PersonService {
 
     // --- Memory recall ---
 
-    def searchMemory(query: String, scopeId: Option[ScopeId], personId: Option[PersonId], kind: Option[String], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryHit]] = {
+    def searchMemory(query: String, personId: Option[PersonId], kind: Option[String], asOf: Option[Instant], limit: Int): IO[AgentError, List[MemoryHit]] = {
       val sanitized = sanitizeFtsQuery(query)
       if (sanitized.isEmpty) ZIO.succeed(Nil)
       else
         for {
-          raw <- memoryRepo.searchFts(sanitized, scopeId, personId, kind, Some("accepted"), asOf, math.max(limit * 5, 50))
+          raw <- memoryRepo.searchFts(sanitized, personId, kind, Some("accepted"), asOf, math.max(limit * 5, 50))
           now <- Clock.instant
         } yield rerank(raw, now).take(limit)
     }
 
-    def contextBundle(scopeId: Option[ScopeId], personId: Option[PersonId], factLimit: Int, eventLimit: Int): IO[AgentError, ContextBundle] =
+    def contextBundle(personId: Option[PersonId], factLimit: Int, eventLimit: Int): IO[AgentError, ContextBundle] =
       for {
-        facts  <- recentFacts(scopeId, personId, factLimit)
-        events <- recentEvents(scopeId, eventLimit)
+        facts  <- recentFacts(personId, factLimit)
+        events <- recentEvents(eventLimit)
       } yield ContextBundle(facts, events)
 
-    private def recentFacts(scopeId: Option[ScopeId], personId: Option[PersonId], factLimit: Int): IO[AgentError, List[MemoryHit]] =
+    private def recentFacts(personId: Option[PersonId], factLimit: Int): IO[AgentError, List[MemoryHit]] =
       for {
-        raw <- memoryRepo.listAccepted(scopeId, personId, None, math.max(factLimit * 3, 30))
+        raw <- memoryRepo.listAccepted(personId, None, math.max(factLimit * 3, 30))
         now <- Clock.instant
       } yield rerank(raw, now).take(factLimit)
 
-    private def recentEvents(scopeId: Option[ScopeId], eventLimit: Int): IO[AgentError, List[AuditEvent]] =
+    private def recentEvents(eventLimit: Int): IO[AgentError, List[AuditEvent]] =
       ZIO
         .foreach(List(EventCategory.Observation, EventCategory.Decision, EventCategory.SessionNote))(cat =>
-          auditRepo.list(scopeId, Some(cat), None, None, eventLimit)
+          auditRepo.list(Some(cat), None, None, eventLimit)
         )
         .map(_.flatten.sortBy(_.createdAt).reverse.take(eventLimit))
 
-    def findConflicts(scopeId: Option[ScopeId], personId: Option[PersonId], kind: String, text: String): IO[AgentError, List[MemoryItem]] = {
+    def findConflicts(personId: Option[PersonId], kind: String, text: String): IO[AgentError, List[MemoryItem]] = {
       val sanitized = sanitizeFtsQuery(text)
       if (sanitized.isEmpty) ZIO.succeed(Nil)
-      else memoryRepo.searchFts(sanitized, scopeId, personId, Some(kind), Some("accepted"), None, 20)
+      else memoryRepo.searchFts(sanitized, personId, Some(kind), Some("accepted"), None, 20)
     }
+
+    def profileFacts(limit: Int): IO[AgentError, List[MemoryItem]] =
+      Clock.instant.flatMap(now => memoryRepo.listBySourcePrefix("onboarding", Some(now), limit))
+
+    // --- Household graph: entities ---
+
+    def proposeEntity(req: ProposeEntityRequest): IO[AgentError, Entity] =
+      for {
+        now <- Clock.instant
+        e    = Entity(
+                 id = EntityId(newUuid), kind = req.kind, name = req.name,
+                 attributesJson = req.attributesJson, status = MemoryStatus.Proposed,
+                 source = req.source, confidence = req.confidence,
+                 supersededById = None, createdAt = now, updatedAt = now
+               )
+        _   <- entityRepo.create(e)
+        _   <- audit("entity.propose", "entity", Some(e.id.value), now)
+      } yield e
+
+    def acceptEntity(id: EntityId): IO[AgentError, Entity]                     = transitionEntity(id, MemoryStatus.Accepted, "entity.accept", None)
+    def rejectEntity(id: EntityId, reason: Option[String]): IO[AgentError, Entity] = transitionEntity(id, MemoryStatus.Rejected, "entity.reject", reason)
+
+    private def transitionEntity(id: EntityId, to: MemoryStatus, action: String, reason: Option[String]): IO[AgentError, Entity] =
+      for {
+        _       <- requireEntity(id)
+        now     <- Clock.instant
+        _       <- entityRepo.updateStatus(id, to, now)
+        _       <- auditPayload(action, "entity", Some(id.value), now, StatusChangePayload(reason))
+        updated <- requireEntity(id)
+      } yield updated
+
+    def supersedeEntity(newId: EntityId, oldId: EntityId): IO[AgentError, Entity] =
+      for {
+        _      <- requireEntity(newId)
+        _      <- requireEntity(oldId)
+        now    <- Clock.instant
+        _      <- entityRepo.setSupersededBy(oldId, newId, now)
+        _      <- audit("entity.supersede", "entity", Some(oldId.value), now)
+        result <- requireEntity(oldId)
+      } yield result
+
+    def listEntities(kind: Option[String], status: Option[String]): IO[AgentError, List[Entity]] =
+      entityRepo.findAll(kind, status)
+
+    def resolveEntities(name: String): IO[AgentError, List[Entity]] =
+      entityRepo.findByName(name, Some("accepted"))
+
+    private def requireEntity(id: EntityId): IO[AgentError, Entity] =
+      entityRepo.findById(id).someOrFail(AgentError.NotFound("entity", id.value))
+
+    // --- Household graph: relationships ---
+
+    def proposeRelationship(req: ProposeRelationshipRequest): IO[AgentError, Relationship] =
+      for {
+        now <- Clock.instant
+        r    = Relationship(
+                 id = RelationshipId(newUuid), fromId = req.fromId, fromKind = req.fromKind,
+                 relType = req.relType, toId = req.toId, toKind = req.toKind,
+                 status = MemoryStatus.Proposed, source = req.source, confidence = req.confidence,
+                 note = req.note, supersededById = None,
+                 validFrom = req.validFrom, validUntil = req.validUntil,
+                 createdAt = now, updatedAt = now
+               )
+        _   <- relationshipRepo.create(r)
+        _   <- audit("relationship.propose", "relationship", Some(r.id.value), now)
+      } yield r
+
+    def acceptRelationship(id: RelationshipId): IO[AgentError, Relationship]                     = transitionRelationship(id, MemoryStatus.Accepted, "relationship.accept", None)
+    def rejectRelationship(id: RelationshipId, reason: Option[String]): IO[AgentError, Relationship] = transitionRelationship(id, MemoryStatus.Rejected, "relationship.reject", reason)
+
+    private def transitionRelationship(id: RelationshipId, to: MemoryStatus, action: String, reason: Option[String]): IO[AgentError, Relationship] =
+      for {
+        _       <- requireRelationship(id)
+        now     <- Clock.instant
+        _       <- relationshipRepo.updateStatus(id, to, now)
+        _       <- auditPayload(action, "relationship", Some(id.value), now, StatusChangePayload(reason))
+        updated <- requireRelationship(id)
+      } yield updated
+
+    def supersedeRelationship(newId: RelationshipId, oldId: RelationshipId): IO[AgentError, Relationship] =
+      for {
+        _      <- requireRelationship(newId)
+        _      <- requireRelationship(oldId)
+        now    <- Clock.instant
+        _      <- relationshipRepo.setSupersededBy(oldId, newId, now)
+        _      <- audit("relationship.supersede", "relationship", Some(oldId.value), now)
+        result <- requireRelationship(oldId)
+      } yield result
+
+    def listRelationships(fromId: Option[String], toId: Option[String], relType: Option[String], status: Option[String], asOf: Option[Instant]): IO[AgentError, List[Relationship]] =
+      relationshipRepo.findAll(fromId, toId, relType, status, asOf)
+
+    val household: IO[AgentError, HouseholdGraph] =
+      for {
+        now    <- Clock.instant
+        ents   <- entityRepo.findAll(None, Some("accepted"))
+        rels   <- relationshipRepo.findAll(None, None, None, Some("accepted"), Some(now))
+      } yield HouseholdGraph(ents, rels)
+
+    private def requireRelationship(id: RelationshipId): IO[AgentError, Relationship] =
+      relationshipRepo.findById(id).someOrFail(AgentError.NotFound("relationship", id.value))
 
     private def rerank(items: List[MemoryItem], now: Instant): List[MemoryHit] = {
       val scored = items.map(m => MemoryHit(m, scoreFor(m, now)))
@@ -220,32 +355,46 @@ object PersonService {
     def requestApproval(req: RequestApprovalRequest): IO[AgentError, Approval] =
       for {
         now <- Clock.instant
-        a    = Approval(ApprovalId(newUuid), req.requestedBy, req.requiredPersonId, req.scopeId,
+        a    = Approval(ApprovalId(newUuid), req.requestedBy, req.requiredPersonId,
                         req.actionType, req.payloadJson, ApprovalStatus.Requested, now, None)
         _   <- approvalRepo.create(a)
         _   <- auditPayloadRaw(
                  actor = req.requestedBy, action = "approval.request",
-                 targetType = "approval", targetId = Some(a.id.value), scopeId = req.scopeId,
+                 targetType = "approval", targetId = Some(a.id.value),
                  now = now, payloadJson = req.payloadJson
                )
       } yield a
 
-    def listApprovals(scopeId: Option[ScopeId], status: Option[String]): IO[AgentError, List[Approval]] =
-      approvalRepo.findAll(scopeId, status)
+    def listApprovals(status: Option[String]): IO[AgentError, List[Approval]] =
+      approvalRepo.findAll(status)
 
     // --- Goals ---
 
+    /** Like commitments, propose-by-source is idempotent. Re-proposing an existing
+     *  source refreshes the mutable fields (title/constraints); `outcome` and
+     *  `evidence_rule` are immutable and untouched. */
     def proposeGoal(req: ProposeGoalRequest): IO[AgentError, Goal] =
       for {
-        now <- Clock.instant
-        g    = Goal(GoalId(newUuid), req.ownerPersonId, req.scopeId, req.title, req.outcome,
-                    req.evidenceRule, req.constraintsJson, GoalStatus.Open, None, req.source, now, now)
-        _   <- goalRepo.create(g)
-        _   <- audit("goal.propose", "goal", Some(g.id.value), Some(req.scopeId), now)
-      } yield g
+        now      <- Clock.instant
+        existing <- req.source.filter(isDedupSource) match {
+                      case Some(src) => goalRepo.findBySource(req.ownerPersonId, src)
+                      case None      => ZIO.none
+                    }
+        result   <- existing match {
+                      case Some(g) =>
+                        goalRepo.updateContent(g.id, req.title, req.constraintsJson, now) *>
+                          audit("goal.propose.update", "goal", Some(g.id.value), now)
+                            .as(g.copy(title = req.title, constraintsJson = req.constraintsJson, updatedAt = now))
+                      case None =>
+                        val g = Goal(GoalId(newUuid), req.ownerPersonId, req.title, req.outcome,
+                                     req.evidenceRule, req.constraintsJson, GoalStatus.Open, None, req.source, now, now)
+                        goalRepo.create(g) *>
+                          audit("goal.propose", "goal", Some(g.id.value), now).as(g)
+                    }
+      } yield result
 
-    def listGoals(owner: Option[PersonId], scope: Option[ScopeId], status: Option[String]): IO[AgentError, List[Goal]] =
-      goalRepo.findAll(owner, scope, status)
+    def listGoals(owner: Option[PersonId], status: Option[String]): IO[AgentError, List[Goal]] =
+      goalRepo.findAll(owner, status)
 
     def getGoal(id: GoalId): IO[AgentError, Option[GoalWithEvidence]] =
       goalRepo.findById(id).flatMap {
@@ -255,13 +404,13 @@ object PersonService {
 
     def updateGoalStatus(id: GoalId, req: UpdateGoalStatusRequest): IO[AgentError, Goal] =
       for {
-        existing <- requireGoal(id)
+        _        <- requireGoal(id)
         now      <- Clock.instant
         _        <- goalRepo.updateStatus(id, req.status, req.blockedReason, now)
         _        <- auditPayload(
                       action = s"goal.status.${GoalStatus.asString(req.status)}",
                       targetType = "goal", targetId = Some(id.value),
-                      scopeId = Some(existing.scopeId), now = now,
+                      now = now,
                       payload = StatusChangePayload(req.blockedReason)
                     )
         updated  <- requireGoal(id)
@@ -269,11 +418,11 @@ object PersonService {
 
     def appendGoalEvidence(id: GoalId, req: AppendGoalEvidenceRequest): IO[AgentError, GoalEvidence] =
       for {
-        goal <- requireGoal(id)
+        _    <- requireGoal(id)
         now  <- Clock.instant
         ev    = GoalEvidence(GoalEvidenceId(newUuid), id, req.kind, req.ref, req.note, now)
         _    <- goalEvidenceRepo.create(ev)
-        _    <- auditPayload("goal.evidence.append", "goal", Some(id.value), Some(goal.scopeId), now,
+        _    <- auditPayload("goal.evidence.append", "goal", Some(id.value), now,
                              GoalEvidencePayload(req.kind, req.ref))
       } yield ev
 
@@ -290,21 +439,21 @@ object PersonService {
                  actor = req.actor, action = req.action,
                  category = if (EventCategory.All.contains(req.category)) req.category else EventCategory.Observation,
                  targetType = req.targetType.getOrElse("event"),
-                 targetId = req.targetId, scopeId = req.scopeId,
+                 targetId = req.targetId,
                  text = req.text, payloadJson = req.payloadJson.getOrElse("{}"),
                  createdAt = now
                )
         _   <- auditRepo.create(ev)
       } yield ev
 
-    def listEvents(scopeId: Option[ScopeId], category: Option[String], since: Option[Instant], until: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]] =
-      auditRepo.list(scopeId, category, since, until, limit)
+    def listEvents(category: Option[String], since: Option[Instant], until: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]] =
+      auditRepo.list(category, since, until, limit)
 
-    def searchEvents(query: String, scopeId: Option[ScopeId], category: Option[String], since: Option[Instant], limit: Int): IO[AgentError, List[EventHit]] = {
+    def searchEvents(query: String, category: Option[String], since: Option[Instant], limit: Int): IO[AgentError, List[EventHit]] = {
       val sanitized = sanitizeFtsQuery(query)
       if (sanitized.isEmpty) ZIO.succeed(Nil)
       else
-        auditRepo.searchFts(sanitized, scopeId, category, since, limit).map(eventsToHits(_, limit))
+        auditRepo.searchFts(sanitized, category, since, limit).map(eventsToHits(_, limit))
     }
 
     private def eventsToHits(events: List[AuditEvent], limit: Int): List[EventHit] =
@@ -312,25 +461,25 @@ object PersonService {
 
     // --- Consolidation ---
 
-    def consolidateMemory(scopeId: ScopeId, since: Option[Instant]): IO[AgentError, List[MemoryItem]] =
+    def consolidateMemory(since: Option[Instant]): IO[AgentError, List[MemoryItem]] =
       for {
-        notes   <- auditRepo.list(Some(scopeId), Some(EventCategory.SessionNote), since, None, 200)
-        obs     <- auditRepo.list(Some(scopeId), Some(EventCategory.Observation), since, None, 200)
+        notes   <- auditRepo.list(Some(EventCategory.SessionNote), since, None, 200)
+        obs     <- auditRepo.list(Some(EventCategory.Observation), since, None, 200)
         all      = notes ++ obs
         already <- memoryRepo.findEventsWithMemory(all.map(_.id))
         fresh    = all.filterNot(e => already.contains(e.id))
         now     <- Clock.instant
-        items   <- ZIO.foreach(fresh)(e => consolidateOne(scopeId, e, now))
+        items   <- ZIO.foreach(fresh)(e => consolidateOne(e, now))
         _       <- ZIO.when(items.nonEmpty)(
-                     auditPayload("memory.consolidate", "scope", Some(scopeId.value), Some(scopeId), now,
+                     auditPayload("memory.consolidate", "memory", None, now,
                                   ConsolidatePayload(items.size))
                    )
       } yield items
 
-    private def consolidateOne(scopeId: ScopeId, e: AuditEvent, now: Instant): IO[AgentError, MemoryItem] = {
+    private def consolidateOne(e: AuditEvent, now: Instant): IO[AgentError, MemoryItem] = {
       val item = MemoryItem(
         id = MemoryId(newUuid),
-        personId = None, scopeId = Some(scopeId),
+        personId = None,
         status = MemoryStatus.Proposed, kind = MemoryKind.Fact,
         text = e.text.getOrElse(e.payloadJson),
         source = s"event:${e.id.value}", confidence = Some(DefaultConfidence),
@@ -339,11 +488,6 @@ object PersonService {
       )
       memoryRepo.create(item).as(item)
     }
-
-    // --- Scope access ---
-
-    def listScopeRoles(personId: PersonId): IO[AgentError, List[PersonScopeRole]] =
-      scopeRoleRepo.findByPerson(personId)
 
     // --- Channels & messages ---
 
@@ -386,34 +530,216 @@ object PersonService {
     def listMessages(channelId: ChannelId, since: Option[Instant], limit: Int): IO[AgentError, List[Message]] =
       messageRepo.findByChannel(channelId, since, limit)
 
+    // --- Gmail / inbox ---
+
+    def gmailAuthUrl(ownerPersonId: PersonId): IO[AgentError, GmailAuthUrlResponse] =
+      for {
+        _        <- requirePerson(ownerPersonId)
+        settings <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
+      } yield GmailAuthUrlResponse(
+        url = GmailOAuth.authUrl(settings, ownerPersonId.value),
+        redirectUri = settings.redirectUri
+      )
+
+    def gmailOAuthExchange(req: GmailOAuthExchangeRequest): IO[AgentError, GmailCredentialSummary] =
+      for {
+        _        <- requirePerson(req.ownerPersonId)
+        settings <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
+        token    <- GmailOAuth.exchangeCode(settings, req.code)
+        email    <- GmailOAuth.fetchUserEmail(token.accessToken)
+        now      <- Clock.instant
+        existing <- credentialRepo.findByOwner(GmailConfig.ProviderName, req.ownerPersonId)
+        refresh   = token.refreshToken.orElse(existing.map(_.refreshToken))
+        refreshTok <- ZIO.fromOption(refresh).orElseFail(AgentError.Validation("No refresh token returned; re-run auth with prompt=consent"))
+        cred      = Credential(
+                      id = existing.map(_.id).getOrElse(CredentialId(newUuid)),
+                      provider = GmailConfig.ProviderName,
+                      accountEmail = email.email,
+                      ownerPersonId = req.ownerPersonId,
+                      accessToken = token.accessToken,
+                      refreshToken = refreshTok,
+                      expiresAt = GmailOAuth.expiresAtFrom(token, now),
+                      scopes = token.scope,
+                      updatedAt = now
+                    )
+        _        <- credentialRepo.upsert(cred)
+        _        <- audit("gmail.oauth", "credential", Some(cred.id.value), now)
+      } yield GmailCredentialSummary(cred.provider, cred.accountEmail, cred.ownerPersonId, cred.scopes)
+
+    def gmailSync(ownerPersonId: PersonId, since: Option[Instant]): IO[AgentError, GmailSyncResult] =
+      for {
+        _        <- requirePerson(ownerPersonId)
+        settings <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
+        cred     <- credentialRepo.findByOwner(GmailConfig.ProviderName, ownerPersonId)
+                      .someOrFail(AgentError.NotFound("gmail credential", ownerPersonId.value))
+        access   <- ensureAccessToken(settings, cred)
+        query     = buildGmailQuery(since)
+        ids      <- GmailClient.listMessageIds(access, query, maxResults = 50)
+        now      <- Clock.instant
+        inserted <- ZIO.foldLeft(ids)(0) { (count, extId) =>
+                      syncOneMessage(access, extId, ownerPersonId, now).map(n => count + n)
+                    }
+        pending  <- inboxRepo.countPending(ownerPersonId)
+      } yield GmailSyncResult(fetched = ids.size, inserted = inserted, pending = pending)
+
+    def listInbox(ownerPersonId: PersonId, status: Option[String], limit: Int, oldestFirst: Boolean = false): IO[AgentError, List[InboxMessage]] =
+      requirePerson(ownerPersonId) *> inboxRepo.findAll(Some(ownerPersonId), status, limit, oldestFirst)
+
+    def getInbox(id: InboxMessageId): IO[AgentError, Option[InboxMessage]] =
+      inboxRepo.findById(id)
+
+    /** Fetch an attachment's bytes on demand: resolve the message (for its
+     *  provider message id + owner), confirm the attachment is one we know
+     *  about, refresh the owner's token, and pull the bytes from Gmail. */
+    def downloadAttachment(id: InboxMessageId, attachmentId: String): IO[AgentError, AttachmentDownload] =
+      for {
+        msg      <- inboxRepo.findById(id).someOrFail(AgentError.NotFound("inbox message", id.value))
+        meta     <- ZIO.fromOption(msg.attachments.find(_.attachmentId == attachmentId))
+                      .orElseFail(AgentError.NotFound("attachment", attachmentId))
+        settings <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
+        cred     <- credentialRepo.findByOwner(GmailConfig.ProviderName, msg.ownerPersonId)
+                      .someOrFail(AgentError.NotFound("gmail credential", msg.ownerPersonId.value))
+        access   <- ensureAccessToken(settings, cred)
+        bytes    <- GmailClient.getAttachment(access, msg.externalId, attachmentId)
+      } yield AttachmentDownload(
+        filename = meta.filename,
+        mimeType = meta.mimeType,
+        sizeBytes = bytes.length.toLong,
+        dataBase64 = java.util.Base64.getEncoder.encodeToString(bytes)
+      )
+
+    def skipInbox(id: InboxMessageId): IO[AgentError, InboxMessage] =
+      updateInboxStatus(id, TriageStatus.Skipped, None)
+
+    def markInboxTriaged(id: InboxMessageId, sourceEventId: Option[EventId]): IO[AgentError, InboxMessage] =
+      updateInboxStatus(id, TriageStatus.Triaged, sourceEventId)
+
+    // --- Calendar (read-only) ---
+
+    /** Live agenda from the owner's primary Google Calendar. Reuses the single
+     *  `gmail` Google credential (the consent now also grants calendar.readonly).
+     *  Phase 1 is on-demand only — no local cache. */
+    def calendarAgenda(ownerPersonId: PersonId, timeMin: Instant, timeMax: Instant): IO[AgentError, List[CalendarEvent]] =
+      for {
+        _        <- requirePerson(ownerPersonId)
+        settings <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
+        cred     <- credentialRepo.findByOwner(GmailConfig.ProviderName, ownerPersonId)
+                      .someOrFail(AgentError.NotFound("google credential", ownerPersonId.value))
+        access   <- ensureAccessToken(settings, cred)
+        events   <- CalendarClient.listEvents(access, "primary", timeMin, timeMax, maxResults = 100)
+                      .mapError(scopeHint)
+      } yield events
+
+    /** Google returns 403 when the granted token lacks calendar.readonly (i.e. the
+     *  owner authed before calendar was added). Turn that into actionable advice. */
+    private def scopeHint(e: AgentError): AgentError = e match {
+      case AgentError.HttpFailed(m, _) if m.contains("403") || m.toLowerCase.contains("insufficient") =>
+        AgentError.Validation("Calendar access not granted for this Google account. Re-run `person gmail auth --owner <owner>` to grant calendar.readonly.")
+      case other => other
+    }
+
+    private def updateInboxStatus(id: InboxMessageId, status: TriageStatus, sourceEventId: Option[EventId]): IO[AgentError, InboxMessage] =
+      for {
+        _       <- inboxRepo.findById(id).someOrFail(AgentError.NotFound("inbox message", id.value))
+        now     <- Clock.instant
+        _       <- inboxRepo.updateStatus(id, status, now, sourceEventId)
+        updated <- inboxRepo.findById(id).someOrFail(AgentError.NotFound("inbox message", id.value))
+        _       <- audit(s"inbox.${TriageStatus.asString(status)}", "inbox_message", Some(id.value), now)
+      } yield updated
+
+    private def ensureAccessToken(settings: GmailConfig.Settings, cred: Credential): IO[AgentError, String] =
+      Clock.instant.flatMap { now =>
+        if (cred.expiresAt.isAfter(now.plusSeconds(60))) ZIO.succeed(cred.accessToken)
+        else
+          for {
+            token   <- GmailOAuth.refreshAccessToken(settings, cred.refreshToken)
+            refreshed = cred.copy(
+                          accessToken = token.accessToken,
+                          expiresAt = GmailOAuth.expiresAtFrom(token, now),
+                          scopes = token.scope,
+                          updatedAt = now
+                        )
+            _       <- credentialRepo.upsert(refreshed)
+          } yield refreshed.accessToken
+      }
+
+    private def buildGmailQuery(since: Option[Instant]): String = {
+      val base = "is:unread OR newer_than:7d"
+      since.map(s => s"$base after:${s.getEpochSecond}").getOrElse(base)
+    }
+
+    private def syncOneMessage(accessToken: String, externalId: String, owner: PersonId, now: Instant): IO[AgentError, Int] =
+      inboxRepo.existsExternal(GmailConfig.ProviderName, externalId, owner).flatMap {
+        case true => ZIO.succeed(0)
+        case false =>
+          for {
+            parsed <- GmailClient.getMessage(accessToken, externalId).flatMap {
+                        case Some(p) => ZIO.succeed(p)
+                        case None    => ZIO.fail(AgentError.DecodeFailed(s"Could not parse Gmail message $externalId"))
+                      }
+            msg     = InboxMessage(
+                        id = InboxMessageId(newUuid),
+                        provider = GmailConfig.ProviderName,
+                        externalId = parsed.id,
+                        threadId = parsed.threadId,
+                        fromAddr = parsed.from,
+                        subject = parsed.subject,
+                        bodyText = truncateBody(parsed.bodyText),
+                        receivedAt = Instant.ofEpochMilli(parsed.internalDateMillis),
+                        ownerPersonId = owner,
+                        triageStatus = TriageStatus.Pending,
+                        triagedAt = None,
+                        sourceEventId = None,
+                        attachments = parsed.attachments.map(a =>
+                          InboxAttachment(a.attachmentId, a.filename, a.mimeType, a.sizeBytes)
+                        )
+                      )
+            _      <- inboxRepo.upsert(msg)
+          } yield 1
+      }
+
+    private def truncateBody(text: String, maxLen: Int = 16000): String =
+      if (text.length <= maxLen) text else text.take(maxLen) + "\n...[truncated]"
+
+    private def requirePerson(id: PersonId): IO[AgentError, Person] =
+      personRepo.findById(id).someOrFail(AgentError.NotFound("person", id.value))
+
     // --- Audit helpers ---
 
     /** Audit event with no payload (empty JSON object). */
-    private def audit(action: String, targetType: String, targetId: Option[String], scopeId: Option[ScopeId], now: Instant): IO[AgentError, Unit] =
+    private def audit(action: String, targetType: String, targetId: Option[String], now: Instant): IO[AgentError, Unit] =
       writeEvent(actor = "agent", action = action, targetType = targetType, targetId = targetId,
-                 scopeId = scopeId, now = now, payloadJson = "{}")
+                 now = now, payloadJson = "{}")
 
     /** Audit event with a structured payload, encoded via the supplied codec. */
-    private def auditPayload[P: JsonEncoder](action: String, targetType: String, targetId: Option[String], scopeId: Option[ScopeId], now: Instant, payload: P): IO[AgentError, Unit] =
+    private def auditPayload[P: JsonEncoder](action: String, targetType: String, targetId: Option[String], now: Instant, payload: P): IO[AgentError, Unit] =
       writeEvent(actor = "agent", action = action, targetType = targetType, targetId = targetId,
-                 scopeId = scopeId, now = now, payloadJson = payload.toJson)
+                 now = now, payloadJson = payload.toJson)
 
     /** Escape hatch for audit events whose payload arrives as opaque JSON
      *  from the caller (approval payloads, mostly). */
-    private def auditPayloadRaw(actor: String, action: String, targetType: String, targetId: Option[String], scopeId: Option[ScopeId], now: Instant, payloadJson: String): IO[AgentError, Unit] =
+    private def auditPayloadRaw(actor: String, action: String, targetType: String, targetId: Option[String], now: Instant, payloadJson: String): IO[AgentError, Unit] =
       writeEvent(actor = actor, action = action, targetType = targetType, targetId = targetId,
-                 scopeId = scopeId, now = now, payloadJson = payloadJson)
+                 now = now, payloadJson = payloadJson)
 
-    private def writeEvent(actor: String, action: String, targetType: String, targetId: Option[String], scopeId: Option[ScopeId], now: Instant, payloadJson: String): IO[AgentError, Unit] =
+    private def writeEvent(actor: String, action: String, targetType: String, targetId: Option[String], now: Instant, payloadJson: String): IO[AgentError, Unit] =
       auditRepo.create(AuditEvent(
         id = EventId(newUuid), actor = actor, action = action, category = EventCategory.State,
-        targetType = targetType, targetId = targetId, scopeId = scopeId,
+        targetType = targetType, targetId = targetId,
         text = None, payloadJson = payloadJson, createdAt = now
       ))
 
     // --- Misc helpers ---
 
     private def newUuid: String = UUID.randomUUID().toString
+
+    /** A source is a dedup key only when it is a namespaced external reference
+     *  (e.g. `email:gmail-msg-X`, `event:<id>`). Generic sources like `chat` or
+     *  `manual` carry no identity and must never collapse distinct items. */
+    private def isDedupSource(source: String): Boolean = {
+      val s = source.trim
+      s.contains(":") && !s.endsWith(":")
+    }
 
     private def sanitizeFtsQuery(raw: String): String = {
       val cleaned = raw.map(c => if (c.isLetterOrDigit) c else ' ')

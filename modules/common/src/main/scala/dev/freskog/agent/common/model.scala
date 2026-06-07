@@ -72,53 +72,87 @@ case class ErrorResponse(
 // --- Person-service domain types shared between service and CLI ---
 
 /** Zero-cost newtype wrappers prevent accidentally swapping `PersonId` for
- *  `ScopeId` etc. through method signatures. JSON encoding is bare-string
+ *  `EntityId` etc. through method signatures. JSON encoding is bare-string
  *  (see JsonCodecs). */
-final case class PersonId(value: String)       extends AnyVal
-final case class ScopeId(value: String)        extends AnyVal
-final case class MemoryId(value: String)       extends AnyVal
-final case class GoalId(value: String)         extends AnyVal
-final case class EventId(value: String)        extends AnyVal
-final case class CommitmentId(value: String)   extends AnyVal
-final case class ApprovalId(value: String)     extends AnyVal
-final case class GoalEvidenceId(value: String) extends AnyVal
-final case class ChannelId(value: String)      extends AnyVal
-final case class MessageId(value: String)      extends AnyVal
+final case class PersonId(value: String)        extends AnyVal
+final case class MemoryId(value: String)         extends AnyVal
+final case class GoalId(value: String)           extends AnyVal
+final case class EventId(value: String)          extends AnyVal
+final case class CommitmentId(value: String)     extends AnyVal
+final case class ApprovalId(value: String)       extends AnyVal
+final case class GoalEvidenceId(value: String)   extends AnyVal
+final case class ChannelId(value: String)        extends AnyVal
+final case class MessageId(value: String)        extends AnyVal
+final case class EntityId(value: String)         extends AnyVal
+final case class RelationshipId(value: String)   extends AnyVal
 
-sealed trait ScopeKind
-object ScopeKind {
-  case object Private   extends ScopeKind
-  case object Shared    extends ScopeKind
-  case object Work      extends ScopeKind
-  case object Household extends ScopeKind
-  case object School    extends ScopeKind
-  case object Other     extends ScopeKind
+/** Whether a graph edge endpoint is a `person` (a `persons` row) or an
+ *  `entity` (an `entities` row). Edges are polymorphic; `fromKind`/`toKind`
+ *  disambiguate the id. */
+sealed trait NodeKind
+object NodeKind {
+  case object Person extends NodeKind
+  case object Entity extends NodeKind
 
-  def fromString(s: String): Either[String, ScopeKind] = s.toLowerCase match {
-    case "private"   => Right(Private)
-    case "shared"    => Right(Shared)
-    case "work"      => Right(Work)
-    case "household" => Right(Household)
-    case "school"    => Right(School)
-    case "other"     => Right(Other)
-    case _           => Left(s"Unknown scope kind: $s")
+  def fromString(s: String): Either[String, NodeKind] = s.toLowerCase match {
+    case "person" => Right(Person)
+    case "entity" => Right(Entity)
+    case _        => Left(s"Unknown node kind: $s")
+  }
+
+  def asString(k: NodeKind): String = k match {
+    case Person => "person"
+    case Entity => "entity"
   }
 }
 
-sealed trait ScopeRole
-object ScopeRole {
-  case object Owner    extends ScopeRole
-  case object Editor   extends ScopeRole
-  case object Viewer   extends ScopeRole
-  case object Proposer extends ScopeRole
+/** The kind of a non-person node in the household graph (the things a person
+ *  relates to). Deliberately a small open-ish set; `Other` is the catch-all. */
+sealed trait EntityKind
+object EntityKind {
+  case object Organization extends EntityKind
+  case object School       extends EntityKind
+  case object Club         extends EntityKind
+  case object Medical      extends EntityKind
+  case object Vehicle      extends EntityKind
+  case object Place        extends EntityKind
+  case object Other        extends EntityKind
 
-  def fromString(s: String): Either[String, ScopeRole] = s.toLowerCase match {
-    case "owner"    => Right(Owner)
-    case "editor"   => Right(Editor)
-    case "viewer"   => Right(Viewer)
-    case "proposer" => Right(Proposer)
-    case _          => Left(s"Unknown role: $s")
+  def fromString(s: String): Either[String, EntityKind] = s.toLowerCase match {
+    case "organization" | "org" => Right(Organization)
+    case "school"               => Right(School)
+    case "club"                 => Right(Club)
+    case "medical"              => Right(Medical)
+    case "vehicle"              => Right(Vehicle)
+    case "place"                => Right(Place)
+    case "other"                => Right(Other)
+    case _                      => Left(s"Unknown entity kind: $s")
   }
+
+  def asString(k: EntityKind): String = k match {
+    case Organization => "organization"
+    case School       => "school"
+    case Club         => "club"
+    case Medical      => "medical"
+    case Vehicle      => "vehicle"
+    case Place        => "place"
+    case Other        => "other"
+  }
+}
+
+/** Common relationship type constants. Stored as a free string (not a closed
+ *  enum) so onboarding can mint household-specific edges without a code change;
+ *  these are the well-known ones the playbooks lean on. */
+object RelationshipType {
+  val Spouse    = "spouse"
+  val ParentOf  = "parent_of"
+  val ChildOf   = "child_of"
+  val EmployedBy = "employed_by"
+  val Attends   = "attends"
+  val PatientOf = "patient_of"
+  val MemberOf  = "member_of"
+  val Owns      = "owns"
+  val LivesIn   = "lives_in"
 }
 
 sealed trait CommitmentStatus
@@ -219,23 +253,49 @@ case class Person(
   active: Boolean
 )
 
-case class Scope(
-  id: ScopeId,
+/** A non-person node in the household graph (employer, school, club, GP, car,
+ *  …). Carries the same propose→accept lifecycle and provenance as memory so a
+ *  human accepts before it becomes durable. */
+case class Entity(
+  id: EntityId,
+  kind: EntityKind,
   name: String,
-  ownerPersonId: Option[PersonId],
-  kind: ScopeKind
+  attributesJson: Option[String],
+  status: MemoryStatus,
+  source: String,
+  confidence: Option[Double],
+  supersededById: Option[EntityId] = None,
+  createdAt: Instant,
+  updatedAt: Instant
 )
 
-case class PersonScopeRole(
-  personId: PersonId,
-  scopeId: ScopeId,
-  role: ScopeRole
+/** A typed edge in the household graph: person↔person (spouse, parent_of) or
+ *  person↔entity (employed_by, attends). Time-bound (`validFrom`/`validUntil`)
+ *  and supersedable so "transitions" (new job, new school) preserve history. */
+case class Relationship(
+  id: RelationshipId,
+  fromId: String,
+  fromKind: NodeKind,
+  relType: String,
+  toId: String,
+  toKind: NodeKind,
+  status: MemoryStatus,
+  source: String,
+  confidence: Option[Double],
+  note: Option[String] = None,
+  supersededById: Option[RelationshipId] = None,
+  validFrom: Option[Instant] = None,
+  validUntil: Option[Instant] = None,
+  createdAt: Instant,
+  updatedAt: Instant
 )
+
+/** The accepted household graph, as injected into context. */
+case class HouseholdGraph(entities: List[Entity], relationships: List[Relationship])
 
 case class Commitment(
   id: CommitmentId,
   ownerPersonId: PersonId,
-  scopeId: ScopeId,
   status: CommitmentStatus,
   text: String,
   source: String,
@@ -248,7 +308,6 @@ case class Commitment(
 case class MemoryItem(
   id: MemoryId,
   personId: Option[PersonId],
-  scopeId: Option[ScopeId],
   status: MemoryStatus,
   kind: MemoryKind,
   text: String,
@@ -266,7 +325,6 @@ case class Approval(
   id: ApprovalId,
   requestedBy: String,
   requiredPersonId: Option[PersonId],
-  scopeId: Option[ScopeId],
   actionType: String,
   payloadJson: String,
   status: ApprovalStatus,
@@ -284,7 +342,6 @@ case class AuditEvent(
   category: String,
   targetType: String,
   targetId: Option[String],
-  scopeId: Option[ScopeId],
   text: Option[String],
   payloadJson: String,
   createdAt: Instant
@@ -322,7 +379,6 @@ object GoalStatus {
 case class Goal(
   id: GoalId,
   ownerPersonId: PersonId,
-  scopeId: ScopeId,
   title: String,
   outcome: String,
   evidenceRule: String,
@@ -346,6 +402,86 @@ case class GoalEvidence(
 case class GoalWithEvidence(
   goal: Goal,
   evidence: List[GoalEvidence]
+)
+
+// --- Inbox / credentials (email ingestion) ---
+
+final case class CredentialId(value: String)    extends AnyVal
+final case class InboxMessageId(value: String) extends AnyVal
+final case class CalendarEventId(value: String) extends AnyVal
+
+sealed trait TriageStatus
+object TriageStatus {
+  case object Pending extends TriageStatus
+  case object Triaged extends TriageStatus
+  case object Skipped extends TriageStatus
+
+  def fromString(s: String): Either[String, TriageStatus] = s.toLowerCase match {
+    case "pending" => Right(Pending)
+    case "triaged" => Right(Triaged)
+    case "skipped" => Right(Skipped)
+    case _         => Left(s"Unknown triage status: $s")
+  }
+
+  def asString(t: TriageStatus): String = t match {
+    case Pending => "pending"
+    case Triaged => "triaged"
+    case Skipped => "skipped"
+  }
+}
+
+case class Credential(
+  id: CredentialId,
+  provider: String,
+  accountEmail: String,
+  ownerPersonId: PersonId,
+  accessToken: String,
+  refreshToken: String,
+  expiresAt: Instant,
+  scopes: String,
+  updatedAt: Instant
+)
+
+/** Metadata for one attachment on an inbox message. The bytes are NOT stored;
+ *  `attachmentId` is the provider-side handle used to download on demand. */
+case class InboxAttachment(
+  attachmentId: String,
+  filename: String,
+  mimeType: String,
+  sizeBytes: Long
+)
+
+case class InboxMessage(
+  id: InboxMessageId,
+  provider: String,
+  externalId: String,
+  threadId: Option[String],
+  fromAddr: String,
+  subject: String,
+  bodyText: String,
+  receivedAt: Instant,
+  ownerPersonId: PersonId,
+  triageStatus: TriageStatus,
+  triagedAt: Option[Instant],
+  sourceEventId: Option[EventId],
+  attachments: List[InboxAttachment] = Nil
+)
+
+/** A calendar event as read from the provider (Google Calendar). Read-only in
+ *  Phase 1 — not persisted, returned live from an agenda query. `allDay` events
+ *  carry date-only boundaries (`start`/`end` are the start-of-day instants in the
+ *  event's own timezone, already normalised to `Instant`). */
+case class CalendarEvent(
+  externalId: String,
+  calendarId: String,
+  summary: String,
+  start: Instant,
+  end: Instant,
+  allDay: Boolean,
+  location: Option[String],
+  description: Option[String],
+  htmlLink: Option[String],
+  status: String
 )
 
 // --- Channels & messages (mycroft / harness state) ---

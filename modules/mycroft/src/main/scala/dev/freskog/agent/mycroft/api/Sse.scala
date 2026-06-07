@@ -26,7 +26,12 @@ object Sse {
       case c: AgentEvent.Content    => List("delta" -> Json.Str(c.delta))
       case t: AgentEvent.ToolCall   => List("tool" -> Json.Str(t.tool), "args" -> Json.Str(t.args))
       case t: AgentEvent.ToolResult => List("tool" -> Json.Str(t.tool), "ok" -> Json.Bool(t.ok), "summary" -> Json.Str(t.summary))
-      case d: AgentEvent.Done       => List("stop_reason" -> Json.Str(d.stopReason), "tokens_in" -> Json.Num(d.tokensIn), "tokens_out" -> Json.Num(d.tokensOut))
+      case d: AgentEvent.Done       => List(
+          "stop_reason" -> Json.Str(d.stopReason),
+          "tokens_in"   -> Json.Num(d.tokensIn),
+          "tokens_out"  -> Json.Num(d.tokensOut),
+          "elapsed_ms"  -> Json.Num(d.elapsedMs)
+        )
       case e: AgentEvent.Error      => List("kind" -> Json.Str(e.kind), "message" -> Json.Str(e.message))
     }
     Json.Obj(Chunk.fromIterable(base ++ extra))

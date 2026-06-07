@@ -17,8 +17,8 @@ object HttpClient {
   def get(path: String, params: Map[String, String] = Map.empty): IO[AgentError, String] =
     send(buildGet(path, params), s"GET $path")
 
-  def post(path: String, body: String): IO[AgentError, String] =
-    send(buildPost(path, body), s"POST $path")
+  def post(path: String, body: String, params: Map[String, String] = Map.empty): IO[AgentError, String] =
+    send(buildPost(path, body, params), s"POST $path")
 
   private def buildGet(path: String, params: Map[String, String]): HttpRequest = {
     val query = if (params.isEmpty) "" else "?" + params.map { case (k, v) => s"$k=$v" }.mkString("&")
@@ -29,13 +29,15 @@ object HttpClient {
       .build()
   }
 
-  private def buildPost(path: String, body: String): HttpRequest =
+  private def buildPost(path: String, body: String, params: Map[String, String] = Map.empty): HttpRequest = {
+    val query = if (params.isEmpty) "" else "?" + params.map { case (k, v) => s"$k=$v" }.mkString("&")
     HttpRequest.newBuilder()
-      .uri(URI.create(s"$baseUrl$path"))
+      .uri(URI.create(s"$baseUrl$path$query"))
       .POST(HttpRequest.BodyPublishers.ofString(body))
       .header("Content-Type", "application/json")
       .header("Accept", "application/json")
       .build()
+  }
 
   private def send(request: HttpRequest, context: String): IO[AgentError, String] =
     ZIO.attemptBlocking(client.send(request, HttpResponse.BodyHandlers.ofString()))

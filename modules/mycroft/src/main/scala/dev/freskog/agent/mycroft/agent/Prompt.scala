@@ -1,86 +1,121 @@
 package dev.freskog.agent.mycroft.agent
 
 import dev.freskog.agent.common._
+import dev.freskog.agent.runtime.SkillHit
 
-/** Builds the system prompt: identity, the sender's accessible scopes, the
- *  trusted-CLI hint, and the injected context bundle. Assembled fresh each turn
- *  and prepended OUTSIDE the compaction window so it can never be dropped. */
+import java.time.{Instant, ZoneId}
+import java.time.format.DateTimeFormatter
+
+/** Builds the system prompt: identity + authority model, the household / owner
+ *  profile, the entry points (the two OS tools + run_skill + how to discover
+ *  skills), candidate skills surfaced by the router, and the injected memory
+ *  context. Deliberately does NOT hand-maintain a `person ...` CLI cheat-sheet —
+ *  command vocabulary is discovered via the `agent-protocol` skill + `--help`,
+ *  so it can't drift. Assembled fresh each turn and prepended OUTSIDE the
+ *  compaction window so it can never be dropped. */
 object Prompt {
 
   /** Cheap token estimate (≈ 4 chars/token) to avoid a tokeniser dependency. */
   def estimateTokens(s: String): Int = (s.length + 3) / 4
 
+  private val clockFormat = DateTimeFormatter.ofPattern("EEEE, yyyy-MM-dd HH:mm")
+
+  /** A single human + machine readable "now" line. The model has no inherent clock,
+   *  so without this it cannot resolve "by Friday" / "next week" or tell whether a
+   *  date in an email is in the past or future. */
+  def clockLine(now: Instant, zone: ZoneId): String =
+    s"Current date & time: ${clockFormat.format(now.atZone(zone))} (${zone.getId}). " +
+      "Use this to resolve relative dates and to judge whether a date is in the past or the future."
+
   def system(
     sender: PersonId,
-    roles: List[PersonScopeRole],
-    bundles: List[(ScopeId, ContextBundle)]
+    bundle: ContextBundle,
+    profile: List[MemoryItem],
+    graph: HouseholdGraph,
+    now: Instant,
+    zone: ZoneId,
+    candidates: List[SkillHit] = Nil
   ): String = {
-    val scopeLines =
-      if (roles.isEmpty) "  (none — you have no scope access for this sender)"
-      else roles.map(r => s"  - ${r.scopeId.value} (${roleName(r.role)})").mkString("\n")
+    val candidateBlock =
+      if (candidates.isEmpty) "  (none matched — run `skill search \"<query>\"` if you need a procedure)"
+      else candidates.map(c => s"  - ${c.name}: ${c.description}").mkString("\n")
 
-    val contextBlock = renderContext(bundles)
+    val profileBlock = renderProfile(profile, graph)
+    val contextBlock = renderContext(bundle)
 
     s"""You are Mycroft, a personal-agent assistant for this household. You act on
-       |behalf of the sender and may read and propose state in any scope they have
-       |access to (listed below). Write access is propose-only — a human accepts
-       |proposals before they become durable.
+       |behalf of the sender and may read and propose any household state. Write
+       |access is propose-only — a human accepts proposals before they become
+       |durable. Never claim something is done when you have only proposed it.
        |
        |Answer directly when you already can. If the request is satisfied by what is
-       |already in front of you — your identity, the sender, the accessible scopes
-       |below, or the conversation so far — just reply, with no tool calls and no
-       |preamble. Keep replies short. Only reach for a tool when you genuinely need
-       |data you don't have or must take an action.
+       |already in front of you — your identity, the sender, the household / owner
+       |profile below, the suggested skills, or the conversation so far — just reply,
+       |with no tool calls and no preamble. Keep replies short. Only reach for a tool
+       |when you genuinely need data you don't have or must take an action.
        |
-       |When you need data or must act, call `shell_run` with a bash command. These
-       |are the ONLY commands available — do NOT invent subcommands or flags:
+       |When you do need to act, you have a tiny tool surface:
+       |  - safe_run(command) — run a bash command. The `person` CLI exposes durable
+       |    household state (memory, commitments, goals, events, inbox, and the
+       |    person/entity/relationship graph); `skill` browses procedures; plus
+       |    general unix. Discover usage with `--help` — never invent subcommands or
+       |    flags.
+       |  - runlog(args) — zoom into the full output of an earlier safe_run when its
+       |    preview was truncated.
+       |  - run_skill(name, task) — run a skill as an isolated sub-task. Prefer this
+       |    when a suggested skill below matches the request; its summary returns to
+       |    you without cluttering this conversation.
+       |If you need the full contract, read it: `skill show agent-protocol`.
        |
-       |person (durable household state; reads + propose-only writes):
-       |  person goal list [--scope <s>] [--status open|blocked|done|cancelled]
-       |  person goal show <goal-id>
-       |  person goal cancel <goal-id> [--reason "..."]   (remove/drop a goal)
-       |  person goal status --to open|blocked|done|cancelled <goal-id> [--reason "..."]
-       |  person commitment list [--scope <s>] [--status <st>]
-       |  person memory search "<query>" [--scope <s>] [--person <id>]
-       |  person memory context [--scope <s>] [--person <id>]
-       |  person memory propose --person <id> --scope <s> --kind fact|preference|project_note|procedure_note --text "..." --source chat
-       |  person goal propose --owner <id> --scope <s> --title "..." --outcome "..." --evidence-rule "..."
-       |  person commitment propose --owner <id> --scope <s> --text "..." --source chat --evidence "..."
-       |  person event record --action <a> --category session_note --scope <s> --text "..."
-       |runlog show <run-id> --stream stdout    (full output of an earlier shell_run)
-       |skill list | skill search "<query>" | skill show <name>
+       |Suggested skills for this request:
+       |$candidateBlock
        |
        |Tool rules:
-       |  - Omit --scope to query across everything; otherwise use one of your scopes below.
-       |  - `person goal list` with no flags lists every goal you can see.
-       |  - If a command fails, read the error and correct it (or run it once with
-       |    `--help`). NEVER repeat the same failing command — it will keep failing.
+       |  - If a command fails, read the error and correct it (or run it with `--help`).
+       |    NEVER repeat the same failing command — it will keep failing.
        |  - After a call or two, reply to the user with what you found.
        |Reasoning you emit is hidden from the user; your final assistant message is
        |the reply they see.
        |
+       |${clockLine(now, zone)}
+       |
        |Sender: ${sender.value}
-       |Accessible scopes:
-       |$scopeLines
+       |
+       |Household / Owner profile:
+       |$profileBlock
        |
        |Recent context:
        |$contextBlock""".stripMargin
   }
 
-  private def renderContext(bundles: List[(ScopeId, ContextBundle)]): String = {
-    val sections = bundles.flatMap { case (scope, bundle) =>
-      val facts = bundle.facts.map(h => s"  - [${scope.value}] ${h.item.text}")
-      val events = bundle.events.map(e => s"  - [${scope.value}] (${e.category}) ${e.text.getOrElse(e.action)}")
-      val lines = facts ++ events
-      if (lines.isEmpty) Nil else lines
-    }
-    if (sections.isEmpty) "  (no recent context)" else sections.mkString("\n")
+  /** The pinned, non-decaying owner/household profile: onboarding facts plus the
+   *  accepted person/entity/relationship graph. When empty, a gentle nudge so the
+   *  agent can offer onboarding without blocking the request. */
+  private def renderProfile(profile: List[MemoryItem], graph: HouseholdGraph): String = {
+    val factLines   = profile.map(m => s"  - ${m.text}")
+    val entityLines = graph.entities.map(e => s"  - ${e.name} (${EntityKind.asString(e.kind)})")
+    val relLines    = graph.relationships.map(renderRelationship)
+    val all         = factLines ++ entityLines ++ relLines
+    if (all.isEmpty)
+      "  (none yet — offer to set this up via the onboarding skill if the user seems open, then proceed with their request)"
+    else all.mkString("\n")
   }
 
-  private def roleName(r: ScopeRole): String = r match {
-    case ScopeRole.Owner    => "owner"
-    case ScopeRole.Editor   => "editor"
-    case ScopeRole.Viewer   => "viewer"
-    case ScopeRole.Proposer => "proposer"
+  private def renderRelationship(r: Relationship): String = {
+    val window = (r.validFrom, r.validUntil) match {
+      case (None, None)       => ""
+      case (Some(f), None)    => s" [since ${f}]"
+      case (None, Some(u))    => s" [until ${u}]"
+      case (Some(f), Some(u)) => s" [${f}..${u}]"
+    }
+    val note = r.note.map(n => s" ($n)").getOrElse("")
+    s"  - ${r.fromId} —${r.relType}→ ${r.toId}$note$window"
+  }
+
+  private def renderContext(bundle: ContextBundle): String = {
+    val facts  = bundle.facts.map(h => s"  - ${h.item.text}")
+    val events = bundle.events.map(e => s"  - (${e.category}) ${e.text.getOrElse(e.action)}")
+    val lines  = facts ++ events
+    if (lines.isEmpty) "  (no recent context)" else lines.mkString("\n")
   }
 }

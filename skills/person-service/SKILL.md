@@ -1,6 +1,6 @@
 ---
 name: person-service
-description: Interact with the trusted person-service sidecar for durable family/work state — people, scopes, commitments, memory, approvals, goals, audit.
+description: Interact with the trusted person-service sidecar for durable household state — people, the entity/relationship graph, commitments, memory, approvals, goals, audit.
 version: 1.0.0
 capabilities: [person-cli, safe-run]
 ---
@@ -25,7 +25,6 @@ safe-run --cwd /tmp/workspace --timeout 5 --shell bash -- "person health"
 safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
   "person memory propose \
     --person fred \
-    --scope fred_work \
     --kind preference \
     --text 'Prefer draft-only email actions' \
     --source chat:local"
@@ -37,11 +36,20 @@ safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
 safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
   "person approval request \
     --action-type calendar.propose_event \
-    --scope family_shared \
     --payload-json '{\"summary\":\"Family dinner\",\"date\":\"2026-05-30\"}'"
 ```
 
-Commitments are covered in the dedicated `commitments` skill. Goals and plans are covered in `goals` and `plans`. Semantic facts and the episodic event log are covered in `memory` and `events`.
+### Household graph (entities & relationships)
+
+```
+person entity propose --kind organization --name 'MegaCorp' --source onboarding:work
+person entity list --status accepted
+person relationship propose --from fred --from-kind person --type employed_by \
+  --to <entity-id> --to-kind entity --source onboarding:work --valid-from 2024-01-01T00:00:00Z
+person household        # accepted, currently-active persons/entities/relationships
+```
+
+Building and updating the graph is covered in the dedicated `onboarding` skill. Commitments are covered in `commitments`. Goals and plans are covered in `goals` and `plans`. Semantic facts and the episodic event log are covered in `memory` and `events`.
 
 ## Rules
 
@@ -54,4 +62,4 @@ Commitments are covered in the dedicated `commitments` skill. Goals and plans ar
 
 ## Reference
 
-For memory kinds, scope ids, and full policy boundaries see `references/api.md` in this skill directory.
+For memory kinds, entity/relationship kinds, and full policy boundaries see `references/api.md` in this skill directory.

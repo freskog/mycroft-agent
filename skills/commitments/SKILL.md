@@ -19,7 +19,6 @@ Track obligations and open loops for people. Commitments are the source of truth
 safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
   "person commitment propose \
     --owner fred \
-    --scope fred_work \
     --text 'Send Graham update by Friday' \
     --source email:gmail-msg-123 \
     --evidence 'Could you send me the update by Friday?' \
@@ -30,7 +29,7 @@ safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
 
 ```
 safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
-  "person commitment list --owner fred --scope fred_work --status proposed"
+  "person commitment list --owner fred --status proposed"
 ```
 
 ## Rules
@@ -41,7 +40,7 @@ safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
 4. Always include `--source` to trace where the commitment came from.
 5. Always include `--evidence` with the relevant quote or context.
 6. Include `--due` when there is an explicit or implied deadline.
-7. Use the appropriate `--scope`: `fred_private`, `fred_work`, `family_shared`, etc.
+7. Set `--owner` to the person the obligation belongs to (commitments are one shared household store keyed by person, not by privacy scope).
 8. Commitments may be proposed — they do not imply the person has agreed to do them.
 
 ## Status Values

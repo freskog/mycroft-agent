@@ -24,7 +24,7 @@ import java.util.concurrent.Executors
  *  The two phases never overlap, so there is a single terminal writer at a time. */
 object Main extends ZIOAppDefault {
 
-  final case class Cfg(channel: String, as: String, mycroftUrl: String, register: Boolean)
+  final case class Cfg(channel: String, as: String, mycroftUrl: String, personServiceUrl: String, register: Boolean)
   final case class Ev(event: String, json: Option[Json])
 
   /** A LineReader that summarises bracketed pastes. While editing, a multi-line
@@ -59,6 +59,8 @@ object Main extends ZIOAppDefault {
   }
 
   private val defaultUrl: String = sys.env.getOrElse("MYCROFT_URL", "http://127.0.0.1:8090")
+  private val defaultPersonUrl: String = sys.env.getOrElse("PERSON_SERVICE_URL", "http://127.0.0.1:8080")
+  private val maxTurnSeconds: Int = sys.env.getOrElse("MYCROFT_MAX_TURN_SECONDS", "240").toIntOption.getOrElse(240)
 
   // Daemon-threaded HTTP/1.1 client: daemon threads can't keep the JVM alive
   // after we quit; HTTP/1.1 for clean chunked SSE.
@@ -79,16 +81,17 @@ object Main extends ZIOAppDefault {
 
   private def parseArgs(args: List[String]): Cfg = {
     @annotation.tailrec
-    def go(rem: List[String], channel: Option[String], as: String, url: String, register: Boolean): Cfg =
+    def go(rem: List[String], channel: Option[String], as: String, url: String, personUrl: String, register: Boolean): Cfg =
       rem match {
-        case "--channel" :: v :: t     => go(t, Some(v), as, url, register)
-        case "--as" :: v :: t          => go(t, channel, v, url, register)
-        case "--mycroft-url" :: v :: t => go(t, channel, as, v, register)
-        case "--register" :: t         => go(t, channel, as, url, register = true)
-        case _ :: t                    => go(t, channel, as, url, register)
-        case Nil                       => Cfg(channel.getOrElse("repl"), as, url, register)
+        case "--channel" :: v :: t           => go(t, Some(v), as, url, personUrl, register)
+        case "--as" :: v :: t                => go(t, channel, v, url, personUrl, register)
+        case "--mycroft-url" :: v :: t       => go(t, channel, as, v, personUrl, register)
+        case "--person-service-url" :: v :: t => go(t, channel, as, url, v, register)
+        case "--register" :: t             => go(t, channel, as, url, personUrl, register = true)
+        case _ :: t                         => go(t, channel, as, url, personUrl, register)
+        case Nil                             => Cfg(channel.getOrElse("repl"), as, url, personUrl, register)
       }
-    go(args, None, "fred", defaultUrl, register = false)
+    go(args, None, "fred", defaultUrl, defaultPersonUrl, register = false)
   }
 
   private def session(cfg: Cfg, rt: Runtime[Any]): ZIO[Scope, Throwable, Unit] =
@@ -131,6 +134,8 @@ object Main extends ZIOAppDefault {
         val trimmed = input.trim
         if (trimmed.isEmpty) loop(cfg, terminal, reader, queue, lastWasEof = false)
         else if (trimmed == "exit" || trimmed == "quit") printLine(terminal, "bye")
+        else if (trimmed == "/triage" || trimmed.startsWith("/triage "))
+          runTriage(cfg, terminal, reader, queue, trimmed) *> loop(cfg, terminal, reader, queue, lastWasEof = false)
         else
           for {
             turnId <- sendInbound(cfg, input).catchAll(t => printLine(terminal, s"send failed: ${describe(t)}").as(""))
@@ -157,9 +162,9 @@ object Main extends ZIOAppDefault {
         if (!ch.contains(cfg.channel) || !mid.contains(turnId)) go
         else ZIO.attempt(r.on(ev)).ignore *> (if (ev.event == "done" || ev.event == "error") ZIO.unit else go)
       }
-    go.timeout(180.seconds).flatMap {
+    go.timeout((maxTurnSeconds + 30).seconds).flatMap {
       case Some(_) => ZIO.unit
-      case None    => printLine(terminal, "[timed out waiting for a response]")
+      case None    => printLine(terminal, s"[timed out after ${maxTurnSeconds + 30}s waiting for a response]")
     }
   }
 
@@ -175,35 +180,46 @@ object Main extends ZIOAppDefault {
     private val tools     = scala.collection.mutable.ArrayBuffer.empty[String]
     private var liveLines = 0
     private var answering = false
+    private var turnStart = 0L
 
     def on(ev: Ev): Unit = if (ansi) onAnsi(ev) else onPlain(ev)
 
     private def onAnsi(ev: Ev): Unit = ev.event match {
-      case "started" => reasoning.setLength(0); tools.clear(); answering = false
+      case "started" => reasoning.setLength(0); tools.clear(); answering = false; turnStart = java.lang.System.nanoTime()
       case "reasoning" =>
+        // Once the answer is streaming, ignore trailing chain-of-thought.
         if (!answering) { reasoning.append(delta(ev)); draw() }
       case "tool_call" =>
-        tools += s"· ${toolLine(ev)}"; draw()
+        // After the answer starts (e.g. a nested skill's tool_result arrives
+        // late), never redraw the live box — that would clobber the printed
+        // answer. Append the tool line inline instead.
+        if (answering) { w.print("\n" + dim(s"· ${toolLine(ev)}")); terminal.flush() }
+        else { tools += s"· ${toolLine(ev)}"; draw() }
       case "tool_result" =>
-        tools += s"  ${resultLine(ev)}"; draw()
+        if (answering) { w.print("\n" + dim(s"  ${resultLine(ev)}")); terminal.flush() }
+        else { tools += s"  ${resultLine(ev)}"; draw() }
       case "content" =>
         if (!answering) { clearLive(); answering = true }
         w.print(delta(ev)); terminal.flush()
       case "done" =>
-        clearLive(); w.print("\n" + dim("─" * 40) + "\n"); terminal.flush()
+        // Only clear the live box if we never started answering; otherwise the
+        // box is already gone and clearing would erase the answer.
+        if (!answering) clearLive()
+        w.print("\n" + dim("─" * 40) + "\n" + dim(doneLine(ev)) + "\n"); terminal.flush()
       case "error" =>
-        clearLive(); w.print(s"\n[error] ${errLine(ev)}\n"); terminal.flush()
+        if (!answering) clearLive()
+        w.print(s"\n[error] ${errLine(ev)}\n"); terminal.flush()
       case _ => ()
     }
 
     private def onPlain(ev: Ev): Unit = {
       ev.event match {
-        case "started"     => w.println(); w.println("[mycroft] thinking…")
+        case "started"     => turnStart = java.lang.System.nanoTime(); w.println(); w.println("[mycroft] thinking…")
         case "reasoning"   => w.print(delta(ev))
         case "content"     => w.print(delta(ev))
         case "tool_call"   => w.println(); w.println(s"  · ${toolLine(ev)}")
         case "tool_result" => w.println(s"  · ${resultLine(ev)}")
-        case "done"        => w.println(); w.println("─" * 40)
+        case "done"        => w.println(); w.println("─" * 40); w.println(doneLine(ev))
         case "error"       => w.println(); w.println(s"[error] ${errLine(ev)}")
         case _             => ()
       }
@@ -247,6 +263,36 @@ object Main extends ZIOAppDefault {
     }
     private def errLine(ev: Ev): String =
       s"${ev.json.flatMap(strField("kind")).getOrElse("")}: ${ev.json.flatMap(strField("message")).getOrElse("")}"
+
+    private def doneLine(ev: Ev): String = {
+      val elapsed = ev.json.flatMap(longField("elapsed_ms")).getOrElse {
+        if (turnStart == 0L) 0L else (java.lang.System.nanoTime() - turnStart) / 1_000_000
+      }
+      val tokOut = ev.json.flatMap(intField("tokens_out")).getOrElse(0)
+      val parts  = List(s"${elapsed}ms") ++ (if (tokOut > 0) List(s"${tokOut} tok out") else Nil)
+      parts.mkString(", ")
+    }
+  }
+
+  // --- inbox triage (thin trigger) ---
+
+  /** The REPL no longer orchestrates triage — it just triggers the
+   *  `inbox-triage` skill. All the steps (Gmail sync, oldest-pending fetch,
+   *  classification, propose/skip, mark-triaged) live in the skill playbook, and
+   *  dedup is a server-side guarantee (propose-by-source). */
+  private def runTriage(cfg: Cfg, terminal: Terminal, reader: PastingLineReader, queue: Queue[Ev], cmd: String): Task[Unit] = {
+    val limit = cmd.stripPrefix("/triage").trim match {
+      case ""     => 5
+      case digits => digits.toIntOption.getOrElse(5)
+    }
+    val params = Json.Obj("limit" -> Json.Num(limit), "owner" -> Json.Str(cfg.as)).toJson
+    val task   =
+      s"Triage the $limit oldest pending inbox messages for ${cfg.as}. Follow the inbox-triage playbook and finish with a short markdown summary of the action taken per message."
+    for {
+      _      <- printLine(terminal, s"Triggering inbox-triage skill (limit $limit)…")
+      turnId <- sendSkill(cfg, "inbox-triage", task, Some(params)).catchAll(t => printLine(terminal, s"triage trigger failed: ${describe(t)}").as(""))
+      _      <- ZIO.when(turnId.nonEmpty)(renderTurn(cfg, terminal, queue, turnId))
+    } yield ()
   }
 
   // --- mycroft HTTP ---
@@ -276,6 +322,21 @@ object Main extends ZIOAppDefault {
     )
   }
 
+  /** Trigger a named skill at the top level — the REPL only names the skill and
+   *  the task/params; the harness runs it in a skill executor. */
+  private def sendSkill(cfg: Cfg, skill: String, task: String, params: Option[String]): Task[String] = {
+    val body = Json.Obj(
+      "channel" -> Json.Str(cfg.channel),
+      "from"    -> Json.Str(cfg.as),
+      "content" -> Json.Str(task),
+      "skill"   -> Json.Str(skill),
+      "params"  -> params.map(Json.Str(_)).getOrElse(Json.Null)
+    ).toJson
+    post(cfg.mycroftUrl + "/inbound", body).map(resp =>
+      resp.fromJson[Json].toOption.flatMap(strField("message_id")).getOrElse("")
+    )
+  }
+
   private def post(url: String, body: String): Task[String] =
     ZIO.attemptBlocking {
       val req = HttpRequest.newBuilder()
@@ -284,7 +345,10 @@ object Main extends ZIOAppDefault {
         .header("Content-Type", "application/json")
         .build()
       val resp = client.send(req, HttpResponse.BodyHandlers.ofString())
-      if (resp.statusCode() >= 400) throw new RuntimeException(s"${resp.statusCode()}: ${resp.body()}")
+      if (resp.statusCode() >= 400) {
+        val hint = if (resp.statusCode() == 413) " (payload too large — try /triage with a smaller number)" else ""
+        throw new RuntimeException(s"${resp.statusCode()}$hint: ${resp.body()}")
+      }
       resp.body()
     }
 
@@ -340,5 +404,21 @@ object Main extends ZIOAppDefault {
   private def boolField(name: String)(json: Json): Option[Boolean] = json match {
     case Json.Obj(fields) => fields.collectFirst { case (k, Json.Bool(b)) if k == name => b }
     case _                => None
+  }
+
+  private def intField(name: String)(json: Json): Option[Int] = json match {
+    case Json.Obj(fields) =>
+      fields.collectFirst {
+        case (k, Json.Num(n)) if k == name => n.intValue
+      }
+    case _ => None
+  }
+
+  private def longField(name: String)(json: Json): Option[Long] = json match {
+    case Json.Obj(fields) =>
+      fields.collectFirst {
+        case (k, Json.Num(n)) if k == name => n.longValue
+      }
+    case _ => None
   }
 }

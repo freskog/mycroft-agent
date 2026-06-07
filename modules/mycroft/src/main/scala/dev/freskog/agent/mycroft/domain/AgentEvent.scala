@@ -29,6 +29,6 @@ object AgentEvent {
   final case class Content(channel: String, messageId: String, delta: String) extends AgentEvent
   final case class ToolCall(channel: String, messageId: String, tool: String, args: String) extends AgentEvent
   final case class ToolResult(channel: String, messageId: String, tool: String, ok: Boolean, summary: String) extends AgentEvent
-  final case class Done(channel: String, messageId: String, stopReason: String, tokensIn: Int, tokensOut: Int) extends AgentEvent
+  final case class Done(channel: String, messageId: String, stopReason: String, tokensIn: Int, tokensOut: Int, elapsedMs: Long) extends AgentEvent
   final case class Error(channel: String, messageId: String, kind: String, message: String) extends AgentEvent
 }

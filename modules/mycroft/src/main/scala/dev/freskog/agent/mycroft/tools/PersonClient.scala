@@ -12,17 +12,20 @@ import java.net.http.{HttpClient => JHttpClient, HttpRequest, HttpResponse}
 import java.time.Instant
 
 /** Small typed HTTP client for mycroft's own bookkeeping against person-service:
- *  scope-roles, context bundles, channels, and the message log. This is NOT the
- *  agent tool surface (that is `shell_run`); it is mycroft's internal plumbing. */
+ *  context bundles, the household graph, channels, and the message log. This is
+ *  NOT the agent tool surface (that is `safe_run`); it is mycroft's internal
+ *  plumbing. */
 trait PersonClient {
-  def scopeRoles(personId: PersonId): IO[AgentError, List[PersonScopeRole]]
-  def contextBundle(scopeId: ScopeId, factLimit: Int, eventLimit: Int): IO[AgentError, ContextBundle]
+  def contextBundle(personId: Option[PersonId], factLimit: Int, eventLimit: Int): IO[AgentError, ContextBundle]
+  def searchMemory(query: String, personId: Option[PersonId], limit: Int): IO[AgentError, List[MemoryHit]]
+  def profileFacts(limit: Int): IO[AgentError, List[MemoryItem]]
+  def household: IO[AgentError, HouseholdGraph]
   def getChannel(id: ChannelId): IO[AgentError, Option[ChannelWithMembers]]
   def listChannels: IO[AgentError, List[Channel]]
   def createChannel(id: ChannelId, defaultModel: Option[String], members: List[PersonId]): IO[AgentError, ChannelWithMembers]
   def appendMessage(channelId: ChannelId, role: MessageRole, from: Option[PersonId], content: String, toolCallsJson: Option[String], externalId: Option[String]): IO[AgentError, Message]
   def listMessages(channelId: ChannelId, since: Option[Instant], limit: Int): IO[AgentError, List[Message]]
-  def logEvent(actor: String, action: String, category: String, scopeId: Option[ScopeId], text: Option[String], payloadJson: Option[String]): IO[AgentError, Unit]
+  def logEvent(actor: String, action: String, category: String, text: Option[String], payloadJson: Option[String]): IO[AgentError, Unit]
 }
 
 object PersonClient {
@@ -34,12 +37,22 @@ object PersonClient {
       .connectTimeout(java.time.Duration.ofSeconds(10))
       .build()
 
-    def scopeRoles(personId: PersonId): IO[AgentError, List[PersonScopeRole]] =
-      get("/scope-roles", Map("person" -> personId.value)).flatMap(decode[List[PersonScopeRole]])
+    def contextBundle(personId: Option[PersonId], factLimit: Int, eventLimit: Int): IO[AgentError, ContextBundle] = {
+      val params = Map("fact_limit" -> factLimit.toString, "event_limit" -> eventLimit.toString) ++
+        personId.map("person" -> _.value)
+      get("/memory/context", params).flatMap(decode[ContextBundle])
+    }
 
-    def contextBundle(scopeId: ScopeId, factLimit: Int, eventLimit: Int): IO[AgentError, ContextBundle] =
-      get("/memory/context", Map("scope" -> scopeId.value, "fact_limit" -> factLimit.toString, "event_limit" -> eventLimit.toString))
-        .flatMap(decode[ContextBundle])
+    def searchMemory(query: String, personId: Option[PersonId], limit: Int): IO[AgentError, List[MemoryHit]] = {
+      val params = Map("q" -> query, "limit" -> limit.toString) ++ personId.map("person" -> _.value)
+      get("/memory/search", params).flatMap(decode[List[MemoryHit]])
+    }
+
+    def profileFacts(limit: Int): IO[AgentError, List[MemoryItem]] =
+      get("/memory/profile", Map("limit" -> limit.toString)).flatMap(decode[List[MemoryItem]])
+
+    def household: IO[AgentError, HouseholdGraph] =
+      get("/household", Map.empty).flatMap(decode[HouseholdGraph])
 
     def getChannel(id: ChannelId): IO[AgentError, Option[ChannelWithMembers]] =
       get(s"/channels/${id.value}", Map.empty).flatMap(decode[ChannelWithMembers]).map(Some(_))
@@ -75,12 +88,11 @@ object PersonClient {
       get("/messages", params).flatMap(decode[List[Message]])
     }
 
-    def logEvent(actor: String, action: String, category: String, scopeId: Option[ScopeId], text: Option[String], payloadJson: Option[String]): IO[AgentError, Unit] = {
+    def logEvent(actor: String, action: String, category: String, text: Option[String], payloadJson: Option[String]): IO[AgentError, Unit] = {
       val body = Json.Obj(
         "actor"       -> Json.Str(actor),
         "action"      -> Json.Str(action),
         "category"    -> Json.Str(category),
-        "scopeId"     -> scopeId.map(s => Json.Str(s.value)).getOrElse(Json.Null),
         "targetType"  -> Json.Null,
         "targetId"    -> Json.Null,
         "text"        -> text.map(Json.Str(_)).getOrElse(Json.Null),

@@ -11,7 +11,6 @@ import java.time.Instant
 
 case class ProposeCommitmentRequest(
   ownerPersonId: PersonId,
-  scopeId: ScopeId,
   text: String,
   source: String,
   evidence: String,
@@ -23,7 +22,6 @@ object ProposeCommitmentRequest {
 
 case class ProposeMemoryRequest(
   personId: Option[PersonId],
-  scopeId: Option[ScopeId],
   kind: MemoryKind,
   text: String,
   source: String,
@@ -39,7 +37,6 @@ object ProposeMemoryRequest {
 case class RequestApprovalRequest(
   requestedBy: String,
   requiredPersonId: Option[PersonId],
-  scopeId: Option[ScopeId],
   actionType: String,
   payloadJson: String
 )
@@ -57,28 +54,8 @@ object CreatePersonRequest {
   implicit val codec: JsonCodec[CreatePersonRequest] = DeriveJsonCodec.gen[CreatePersonRequest]
 }
 
-case class CreateScopeRequest(
-  id: ScopeId,
-  name: String,
-  ownerPersonId: Option[PersonId],
-  kind: ScopeKind
-)
-object CreateScopeRequest {
-  implicit val codec: JsonCodec[CreateScopeRequest] = DeriveJsonCodec.gen[CreateScopeRequest]
-}
-
-case class CreateScopeRoleRequest(
-  personId: PersonId,
-  scopeId: ScopeId,
-  role: ScopeRole
-)
-object CreateScopeRoleRequest {
-  implicit val codec: JsonCodec[CreateScopeRoleRequest] = DeriveJsonCodec.gen[CreateScopeRoleRequest]
-}
-
 case class ProposeGoalRequest(
   ownerPersonId: PersonId,
-  scopeId: ScopeId,
   title: String,
   outcome: String,
   evidenceRule: String,
@@ -87,6 +64,45 @@ case class ProposeGoalRequest(
 )
 object ProposeGoalRequest {
   implicit val codec: JsonCodec[ProposeGoalRequest] = DeriveJsonCodec.gen[ProposeGoalRequest]
+}
+
+// --- Household graph (entities + relationships) ---
+
+case class ProposeEntityRequest(
+  kind: EntityKind,
+  name: String,
+  attributesJson: Option[String] = None,
+  source: String,
+  confidence: Option[Double] = None
+)
+object ProposeEntityRequest {
+  implicit val codec: JsonCodec[ProposeEntityRequest] = DeriveJsonCodec.gen[ProposeEntityRequest]
+}
+
+case class ProposeRelationshipRequest(
+  fromId: String,
+  fromKind: NodeKind,
+  relType: String,
+  toId: String,
+  toKind: NodeKind,
+  source: String,
+  confidence: Option[Double] = None,
+  note: Option[String] = None,
+  validFrom: Option[Instant] = None,
+  validUntil: Option[Instant] = None
+)
+object ProposeRelationshipRequest {
+  implicit val codec: JsonCodec[ProposeRelationshipRequest] = DeriveJsonCodec.gen[ProposeRelationshipRequest]
+}
+
+case class SupersedeEntityRequest(newId: EntityId, oldId: EntityId)
+object SupersedeEntityRequest {
+  implicit val codec: JsonCodec[SupersedeEntityRequest] = DeriveJsonCodec.gen[SupersedeEntityRequest]
+}
+
+case class SupersedeRelationshipRequest(newId: RelationshipId, oldId: RelationshipId)
+object SupersedeRelationshipRequest {
+  implicit val codec: JsonCodec[SupersedeRelationshipRequest] = DeriveJsonCodec.gen[SupersedeRelationshipRequest]
 }
 
 case class UpdateGoalStatusRequest(
@@ -120,7 +136,6 @@ case class LogEventRequest(
   actor: String,
   action: String,
   category: String,
-  scopeId: Option[ScopeId],
   targetType: Option[String],
   targetId: Option[String],
   text: Option[String],
@@ -130,7 +145,7 @@ object LogEventRequest {
   implicit val codec: JsonCodec[LogEventRequest] = DeriveJsonCodec.gen[LogEventRequest]
 }
 
-case class ConsolidateRequest(scopeId: ScopeId, since: Option[Instant])
+case class ConsolidateRequest(since: Option[Instant])
 object ConsolidateRequest {
   implicit val codec: JsonCodec[ConsolidateRequest] = DeriveJsonCodec.gen[ConsolidateRequest]
 }
@@ -159,6 +174,52 @@ case class AppendMessageRequest(
 )
 object AppendMessageRequest {
   implicit val codec: JsonCodec[AppendMessageRequest] = DeriveJsonCodec.gen[AppendMessageRequest]
+}
+
+case class GmailOAuthExchangeRequest(
+  ownerPersonId: PersonId,
+  code: String,
+  redirectUri: String
+)
+object GmailOAuthExchangeRequest {
+  implicit val codec: JsonCodec[GmailOAuthExchangeRequest] = DeriveJsonCodec.gen[GmailOAuthExchangeRequest]
+}
+
+case class GmailAuthUrlResponse(url: String, redirectUri: String)
+object GmailAuthUrlResponse {
+  implicit val codec: JsonCodec[GmailAuthUrlResponse] = DeriveJsonCodec.gen[GmailAuthUrlResponse]
+}
+
+case class GmailCredentialSummary(
+  provider: String,
+  accountEmail: String,
+  ownerPersonId: PersonId,
+  scopes: String
+)
+object GmailCredentialSummary {
+  implicit val codec: JsonCodec[GmailCredentialSummary] = DeriveJsonCodec.gen[GmailCredentialSummary]
+}
+
+case class GmailSyncResult(fetched: Int, inserted: Int, pending: Int)
+object GmailSyncResult {
+  implicit val codec: JsonCodec[GmailSyncResult] = DeriveJsonCodec.gen[GmailSyncResult]
+}
+
+case class MarkInboxTriagedRequest(sourceEventId: Option[EventId] = None)
+object MarkInboxTriagedRequest {
+  implicit val codec: JsonCodec[MarkInboxTriagedRequest] = DeriveJsonCodec.gen[MarkInboxTriagedRequest]
+}
+
+/** One downloaded attachment. `dataBase64` is standard (not url-safe) base64 of
+ *  the raw bytes — the CLI decodes it and writes the file locally. */
+case class AttachmentDownload(
+  filename: String,
+  mimeType: String,
+  sizeBytes: Long,
+  dataBase64: String
+)
+object AttachmentDownload {
+  implicit val codec: JsonCodec[AttachmentDownload] = DeriveJsonCodec.gen[AttachmentDownload]
 }
 
 // --- Audit payload codecs ---

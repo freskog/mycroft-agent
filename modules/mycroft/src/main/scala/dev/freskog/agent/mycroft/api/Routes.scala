@@ -20,7 +20,9 @@ object Routes {
     channel: String,
     from: String,
     content: String,
-    @jsonField("external_id") externalId: Option[String]
+    @jsonField("external_id") externalId: Option[String],
+    skill: Option[String] = None,
+    params: Option[String] = None
   )
   object InboundRequest {
     implicit val codec: JsonCodec[InboundRequest] = DeriveJsonCodec.gen[InboundRequest]
@@ -47,7 +49,11 @@ object Routes {
           case Left(err) => ZIO.succeed(errorToResponse(err))
           case Right(in) =>
             val turnId = java.util.UUID.randomUUID().toString
-            loop.run(in.channel, in.from, in.content, in.externalId, turnId).forkDaemon.as(
+            val start  = in.skill.map(_.trim).filter(_.nonEmpty) match {
+              case Some(skill) => loop.runSkill(in.channel, in.from, skill, in.content, in.params, turnId)
+              case None        => loop.run(in.channel, in.from, in.content, in.externalId, turnId)
+            }
+            start.forkDaemon.as(
               Response.json(s"""{"message_id":"$turnId","channel":"${in.channel}"}""").status(Status.Accepted)
             )
         }

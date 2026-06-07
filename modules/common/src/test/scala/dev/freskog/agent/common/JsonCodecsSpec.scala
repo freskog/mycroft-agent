@@ -79,16 +79,22 @@ object JsonCodecsSpec extends ZIOSpecDefault {
         assertTrue(back == Right(meta))
       }
     ),
-    suite("ScopeKind")(
+    suite("EntityKind")(
       test("round-trip all kinds") {
-        val kinds: List[ScopeKind] = List(
-          ScopeKind.Private, ScopeKind.Shared, ScopeKind.Work,
-          ScopeKind.Household, ScopeKind.School, ScopeKind.Other
+        val kinds: List[EntityKind] = List(
+          EntityKind.Organization, EntityKind.School, EntityKind.Club,
+          EntityKind.Medical, EntityKind.Vehicle, EntityKind.Place, EntityKind.Other
         )
         val results = kinds.map { k =>
-          k.toJson.fromJson[ScopeKind] == Right(k)
+          k.toJson.fromJson[EntityKind] == Right(k)
         }
         assertTrue(results.forall(identity))
+      }
+    ),
+    suite("NodeKind")(
+      test("round-trip person and entity") {
+        val kinds: List[NodeKind] = List(NodeKind.Person, NodeKind.Entity)
+        assertTrue(kinds.forall(k => k.toJson.fromJson[NodeKind] == Right(k)))
       }
     ),
     suite("CommitmentStatus")(
@@ -128,7 +134,6 @@ object JsonCodecsSpec extends ZIOSpecDefault {
         val c = Commitment(
           id = CommitmentId("c1"),
           ownerPersonId = PersonId("p1"),
-          scopeId = ScopeId("s1"),
           status = CommitmentStatus.Proposed,
           text = "Send update",
           source = "email:123",
@@ -148,7 +153,6 @@ object JsonCodecsSpec extends ZIOSpecDefault {
         val m = MemoryItem(
           id = MemoryId("m1"),
           personId = Some(PersonId("p1")),
-          scopeId = Some(ScopeId("s1")),
           status = MemoryStatus.Proposed,
           kind = MemoryKind.Preference,
           text = "Prefer draft-only email actions",
@@ -169,7 +173,6 @@ object JsonCodecsSpec extends ZIOSpecDefault {
           id = ApprovalId("a1"),
           requestedBy = "agent",
           requiredPersonId = Some(PersonId("p1")),
-          scopeId = Some(ScopeId("s1")),
           actionType = "calendar.propose_event",
           payloadJson = """{"summary":"meeting"}""",
           status = ApprovalStatus.Requested,
@@ -191,7 +194,6 @@ object JsonCodecsSpec extends ZIOSpecDefault {
           category = "state",
           targetType = "commitment",
           targetId = Some("c1"),
-          scopeId = Some(ScopeId("s1")),
           text = None,
           payloadJson = "{}",
           createdAt = now
@@ -199,6 +201,53 @@ object JsonCodecsSpec extends ZIOSpecDefault {
         val json = e.toJson
         val back = json.fromJson[AuditEvent]
         assertTrue(back == Right(e))
+      }
+    ),
+    suite("Entity")(
+      test("round-trip") {
+        val now = Instant.parse("2026-05-25T12:00:00Z")
+        val e = Entity(
+          id = EntityId("e1"),
+          kind = EntityKind.School,
+          name = "Oakwood Primary",
+          attributesJson = Some("""{"phase":"primary"}"""),
+          status = MemoryStatus.Accepted,
+          source = "onboarding:children",
+          confidence = Some(0.95),
+          supersededById = None,
+          createdAt = now,
+          updatedAt = now
+        )
+        assertTrue(e.toJson.fromJson[Entity] == Right(e))
+      }
+    ),
+    suite("Relationship")(
+      test("round-trip") {
+        val now = Instant.parse("2026-05-25T12:00:00Z")
+        val r = Relationship(
+          id = RelationshipId("r1"),
+          fromId = "p-child",
+          fromKind = NodeKind.Person,
+          relType = RelationshipType.Attends,
+          toId = "e1",
+          toKind = NodeKind.Entity,
+          status = MemoryStatus.Accepted,
+          source = "onboarding:children",
+          confidence = Some(0.9),
+          note = Some("started 2025"),
+          supersededById = None,
+          validFrom = Some(now),
+          validUntil = None,
+          createdAt = now,
+          updatedAt = now
+        )
+        assertTrue(r.toJson.fromJson[Relationship] == Right(r))
+      }
+    ),
+    suite("HouseholdGraph")(
+      test("round-trip empty") {
+        val g = HouseholdGraph(Nil, Nil)
+        assertTrue(g.toJson.fromJson[HouseholdGraph] == Right(g))
       }
     ),
     suite("AgentError")(

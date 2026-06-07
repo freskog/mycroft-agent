@@ -1,10 +1,11 @@
 package dev.freskog.agent.mycroft
 
-import dev.freskog.agent.mycroft.agent.Loop
+import dev.freskog.agent.mycroft.agent.{Loop, MemoryProvider}
 import dev.freskog.agent.mycroft.api.Routes
 import dev.freskog.agent.mycroft.domain.{AgentEvent, MycroftConfig}
 import dev.freskog.agent.mycroft.llm.LmStudioClient
-import dev.freskog.agent.mycroft.tools.{PersonClient, ToolRegistry}
+import dev.freskog.agent.mycroft.tools.{PersonClient, SkillProvider, ToolRegistry}
+import dev.freskog.agent.runtime.SkillCatalog
 
 import zio._
 import zio.http._
@@ -21,9 +22,13 @@ object Main extends ZIOAppDefault {
         person  = PersonClient.live(config.personServiceUrl)
         llm     = LmStudioClient.live(config.lmStudioUrl)
         tools   = ToolRegistry.live(ToolRegistry.defaultCwd, config.maxTurnSeconds)
-        loop    = new Loop(config, person, llm, tools, hub)
+        mem     = MemoryProvider.live(person)
+        skills  = SkillProvider.live(SkillCatalog.resolveSkillsDir(None))
+        loop    = new Loop(config, person, llm, tools, mem, skills, hub)
         routes  = Routes.make(loop, person, llm, hub)
-        _      <- Server.serve(routes).provide(Server.defaultWith(_.binding(config.host, config.port)))
+        _ <- Server.serve(routes).provide(
+          Server.defaultWith(_.binding(config.host, config.port).enableRequestStreaming)
+        )
       } yield ()
     }
   }

@@ -32,6 +32,19 @@ final case class ChatChunk(
   finishReason: Option[String]
 )
 
+/** Sampling knobs sent to LM Studio. Defaults follow Qwen3's recommended
+ *  *thinking-mode* settings, plus a `presence_penalty` to break the reasoning
+ *  repetition loops that otherwise burn the whole token budget without ever
+ *  emitting an answer or a tool call. `top_k`/`min_p` are llama.cpp/MLX
+ *  extensions that LM Studio honours and other servers ignore. */
+final case class SamplingParams(
+  temperature: Double = 0.6,
+  topP: Double = 0.95,
+  topK: Int = 20,
+  minP: Double = 0.0,
+  presencePenalty: Double = 1.0
+)
+
 object ChatProtocol {
 
   /** Build the `/v1/chat/completions` request body as a JSON string. */
@@ -40,14 +53,20 @@ object ChatProtocol {
     messages: List[ChatMessage],
     maxTokens: Int,
     stream: Boolean,
-    toolsJson: Option[String]
+    toolsJson: Option[String],
+    sampling: SamplingParams = SamplingParams()
   ): String = {
     val msgArr = Json.Arr(Chunk.fromIterable(messages.map(encodeMessage)))
     val base = List(
-      "model"      -> Json.Str(model),
-      "messages"   -> msgArr,
-      "stream"     -> Json.Bool(stream),
-      "max_tokens" -> Json.Num(maxTokens)
+      "model"            -> Json.Str(model),
+      "messages"         -> msgArr,
+      "stream"           -> Json.Bool(stream),
+      "max_tokens"       -> Json.Num(maxTokens),
+      "temperature"      -> Json.Num(sampling.temperature),
+      "top_p"            -> Json.Num(sampling.topP),
+      "top_k"            -> Json.Num(sampling.topK),
+      "min_p"            -> Json.Num(sampling.minP),
+      "presence_penalty" -> Json.Num(sampling.presencePenalty)
     )
     val withTools = toolsJson.flatMap(_.fromJson[Json].toOption) match {
       case Some(arr) => base :+ ("tools" -> arr)

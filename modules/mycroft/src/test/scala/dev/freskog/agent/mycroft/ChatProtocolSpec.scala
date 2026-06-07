@@ -20,13 +20,13 @@ object ChatProtocolSpec extends ZIOSpecDefault {
     },
 
     test("parses a tool_call delta with index/id/name and arg fragment") {
-      val line = """data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"shell_run","arguments":"{\"command\""}}]}}]}"""
+      val line = """data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"safe_run","arguments":"{\"command\""}}]}}]}"""
       val deltas = StreamParser.parseLine(line).map(_.toolCallDeltas).getOrElse(Nil)
       assertTrue(
         deltas.size == 1,
         deltas.head.index == 0,
         deltas.head.id.contains("call-1"),
-        deltas.head.name.contains("shell_run"),
+        deltas.head.name.contains("safe_run"),
         deltas.head.argsFragment.contains("{\"command\"")
       )
     },
@@ -48,7 +48,7 @@ object ChatProtocolSpec extends ZIOSpecDefault {
       val msgs = List(
         ChatMessage.system("sys"),
         ChatMessage.user("hi"),
-        ChatMessage("assistant", Some(""), toolCalls = List(ToolCallSpec("c1", "shell_run", """{"command":"ls"}"""))),
+        ChatMessage("assistant", Some(""), toolCalls = List(ToolCallSpec("c1", "safe_run", """{"command":"ls"}"""))),
         ChatMessage("tool", Some("exit 0"), toolCallId = Some("c1"))
       )
       val body = ChatProtocol.encodeBody("m", msgs, 256, stream = true, Some(ToolRegistryToolsJson))
@@ -64,5 +64,5 @@ object ChatProtocolSpec extends ZIOSpecDefault {
 
   // A minimal tools array so the test doesn't depend on ToolRegistry's constant.
   private val ToolRegistryToolsJson =
-    """[{"type":"function","function":{"name":"shell_run","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]"""
+    """[{"type":"function","function":{"name":"safe_run","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]"""
 }

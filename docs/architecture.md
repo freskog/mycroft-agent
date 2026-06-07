@@ -71,7 +71,10 @@ Credentials (OAuth tokens, API keys, SSH keys) in the sandbox would let a compro
 - Access private repositories
 - Modify cloud infrastructure
 
-Credentials stay in `person-service`. Future integrations (Gmail, Calendar) will be server-side operations triggered by approved requests.
+Credentials stay in `person-service`. Gmail and Google Calendar are both
+integrated today as **read-only** server-side operations (the agent never sees the
+OAuth token); calendar *writes* and any other write-side integrations remain
+future work behind the same approval boundary.
 
 ## Domain Model
 
@@ -141,6 +144,58 @@ The flow between them:
 
 `outcome` and `evidence_rule` are immutable on goals; `text` is immutable on memory items (replace via supersession). Both rules block environmental text from quietly rewriting durable state.
 
+### Email Ingestion (Inbox)
+
+`person-service` ingests email as a read-only source feeding triage. Gmail OAuth
+tokens live only in the sidecar (in the `credentials` table); the agent never
+holds them.
+
+- `person gmail auth` runs a one-time OAuth loopback flow; `person gmail sync`
+  pulls recent message **metadata + plain-text body** into the `inbox_messages`
+  table and refreshes the access token as needed.
+- Each inbox row carries triage state (`pending` / `triaged` / `skipped`) so the
+  `inbox-triage` skill can process the oldest-pending messages and mark them.
+- **Attachments are stored as metadata only** — `attachmentId`, `filename`,
+  `mimeType`, `sizeBytes` (in the row's `attachments_json`). The bytes are *not*
+  persisted. When a task actually needs an attachment's contents, the agent runs
+  `person inbox download <id> --out <dir>`: the sidecar fetches the bytes from
+  Gmail on demand (refreshing the token), returns them base64-encoded, and the
+  `person` CLI writes the file into the agent's workspace where `safe_run` can
+  read it. This keeps large blobs out of both the database and the LLM context
+  until they are explicitly requested.
+
+The agent's surface is the `person inbox` / `person gmail` CLI verbs (read +
+on-demand download); it can never send mail or mutate the mailbox.
+
+### Calendar (read-only, Phase 1)
+
+Calendar reuses the **same Google OAuth grant** as Gmail: the consent requests
+`gmail.readonly` + `calendar.readonly` together, yielding one access/refresh token
+(stored in the single `gmail` credential row) that works against both APIs. There
+is no separate calendar login.
+
+Phase 1 is **on-demand and uncached**: `person calendar agenda --owner <p>
+[--days N | --from --to]` live-queries the owner's primary Google Calendar
+(`events.list`, single-events expanded, ordered by start) and returns a JSON array
+of events. The agent pulls the agenda when it needs scheduling context — answering
+"what's on this week", or, during triage, grounding a date found in an email
+("already on the calendar" / "conflicts with X"). This keeps calendar consistent
+with the substrate's tool-on-demand philosophy rather than always injecting a
+schedule into the prompt.
+
+This preserves the existing boundary: **calendar events are projections, not
+authoritative state**, and the agent still cannot write them. Two deliberate
+follow-ups:
+
+- **Phase 1.5 — cache + context injection**: sync events into a local
+  `calendar_events` table (like `inbox_messages`) and fold upcoming events into
+  the per-turn context bundle, so the agent always knows the schedule without a
+  tool call.
+- **Phase 2 — write via approval**: a `calendar.events` scope where the agent
+  *proposes* an event (an `Approval` of type `calendar.create_event`); a human
+  approves and `person-service` creates it, linking it back to the commitment or
+  goal it projects.
+
 ## Execution Model
 
 ### Stateless Command Execution (Default)
@@ -178,8 +233,8 @@ These would be additional commands, not changes to `safe-run`.
 │  ┌─────────────────────────────────────────┐│
 │  │ person-service                           ││
 │  │  ├── SQLite DB                          ││
-│  │  ├── Gmail OAuth (future)               ││
-│  │  ├── Calendar API (future)              ││
+│  │  ├── Gmail OAuth (readonly)             ││
+│  │  ├── Calendar API (readonly)            ││
 │  │  └── Approval engine                    ││
 │  └─────────────────────────────────────────┘│
 └──────────────────────────────────────────────┘
@@ -267,19 +322,47 @@ Mycroft uses **native OpenAI tool calls** (reasoning models on this build
 return reasoning in a dedicated `reasoning_content` field, not inline
 `<think>` tags). The native tool set is intentionally tiny:
 
-- `shell_run(command, timeout?)` — executes a bash command via the in-process
+- `safe_run(command, timeout?)` — executes a bash command via the in-process
   `safe-run` `ProcessRunner` and returns bounded preview + `runlog` reference.
-- `skill_search(query, limit?)` / `skill_show(name)` — bootstrap procedure
-  lookup so the agent finds CLI vocabulary by retrieval, not by enumeration.
+- `runlog(args)` — zooms into the full output of an earlier `safe_run` when its
+  preview was truncated. It is its own tool (not invoked through `safe_run`,
+  which would be circular).
+- `run_skill(name, task, params?)` — **control-plane** tool that runs a skill as
+  an isolated sub-task (own context + budget) and returns a structured result
+  summary. It composes skills; it does not touch the OS, so the OS surface stays
+  `safe_run` + `runlog`.
 
-Everything else — `person memory propose`, `person goal list`, `runlog show`,
-unix utilities — is invoked through `shell_run`. Command vocabulary lives in
-skills; the system prompt mentions only the available binaries. This is
+Everything else — `person memory propose`, `person goal list`, the `skill`
+catalogue, unix utilities — is invoked through `safe_run`. Command vocabulary
+lives in skills; the system prompt mentions only the entry points. This is
 progressive disclosure of tools, mirroring the substrate's progressive
 disclosure of skills.
 
 Every tool invocation writes a `decision`-category audit event so the turn is
 fully reconstructable from the event log.
+
+### LLM sampling
+
+Mycroft sends explicit sampling parameters with every completion (Qwen3
+thinking-mode defaults: `temperature 0.6`, `top_p 0.95`, `top_k 20`, `min_p 0`)
+plus a `presence_penalty` (default `1.0`). The presence penalty is load-bearing:
+without it the reasoning model can fall into a repetition loop that burns the
+whole `max_tokens` budget without ever emitting an answer or a tool call. All are
+env-tunable (`MYCROFT_TEMPERATURE`, `MYCROFT_TOP_P`, `MYCROFT_TOP_K`,
+`MYCROFT_MIN_P`, `MYCROFT_PRESENCE_PENALTY`). As a backstop, a turn that finishes
+with no tool call and empty content returns a clear fallback message rather than a
+blank reply.
+
+### Clock
+
+The model has no inherent sense of time, so every system prompt — top-level turns
+and skill sub-tasks alike — is stamped with the current date/time in a configured
+timezone (`MYCROFT_TIMEZONE`, an IANA zone id; default `UTC`). The "now" itself
+comes from ZIO's `Clock`; only zone parsing and formatting touch `java.time`,
+which ZIO has no substitute for. Without this the
+agent cannot resolve relative dates ("by Friday", "next week") or tell whether a
+date referenced in an email is in the past or the future — essential for inbox
+triage and the planned calendar work.
 
 ### Compaction
 

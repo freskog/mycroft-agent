@@ -4,7 +4,7 @@ import dev.freskog.agent.common._
 import dev.freskog.agent.person.domain._
 import dev.freskog.agent.person.persistence._
 import dev.freskog.agent.person.seed.SeedData
-import dev.freskog.agent.person.seed.SeedData.{FamilyShared, FredId, FredPrivate, FredWork, SampleGoalId}
+import dev.freskog.agent.person.seed.SeedData.{FredId, PaulaId, SampleGoalId}
 import dev.freskog.agent.person.service.PersonService
 
 import zio._
@@ -20,25 +20,33 @@ object PersonServiceSpec extends ZIOSpecDefault {
         _       <- SeedData.seed(db)
         service  = PersonService.live(
           Repos.sqlitePersonRepo(db),
-          Repos.sqliteScopeRepo(db),
-          Repos.sqliteScopeRoleRepo(db),
           Repos.sqliteCommitmentRepo(db),
           Repos.sqliteMemoryRepo(db),
           Repos.sqliteApprovalRepo(db),
           Repos.sqliteAuditRepo(db),
           Repos.sqliteGoalRepo(db),
           Repos.sqliteGoalEvidenceRepo(db),
+          Repos.sqliteEntityRepo(db),
+          Repos.sqliteRelationshipRepo(db),
           Repos.sqliteChannelRepo(db),
           Repos.sqliteChannelMemberRepo(db),
-          Repos.sqliteMessageRepo(db)
+          Repos.sqliteMessageRepo(db),
+          Repos.sqliteCredentialRepo(db),
+          Repos.sqliteInboxMessageRepo(db)
         )
         result  <- f(service)
       } yield result
     }
 
-  private def proposeAndAcceptMemory(svc: PersonService, text: String, kind: MemoryKind = MemoryKind.Fact, scope: ScopeId = FredWork, confidence: Double = 0.7): IO[AgentError, MemoryItem] =
+  private def proposeAndAcceptMemory(svc: PersonService, text: String, kind: MemoryKind = MemoryKind.Fact, confidence: Double = 0.7): IO[AgentError, MemoryItem] =
     for {
-      m <- svc.proposeMemory(ProposeMemoryRequest(Some(FredId), Some(scope), kind, text, "chat", Some(confidence)))
+      m <- svc.proposeMemory(ProposeMemoryRequest(Some(FredId), kind, text, "chat", Some(confidence)))
+      a <- svc.acceptMemory(m.id)
+    } yield a
+
+  private def proposeAcceptProfileFact(svc: PersonService, text: String): IO[AgentError, MemoryItem] =
+    for {
+      m <- svc.proposeMemory(ProposeMemoryRequest(Some(FredId), MemoryKind.Fact, text, "onboarding:profile", Some(0.9)))
       a <- svc.acceptMemory(m.id)
     } yield a
 
@@ -57,20 +65,9 @@ object PersonServiceSpec extends ZIOSpecDefault {
         )
       }
     },
-    test("seeded scopes are available") {
-      withService { svc =>
-        svc.listScopes.map(scopes =>
-          assertTrue(
-            scopes.length == 4,
-            scopes.exists(_.id == FredPrivate),
-            scopes.exists(_.id == FamilyShared)
-          )
-        )
-      }
-    },
     test("seeded goal is available and open") {
       withService { svc =>
-        svc.listGoals(None, None, None).map(goals =>
+        svc.listGoals(None, None).map(goals =>
           assertTrue(goals.exists(g => g.id == SampleGoalId && g.status == GoalStatus.Open))
         )
       }
@@ -81,7 +78,7 @@ object PersonServiceSpec extends ZIOSpecDefault {
     test("propose commitment creates with proposed status") {
       withService { svc =>
         svc.proposeCommitment(ProposeCommitmentRequest(
-          ownerPersonId = FredId, scopeId = FredWork,
+          ownerPersonId = FredId,
           text = "Send Graham update by Friday",
           source = "email:gmail-msg-123",
           evidence = "Could you send me the update by Friday?",
@@ -90,31 +87,52 @@ object PersonServiceSpec extends ZIOSpecDefault {
           assertTrue(
             c.status == CommitmentStatus.Proposed,
             c.ownerPersonId == FredId,
-            c.scopeId == FredWork,
             c.id.value.nonEmpty
           )
         )
       }
     },
-    test("list commitments filters by scope") {
+    test("list commitments filters by owner") {
       withService { svc =>
         for {
-          _        <- svc.proposeCommitment(ProposeCommitmentRequest(FredId, FredWork, "task1", "src", "ev", None))
-          _        <- svc.proposeCommitment(ProposeCommitmentRequest(FredId, FredPrivate, "task2", "src", "ev", None))
-          workOnly <- svc.listCommitments(None, Some(FredWork), None)
+          _        <- svc.proposeCommitment(ProposeCommitmentRequest(FredId, "task1", "src", "ev", None))
+          _        <- svc.proposeCommitment(ProposeCommitmentRequest(PaulaId, "task2", "src", "ev", None))
+          fredOnly <- svc.listCommitments(Some(FredId), None)
         } yield assertTrue(
-          workOnly.length == 1,
-          workOnly.exists(_.text == "task1")
+          fredOnly.length == 1,
+          fredOnly.exists(_.text == "task1")
         )
       }
     },
     test("list commitments filters by status") {
       withService { svc =>
         for {
-          _        <- svc.proposeCommitment(ProposeCommitmentRequest(FredId, FredWork, "task1", "src", "ev", None))
-          proposed <- svc.listCommitments(None, None, Some("proposed"))
-          open     <- svc.listCommitments(None, None, Some("open"))
+          _        <- svc.proposeCommitment(ProposeCommitmentRequest(FredId, "task1", "src", "ev", None))
+          proposed <- svc.listCommitments(None, Some("proposed"))
+          open     <- svc.listCommitments(None, Some("open"))
         } yield assertTrue(proposed.length == 1, open.isEmpty)
+      }
+    },
+    test("re-proposing a commitment by external source updates in place (idempotent)") {
+      withService { svc =>
+        for {
+          first  <- svc.proposeCommitment(ProposeCommitmentRequest(FredId, "Reply to Graham", "email:gmail-msg-1", "ev1", None))
+          second <- svc.proposeCommitment(ProposeCommitmentRequest(FredId, "Reply to Graham today", "email:gmail-msg-1", "ev2", None))
+          all    <- svc.listCommitments(Some(FredId), None)
+        } yield assertTrue(
+          first.id == second.id,
+          second.text == "Reply to Graham today",
+          all.count(_.source == "email:gmail-msg-1") == 1
+        )
+      }
+    },
+    test("generic 'chat' source is not deduped — each propose is a new commitment") {
+      withService { svc =>
+        for {
+          _   <- svc.proposeCommitment(ProposeCommitmentRequest(FredId, "task A", "chat", "ev", None))
+          _   <- svc.proposeCommitment(ProposeCommitmentRequest(FredId, "task B", "chat", "ev", None))
+          all <- svc.listCommitments(Some(FredId), None)
+        } yield assertTrue(all.count(_.source == "chat") == 2)
       }
     },
 
@@ -123,7 +141,7 @@ object PersonServiceSpec extends ZIOSpecDefault {
     test("propose memory creates with proposed status") {
       withService { svc =>
         svc.proposeMemory(ProposeMemoryRequest(
-          personId = Some(FredId), scopeId = Some(FredWork),
+          personId = Some(FredId),
           kind = MemoryKind.Preference,
           text = "Prefer draft-only email actions",
           source = "chat:local",
@@ -140,7 +158,7 @@ object PersonServiceSpec extends ZIOSpecDefault {
     test("propose then accept memory transitions status") {
       withService { svc =>
         for {
-          m  <- svc.proposeMemory(ProposeMemoryRequest(Some(FredId), Some(FredWork), MemoryKind.Preference, "Likes morning meetings", "chat", Some(0.7)))
+          m  <- svc.proposeMemory(ProposeMemoryRequest(Some(FredId), MemoryKind.Preference, "Likes morning meetings", "chat", Some(0.7)))
           ac <- svc.acceptMemory(m.id)
         } yield assertTrue(ac.status == MemoryStatus.Accepted, ac.id == m.id)
       }
@@ -148,7 +166,7 @@ object PersonServiceSpec extends ZIOSpecDefault {
     test("reject memory records reason") {
       withService { svc =>
         for {
-          m <- svc.proposeMemory(ProposeMemoryRequest(Some(FredId), Some(FredWork), MemoryKind.Fact, "Wrong fact", "chat", None))
+          m <- svc.proposeMemory(ProposeMemoryRequest(Some(FredId), MemoryKind.Fact, "Wrong fact", "chat", None))
           r <- svc.rejectMemory(m.id, Some("user clarified"))
         } yield assertTrue(r.status == MemoryStatus.Rejected)
       }
@@ -159,7 +177,7 @@ object PersonServiceSpec extends ZIOSpecDefault {
           oldM     <- proposeAndAcceptMemory(svc, "Fred works at Acme")
           newM     <- proposeAndAcceptMemory(svc, "Fred works at Beta Corp")
           _        <- svc.supersedeMemory(newM.id, oldM.id)
-          afterAll <- svc.listMemory(Some(FredId), Some(FredWork))
+          afterAll <- svc.listMemory(Some(FredId))
         } yield assertTrue(
           afterAll.find(_.id == oldM.id).flatMap(_.supersededById).contains(newM.id)
         )
@@ -173,7 +191,6 @@ object PersonServiceSpec extends ZIOSpecDefault {
         svc.requestApproval(RequestApprovalRequest(
           requestedBy = "agent",
           requiredPersonId = Some(FredId),
-          scopeId = Some(FamilyShared),
           actionType = "calendar.propose_event",
           payloadJson = """{"summary":"family dinner"}"""
         )).map(a =>
@@ -185,13 +202,14 @@ object PersonServiceSpec extends ZIOSpecDefault {
         )
       }
     },
-    test("list approvals filters by scope") {
+    test("list approvals filters by status") {
       withService { svc =>
         for {
-          _          <- svc.requestApproval(RequestApprovalRequest("agent", None, Some(FamilyShared), "test", "{}"))
-          _          <- svc.requestApproval(RequestApprovalRequest("agent", None, Some(FredWork), "test2", "{}"))
-          familyOnly <- svc.listApprovals(Some(FamilyShared), None)
-        } yield assertTrue(familyOnly.length == 1)
+          _            <- svc.requestApproval(RequestApprovalRequest("agent", None, "test", "{}"))
+          _            <- svc.requestApproval(RequestApprovalRequest("agent", None, "test2", "{}"))
+          requested    <- svc.listApprovals(Some("requested"))
+          approved     <- svc.listApprovals(Some("approved"))
+        } yield assertTrue(requested.length == 2, approved.isEmpty)
       }
     },
 
@@ -200,7 +218,7 @@ object PersonServiceSpec extends ZIOSpecDefault {
     test("proposed goal starts open") {
       withService { svc =>
         svc.proposeGoal(ProposeGoalRequest(
-          ownerPersonId = FredId, scopeId = FredWork,
+          ownerPersonId = FredId,
           title = "Ship the migration",
           outcome = "Migration deployed to prod with rollback plan documented.",
           evidenceRule = "Prod deploy SHA + rollback runbook link",
@@ -211,10 +229,25 @@ object PersonServiceSpec extends ZIOSpecDefault {
         )
       }
     },
+    test("re-proposing a goal by external source updates mutable fields, keeps outcome immutable") {
+      withService { svc =>
+        for {
+          first  <- svc.proposeGoal(ProposeGoalRequest(FredId, "Plan trip", "Trip booked", "Booking confirmation", None, Some("email:gmail-msg-7")))
+          second <- svc.proposeGoal(ProposeGoalRequest(FredId, "Plan summer trip", "DIFFERENT outcome", "DIFFERENT rule", None, Some("email:gmail-msg-7")))
+          all    <- svc.listGoals(Some(FredId), None)
+        } yield assertTrue(
+          first.id == second.id,
+          second.title == "Plan summer trip",
+          second.outcome == "Trip booked",
+          second.evidenceRule == "Booking confirmation",
+          all.count(_.source.contains("email:gmail-msg-7")) == 1
+        )
+      }
+    },
     test("goal status transitions and audit records each step") {
       withService { svc =>
         for {
-          g       <- svc.proposeGoal(ProposeGoalRequest(FredId, FredWork, "task", "out", "ev", None, None))
+          g       <- svc.proposeGoal(ProposeGoalRequest(FredId, "task", "out", "ev", None, None))
           _       <- svc.updateGoalStatus(g.id, UpdateGoalStatusRequest(GoalStatus.Blocked, Some("waiting on stakeholder")))
           blocked <- svc.getGoal(g.id)
           _       <- svc.updateGoalStatus(g.id, UpdateGoalStatusRequest(GoalStatus.Done, None))
@@ -231,7 +264,7 @@ object PersonServiceSpec extends ZIOSpecDefault {
     test("appending evidence preserves goal identity") {
       withService { svc =>
         for {
-          g   <- svc.proposeGoal(ProposeGoalRequest(FredId, FredWork, "task", "out", "ev", None, None))
+          g   <- svc.proposeGoal(ProposeGoalRequest(FredId, "task", "out", "ev", None, None))
           _   <- svc.appendGoalEvidence(g.id, AppendGoalEvidenceRequest("file", "/workspace/evidence/commit.txt", Some("merged")))
           _   <- svc.appendGoalEvidence(g.id, AppendGoalEvidenceRequest("commitment", "C123", None))
           gwe <- svc.getGoal(g.id)
@@ -246,11 +279,11 @@ object PersonServiceSpec extends ZIOSpecDefault {
     test("listing goals filters by status") {
       withService { svc =>
         for {
-          a         <- svc.proposeGoal(ProposeGoalRequest(FredId, FredWork, "open one", "o", "e", None, None))
-          b         <- svc.proposeGoal(ProposeGoalRequest(FredId, FredWork, "done one", "o", "e", None, None))
+          a         <- svc.proposeGoal(ProposeGoalRequest(FredId, "open one", "o", "e", None, None))
+          b         <- svc.proposeGoal(ProposeGoalRequest(FredId, "done one", "o", "e", None, None))
           _         <- svc.updateGoalStatus(b.id, UpdateGoalStatusRequest(GoalStatus.Done, None))
-          openGoals <- svc.listGoals(Some(FredId), Some(FredWork), Some("open"))
-          doneGoals <- svc.listGoals(Some(FredId), Some(FredWork), Some("done"))
+          openGoals <- svc.listGoals(Some(FredId), Some("open"))
+          doneGoals <- svc.listGoals(Some(FredId), Some("done"))
         } yield assertTrue(
           openGoals.exists(_.id == a.id),
           !openGoals.exists(_.id == b.id),
@@ -259,14 +292,14 @@ object PersonServiceSpec extends ZIOSpecDefault {
       }
     },
 
-    // --- Recall ---
+    // --- Recall (global, scopeless) ---
 
     test("search returns accepted hits, excludes proposed and rejected") {
       withService { svc =>
         for {
           a    <- proposeAndAcceptMemory(svc, "Fred prefers morning standups", MemoryKind.Preference, confidence = 0.8)
-          b    <- svc.proposeMemory(ProposeMemoryRequest(Some(FredId), Some(FredWork), MemoryKind.Preference, "Likes afternoon walks", "chat", Some(0.8)))
-          hits <- svc.searchMemory("morning", Some(FredWork), None, None, None, 10)
+          b    <- svc.proposeMemory(ProposeMemoryRequest(Some(FredId), MemoryKind.Preference, "Likes afternoon walks", "chat", Some(0.8)))
+          hits <- svc.searchMemory("morning", None, None, None, 10)
         } yield assertTrue(
           hits.exists(_.item.id == a.id),
           !hits.exists(_.item.id == b.id)
@@ -278,8 +311,8 @@ object PersonServiceSpec extends ZIOSpecDefault {
         for {
           a      <- proposeAndAcceptMemory(svc, "Likes morning standups", MemoryKind.Preference, confidence = 0.9)
           b      <- proposeAndAcceptMemory(svc, "Works on the migration project", MemoryKind.Fact, confidence = 0.7)
-          _      <- svc.logEvent(LogEventRequest("agent", "obs.standup.empty", "observation", Some(FredWork), None, None, Some("Standup cancelled"), None))
-          bundle <- svc.contextBundle(Some(FredWork), Some(FredId), 5, 5)
+          _      <- svc.logEvent(LogEventRequest("agent", "obs.standup.empty", "observation", None, None, Some("Standup cancelled"), None))
+          bundle <- svc.contextBundle(Some(FredId), 5, 5)
         } yield assertTrue(
           bundle.facts.exists(_.item.id == a.id),
           bundle.facts.exists(_.item.id == b.id),
@@ -292,17 +325,17 @@ object PersonServiceSpec extends ZIOSpecDefault {
       withService { svc =>
         for {
           a         <- proposeAndAcceptMemory(svc, "Likes morning meetings", MemoryKind.Preference, confidence = 0.8)
-          conflicts <- svc.findConflicts(Some(FredWork), Some(FredId), "preference", "morning meetings")
+          conflicts <- svc.findConflicts(Some(FredId), "preference", "morning meetings")
         } yield assertTrue(conflicts.exists(_.id == a.id))
       }
     },
     test("consolidate is idempotent and links memory to origin event") {
       withService { svc =>
         for {
-          e1     <- svc.logEvent(LogEventRequest("agent", "note.preference", "session_note", Some(FredWork), None, None, Some("Fred said he likes morning sync"), None))
-          e2     <- svc.logEvent(LogEventRequest("agent", "obs.calendar", "observation", Some(FredWork), None, None, Some("Calendar empty on Friday"), None))
-          first  <- svc.consolidateMemory(FredWork, None)
-          second <- svc.consolidateMemory(FredWork, None)
+          e1     <- svc.logEvent(LogEventRequest("agent", "note.preference", "session_note", None, None, Some("Fred said he likes morning sync"), None))
+          e2     <- svc.logEvent(LogEventRequest("agent", "obs.calendar", "observation", None, None, Some("Calendar empty on Friday"), None))
+          first  <- svc.consolidateMemory(None)
+          second <- svc.consolidateMemory(None)
         } yield assertTrue(
           first.size == 2,
           first.forall(_.status == MemoryStatus.Proposed),
@@ -315,17 +348,17 @@ object PersonServiceSpec extends ZIOSpecDefault {
     test("event log + searchEvents round-trip") {
       withService { svc =>
         for {
-          _         <- svc.logEvent(LogEventRequest("user", "utterance.scope", "utterance", Some(FredWork), None, None, Some("Move that meeting to next Tuesday"), None))
-          _         <- svc.logEvent(LogEventRequest("agent", "decision.skip", "decision", Some(FredWork), None, None, Some("Skipped re-encoding the Q3 video"), None))
-          all       <- svc.listEvents(Some(FredWork), None, None, None, 50)
-          decisions <- svc.listEvents(Some(FredWork), Some("decision"), None, None, 50)
-          hits      <- svc.searchEvents("meeting", Some(FredWork), None, None, 10)
+          _         <- svc.logEvent(LogEventRequest("user", "utterance.move", "utterance", None, None, Some("Move that meeting to next Tuesday"), None))
+          _         <- svc.logEvent(LogEventRequest("agent", "decision.skip", "decision", None, None, Some("Skipped re-encoding the Q3 video"), None))
+          all       <- svc.listEvents(None, None, None, 50)
+          decisions <- svc.listEvents(Some("decision"), None, None, 50)
+          hits      <- svc.searchEvents("meeting", None, None, 10)
         } yield assertTrue(
-          all.exists(_.action == "utterance.scope"),
+          all.exists(_.action == "utterance.move"),
           all.exists(_.action == "decision.skip"),
           decisions.size == 1,
           decisions.exists(_.action == "decision.skip"),
-          hits.exists(_.event.action == "utterance.scope")
+          hits.exists(_.event.action == "utterance.move")
         )
       }
     },
@@ -337,12 +370,41 @@ object PersonServiceSpec extends ZIOSpecDefault {
           second     <- proposeAndAcceptMemory(svc, "Fred works at Beta Corp", confidence = 0.9)
           _          <- svc.supersedeMemory(second.id, first.id)
           asOf        = second.createdAt.minusMillis(1)
-          hitsBefore <- svc.searchMemory("Acme Beta", Some(FredWork), None, None, Some(asOf), 10)
-          hitsAfter  <- svc.searchMemory("Acme Beta", Some(FredWork), None, None, None, 10)
+          hitsBefore <- svc.searchMemory("Acme Beta", None, None, Some(asOf), 10)
+          hitsAfter  <- svc.searchMemory("Acme Beta", None, None, None, 10)
         } yield assertTrue(
           hitsBefore.exists(_.item.id == first.id),
           !hitsAfter.exists(_.item.id == first.id),
           hitsAfter.exists(_.item.id == second.id)
+        )
+      }
+    },
+
+    // --- Pinned profile recall (non-decaying) ---
+
+    test("profileFacts returns only onboarding-sourced accepted facts") {
+      withService { svc =>
+        for {
+          p     <- proposeAcceptProfileFact(svc, "Fred lives in London")
+          _     <- proposeAndAcceptMemory(svc, "Likes morning standups")
+          facts <- svc.profileFacts(50)
+        } yield assertTrue(
+          facts.exists(_.id == p.id),
+          facts.forall(_.source.startsWith("onboarding"))
+        )
+      }
+    },
+    test("profileFacts excludes superseded profile facts") {
+      withService { svc =>
+        for {
+          oldP  <- proposeAcceptProfileFact(svc, "Fred works at Acme")
+          _     <- TestClock.adjust(Duration.fromSeconds(1))
+          newP  <- proposeAcceptProfileFact(svc, "Fred works at Beta Corp")
+          _     <- svc.supersedeMemory(newP.id, oldP.id)
+          facts <- svc.profileFacts(50)
+        } yield assertTrue(
+          !facts.exists(_.id == oldP.id),
+          facts.exists(_.id == newP.id)
         )
       }
     },
@@ -363,16 +425,16 @@ object PersonServiceSpec extends ZIOSpecDefault {
         )
       }
     },
-    test("findConflicts on empty scope returns empty list") {
+    test("findConflicts with no matches returns empty list") {
       withService { svc =>
-        svc.findConflicts(Some(ScopeId("nowhere")), None, "preference", "nothing here").map(xs =>
+        svc.findConflicts(None, "preference", "nothing here at all").map(xs =>
           assertTrue(xs.isEmpty)
         )
       }
     },
-    test("contextBundle on scope with no facts and no events returns empty bundle") {
+    test("contextBundle with no facts and no events returns empty bundle") {
       withService { svc =>
-        svc.contextBundle(Some(ScopeId("empty-scope")), None, 10, 10).map(b =>
+        svc.contextBundle(Some(PersonId("ghost")), 10, 10).map(b =>
           assertTrue(b.facts.isEmpty, b.events.isEmpty)
         )
       }
@@ -380,9 +442,9 @@ object PersonServiceSpec extends ZIOSpecDefault {
     test("consolidate with no events returns empty list (no audit row)") {
       withService { svc =>
         for {
-          before <- svc.listEvents(Some(FredWork), Some("state"), None, None, 50).map(_.size)
-          out    <- svc.consolidateMemory(FredWork, None)
-          after  <- svc.listEvents(Some(FredWork), Some("state"), None, None, 50).map(_.size)
+          before <- svc.listEvents(Some("state"), None, None, 50).map(_.size)
+          out    <- svc.consolidateMemory(None)
+          after  <- svc.listEvents(Some("state"), None, None, 50).map(_.size)
         } yield assertTrue(out.isEmpty, before == after)
       }
     },
@@ -394,7 +456,7 @@ object PersonServiceSpec extends ZIOSpecDefault {
           c <- proposeAndAcceptMemory(svc, "Fact C")
           _ <- svc.supersedeMemory(b.id, a.id)
           _ <- svc.supersedeMemory(c.id, b.id)
-          all <- svc.listMemory(Some(FredId), Some(FredWork))
+          all <- svc.listMemory(Some(FredId))
         } yield assertTrue(
           all.find(_.id == a.id).flatMap(_.supersededById).contains(b.id),
           all.find(_.id == b.id).flatMap(_.supersededById).contains(c.id),
@@ -408,18 +470,15 @@ object PersonServiceSpec extends ZIOSpecDefault {
         val t1 = java.time.Instant.parse("2026-06-01T00:00:00Z")
         for {
           m <- svc.proposeMemory(ProposeMemoryRequest(
-                 Some(FredId), Some(FredWork), MemoryKind.Fact, "Worked at Acme 2026",
+                 Some(FredId), MemoryKind.Fact, "Worked at Acme 2026",
                  "chat", Some(0.8), validFrom = Some(t0), validUntil = Some(t1)
                ))
           _ <- svc.acceptMemory(m.id)
-          // Inside the window — included
-          inside <- svc.searchMemory("Acme", Some(FredWork), None, None,
+          inside <- svc.searchMemory("Acme", None, None,
                                      Some(java.time.Instant.parse("2026-03-15T00:00:00Z")), 10)
-          // After validUntil — excluded
-          after  <- svc.searchMemory("Acme", Some(FredWork), None, None,
+          after  <- svc.searchMemory("Acme", None, None,
                                      Some(java.time.Instant.parse("2026-07-01T00:00:00Z")), 10)
-          // Before validFrom — excluded
-          before <- svc.searchMemory("Acme", Some(FredWork), None, None,
+          before <- svc.searchMemory("Acme", None, None,
                                      Some(java.time.Instant.parse("2025-12-01T00:00:00Z")), 10)
         } yield assertTrue(
           inside.exists(_.item.id == m.id),
@@ -433,8 +492,8 @@ object PersonServiceSpec extends ZIOSpecDefault {
         for {
           a    <- proposeAndAcceptMemory(svc, "morning standups", MemoryKind.Preference, confidence = 0.5)
           b    <- proposeAndAcceptMemory(svc, "morning routines",  MemoryKind.Preference, confidence = 0.5)
-          h1   <- svc.searchMemory("morning", Some(FredWork), None, None, None, 10)
-          h2   <- svc.searchMemory("morning", Some(FredWork), None, None, None, 10)
+          h1   <- svc.searchMemory("morning", None, None, None, 10)
+          h2   <- svc.searchMemory("morning", None, None, None, 10)
         } yield assertTrue(
           h1.map(_.item.id) == h2.map(_.item.id),
           h1.exists(_.item.id == a.id),

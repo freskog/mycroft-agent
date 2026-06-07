@@ -35,7 +35,6 @@ safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
     --actor agent \
     --action note.preference \
     --category session_note \
-    --scope fred_work \
     --text 'Fred mentioned again that morning meetings work better' \
     --payload-json '{\"messageId\":\"gmail-msg-456\"}'"
 ```
@@ -45,13 +44,13 @@ safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
 ### List recent events
 
 ```
-person event log --scope fred_work --category session_note --since 2026-05-25T00:00:00Z --limit 50
+person event log --category session_note --since 2026-05-25T00:00:00Z --limit 50
 ```
 
 ### Search events
 
 ```
-person event search "morning meetings" --scope fred_work --since 2026-05-01T00:00:00Z
+person event search "morning meetings" --since 2026-05-01T00:00:00Z
 ```
 
 FTS5 over `text` and `payload_json`. Useful for "where did the user say X" timeline questions.

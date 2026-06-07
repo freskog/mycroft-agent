@@ -1,6 +1,6 @@
 package dev.freskog.agent.person.api
 
-import dev.freskog.agent.common.{Scope => PersonScope, _}
+import dev.freskog.agent.common._
 import dev.freskog.agent.common.JsonCodecs._
 import dev.freskog.agent.person.domain._
 import dev.freskog.agent.person.service.PersonService
@@ -28,21 +28,64 @@ object Routes {
         handlePost[CreatePersonRequest, Person](req)(service.createPerson)
       },
 
-      // --- scopes ---
-      Method.GET / "scopes" -> handler { (_: Request) =>
-        handleGet(service.listScopes)
+      // --- household graph: entities ---
+      Method.POST / "entities" / "propose" -> handler { (req: Request) =>
+        handlePost[ProposeEntityRequest, Entity](req)(service.proposeEntity)
       },
-      Method.POST / "scopes" -> handler { (req: Request) =>
-        handlePost[CreateScopeRequest, PersonScope](req)(service.createScope)
-      },
-      Method.POST / "scope-roles" -> handler { (req: Request) =>
-        handlePost[CreateScopeRoleRequest, PersonScopeRole](req)(service.createScopeRole)
-      },
-      Method.GET / "scope-roles" -> handler { (req: Request) =>
-        queryParam(req, "person") match {
-          case None    => ZIO.succeed(errorToResponse(AgentError.BadRequest("person is required")))
-          case Some(p) => handleGet(service.listScopeRoles(PersonId(p)))
+      Method.GET / "entities" -> handler { (req: Request) =>
+        queryParam(req, "name") match {
+          case Some(n) => handleGet(service.resolveEntities(n))
+          case None    =>
+            handleGet(service.listEntities(
+              kind = queryParam(req, "kind"),
+              status = queryParam(req, "status")
+            ))
         }
+      },
+      Method.POST / "entities" / "supersede" -> handler { (req: Request) =>
+        handlePost[SupersedeEntityRequest, Entity](req)(r => service.supersedeEntity(r.newId, r.oldId))
+      },
+      Method.POST / "entities" / string("id") / "accept" -> handler { (id: String, _: Request) =>
+        handleGet(service.acceptEntity(EntityId(id)))
+      },
+      Method.POST / "entities" / string("id") / "reject" -> handler { (id: String, req: Request) =>
+        handlePostOptional[RejectMemoryRequest, Entity](req) { reqOpt =>
+          service.rejectEntity(EntityId(id), reqOpt.flatMap(_.reason))
+        }
+      },
+
+      // --- household graph: relationships ---
+      Method.POST / "relationships" / "propose" -> handler { (req: Request) =>
+        handlePost[ProposeRelationshipRequest, Relationship](req)(service.proposeRelationship)
+      },
+      Method.GET / "relationships" -> handler { (req: Request) =>
+        parseInstantParam(req, "as_of").flatMap {
+          case Left(err)   => ZIO.succeed(errorToResponse(err))
+          case Right(asOf) =>
+            handleGet(service.listRelationships(
+              fromId = queryParam(req, "from"),
+              toId = queryParam(req, "to"),
+              relType = queryParam(req, "type"),
+              status = queryParam(req, "status"),
+              asOf = asOf
+            ))
+        }
+      },
+      Method.POST / "relationships" / "supersede" -> handler { (req: Request) =>
+        handlePost[SupersedeRelationshipRequest, Relationship](req)(r => service.supersedeRelationship(r.newId, r.oldId))
+      },
+      Method.POST / "relationships" / string("id") / "accept" -> handler { (id: String, _: Request) =>
+        handleGet(service.acceptRelationship(RelationshipId(id)))
+      },
+      Method.POST / "relationships" / string("id") / "reject" -> handler { (id: String, req: Request) =>
+        handlePostOptional[RejectMemoryRequest, Relationship](req) { reqOpt =>
+          service.rejectRelationship(RelationshipId(id), reqOpt.flatMap(_.reason))
+        }
+      },
+
+      // --- household graph: combined snapshot ---
+      Method.GET / "household" -> handler { (_: Request) =>
+        handleGet(service.household)
       },
 
       // --- channels & messages (mycroft) ---
@@ -83,7 +126,6 @@ object Routes {
       Method.GET / "commitments" -> handler { (req: Request) =>
         handleGet(service.listCommitments(
           owner = queryParam(req, "owner").map(PersonId),
-          scope = queryParam(req, "scope").map(ScopeId),
           status = queryParam(req, "status")
         ))
       },
@@ -94,15 +136,19 @@ object Routes {
       },
       Method.GET / "memory" -> handler { (req: Request) =>
         handleGet(service.listMemory(
-          personId = queryParam(req, "person").map(PersonId),
-          scopeId = queryParam(req, "scope").map(ScopeId)
+          personId = queryParam(req, "person").map(PersonId)
+        ))
+      },
+      Method.GET / "memory" / "profile" -> handler { (req: Request) =>
+        handleGet(service.profileFacts(
+          limit = queryParam(req, "limit").flatMap(_.toIntOption).getOrElse(50)
         ))
       },
       Method.POST / "memory" / "supersede" -> handler { (req: Request) =>
         handlePost[SupersedeMemoryRequest, MemoryItem](req)(r => service.supersedeMemory(r.newId, r.oldId))
       },
       Method.POST / "memory" / "consolidate" -> handler { (req: Request) =>
-        handlePost[ConsolidateRequest, List[MemoryItem]](req)(r => service.consolidateMemory(r.scopeId, r.since))
+        handlePostOptional[ConsolidateRequest, List[MemoryItem]](req)(r => service.consolidateMemory(r.flatMap(_.since)))
       },
       Method.GET / "memory" / "search" -> handler { (req: Request) =>
         val limit = queryParam(req, "limit").flatMap(_.toIntOption).getOrElse(10)
@@ -111,7 +157,6 @@ object Routes {
           case Right(asOf) =>
             handleGet(service.searchMemory(
               query = queryParam(req, "q").getOrElse(""),
-              scopeId = queryParam(req, "scope").map(ScopeId),
               personId = queryParam(req, "person").map(PersonId),
               kind = queryParam(req, "kind"),
               asOf = asOf,
@@ -121,7 +166,6 @@ object Routes {
       },
       Method.GET / "memory" / "context" -> handler { (req: Request) =>
         handleGet(service.contextBundle(
-          scopeId = queryParam(req, "scope").map(ScopeId),
           personId = queryParam(req, "person").map(PersonId),
           factLimit = queryParam(req, "fact_limit").flatMap(_.toIntOption).getOrElse(10),
           eventLimit = queryParam(req, "event_limit").flatMap(_.toIntOption).getOrElse(10)
@@ -134,7 +178,6 @@ object Routes {
           ZIO.succeed(errorToResponse(AgentError.BadRequest("kind and text are required")))
         else
           handleGet(service.findConflicts(
-            scopeId = queryParam(req, "scope").map(ScopeId),
             personId = queryParam(req, "person").map(PersonId),
             kind = kind,
             text = text
@@ -158,7 +201,6 @@ object Routes {
       },
       Method.GET / "approvals" -> handler { (req: Request) =>
         handleGet(service.listApprovals(
-          scopeId = queryParam(req, "scope").map(ScopeId),
           status = queryParam(req, "status")
         ))
       },
@@ -170,7 +212,6 @@ object Routes {
       Method.GET / "goals" -> handler { (req: Request) =>
         handleGet(service.listGoals(
           owner = queryParam(req, "owner").map(PersonId),
-          scope = queryParam(req, "scope").map(ScopeId),
           status = queryParam(req, "status")
         ))
       },
@@ -194,7 +235,6 @@ object Routes {
           case Right(since) =>
             handleGet(service.searchEvents(
               query = queryParam(req, "q").getOrElse(""),
-              scopeId = queryParam(req, "scope").map(ScopeId),
               category = queryParam(req, "category"),
               since = since,
               limit = queryParam(req, "limit").flatMap(_.toIntOption).getOrElse(10)
@@ -211,11 +251,77 @@ object Routes {
           case (_, Left(err))               => ZIO.succeed(errorToResponse(err))
           case (Right(since), Right(until)) =>
             handleGet(service.listEvents(
-              scopeId = queryParam(req, "scope").map(ScopeId),
               category = queryParam(req, "category"),
               since = since, until = until,
               limit = queryParam(req, "limit").flatMap(_.toIntOption).getOrElse(50)
             ))
+        }
+      },
+
+      // --- gmail / inbox ---
+      Method.GET / "gmail" / "auth-url" -> handler { (req: Request) =>
+        queryParam(req, "owner") match {
+          case None    => ZIO.succeed(errorToResponse(AgentError.BadRequest("owner is required")))
+          case Some(o) => handleGet(service.gmailAuthUrl(PersonId(o)))
+        }
+      },
+      Method.POST / "gmail" / "oauth" / "exchange" -> handler { (req: Request) =>
+        handlePost[GmailOAuthExchangeRequest, GmailCredentialSummary](req)(service.gmailOAuthExchange)
+      },
+      Method.POST / "gmail" / "sync" -> handler { (req: Request) =>
+        queryParam(req, "owner") match {
+          case None => ZIO.succeed(errorToResponse(AgentError.BadRequest("owner is required")))
+          case Some(o) =>
+            parseInstantParam(req, "since").flatMap {
+              case Left(err)    => ZIO.succeed(errorToResponse(err))
+              case Right(since) => handleGet(service.gmailSync(PersonId(o), since))
+            }
+        }
+      },
+      Method.GET / "inbox" -> handler { (req: Request) =>
+        queryParam(req, "owner") match {
+          case None => ZIO.succeed(errorToResponse(AgentError.BadRequest("owner is required")))
+          case Some(o) =>
+            handleGet(service.listInbox(
+              ownerPersonId = PersonId(o),
+              status = queryParam(req, "status"),
+              limit = queryParam(req, "limit").flatMap(_.toIntOption).getOrElse(20),
+              oldestFirst = queryParam(req, "order").exists(_.equalsIgnoreCase("asc"))
+            ))
+        }
+      },
+      Method.GET / "inbox" / string("id") -> handler { (id: String, _: Request) =>
+        handleGetOption(service.getInbox(InboxMessageId(id)), "inbox message", id)
+      },
+      Method.GET / "inbox" / string("id") / "attachments" / string("attachmentId") -> handler {
+        (id: String, attachmentId: String, _: Request) =>
+          handleGet(service.downloadAttachment(InboxMessageId(id), attachmentId))
+      },
+      Method.POST / "inbox" / string("id") / "skip" -> handler { (id: String, _: Request) =>
+        handleGet(service.skipInbox(InboxMessageId(id)))
+      },
+      Method.POST / "inbox" / string("id") / "mark-triaged" -> handler { (id: String, req: Request) =>
+        handlePostOptional[MarkInboxTriagedRequest, InboxMessage](req) { bodyOpt =>
+          service.markInboxTriaged(InboxMessageId(id), bodyOpt.flatMap(_.sourceEventId))
+        }
+      },
+
+      // --- calendar (read-only) ---
+      Method.GET / "calendar" / "agenda" -> handler { (req: Request) =>
+        queryParam(req, "owner") match {
+          case None => ZIO.succeed(errorToResponse(AgentError.BadRequest("owner is required")))
+          case Some(o) =>
+            (parseInstantParam(req, "from") <*> parseInstantParam(req, "to")).flatMap {
+              case (Left(err), _) => ZIO.succeed(errorToResponse(err))
+              case (_, Left(err)) => ZIO.succeed(errorToResponse(err))
+              case (Right(fromOpt), Right(toOpt)) =>
+                val days = queryParam(req, "days").flatMap(_.toIntOption).getOrElse(14).max(1)
+                Clock.instant.flatMap { now =>
+                  val from = fromOpt.getOrElse(now)
+                  val to   = toOpt.getOrElse(from.plus(java.time.Duration.ofDays(days.toLong)))
+                  handleGet(service.calendarAgenda(PersonId(o), from, to))
+                }
+            }
         }
       }
     )

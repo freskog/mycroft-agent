@@ -39,17 +39,19 @@ object Main extends ZIOAppDefault {
 
         service = PersonService.live(
           Repos.sqlitePersonRepo(db),
-          Repos.sqliteScopeRepo(db),
-          Repos.sqliteScopeRoleRepo(db),
           Repos.sqliteCommitmentRepo(db),
           Repos.sqliteMemoryRepo(db),
           Repos.sqliteApprovalRepo(db),
           Repos.sqliteAuditRepo(db),
           Repos.sqliteGoalRepo(db),
           Repos.sqliteGoalEvidenceRepo(db),
+          Repos.sqliteEntityRepo(db),
+          Repos.sqliteRelationshipRepo(db),
           Repos.sqliteChannelRepo(db),
           Repos.sqliteChannelMemberRepo(db),
-          Repos.sqliteMessageRepo(db)
+          Repos.sqliteMessageRepo(db),
+          Repos.sqliteCredentialRepo(db),
+          Repos.sqliteInboxMessageRepo(db)
         )
 
         routes = Routes.make(service)
