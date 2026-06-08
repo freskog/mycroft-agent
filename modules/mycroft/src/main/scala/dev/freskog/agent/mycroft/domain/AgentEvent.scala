@@ -29,6 +29,21 @@ object AgentEvent {
   final case class Content(channel: String, messageId: String, delta: String) extends AgentEvent
   final case class ToolCall(channel: String, messageId: String, tool: String, args: String) extends AgentEvent
   final case class ToolResult(channel: String, messageId: String, tool: String, ok: Boolean, summary: String) extends AgentEvent
-  final case class Done(channel: String, messageId: String, stopReason: String, tokensIn: Int, tokensOut: Int, elapsedMs: Long) extends AgentEvent
+  /** `tokensIn`/`tokensOut` are the final model call's prompt (context) and
+   *  generated token counts. `ttftMs` is time-to-first-token, `genTps`/`ppTps`
+   *  the generation and prompt-processing throughput (tokens/sec). The metric
+   *  fields are optional — they're absent when the backend reports no usage and
+   *  no token was streamed. */
+  final case class Done(
+    channel: String,
+    messageId: String,
+    stopReason: String,
+    tokensIn: Int,
+    tokensOut: Int,
+    elapsedMs: Long,
+    ttftMs: Option[Long] = None,
+    genTps: Option[Double] = None,
+    ppTps: Option[Double] = None
+  ) extends AgentEvent
   final case class Error(channel: String, messageId: String, kind: String, message: String) extends AgentEvent
 }

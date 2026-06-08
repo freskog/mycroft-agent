@@ -19,7 +19,7 @@ trait PersonService {
   def proposeCommitment(req: ProposeCommitmentRequest): IO[AgentError, Commitment]
   def listCommitments(owner: Option[PersonId], status: Option[String]): IO[AgentError, List[Commitment]]
   def proposeMemory(req: ProposeMemoryRequest): IO[AgentError, MemoryItem]
-  def listMemory(personId: Option[PersonId]): IO[AgentError, List[MemoryItem]]
+  def listMemory(personId: Option[PersonId], status: Option[String], kind: Option[String]): IO[AgentError, List[MemoryItem]]
   def requestApproval(req: RequestApprovalRequest): IO[AgentError, Approval]
   def listApprovals(status: Option[String]): IO[AgentError, List[Approval]]
   def proposeGoal(req: ProposeGoalRequest): IO[AgentError, Goal]
@@ -59,6 +59,15 @@ trait PersonService {
   def listRelationships(fromId: Option[String], toId: Option[String], relType: Option[String], status: Option[String], asOf: Option[Instant]): IO[AgentError, List[Relationship]]
   /** Accepted, currently-active household graph for context injection. */
   def household: IO[AgentError, HouseholdGraph]
+
+  /** Items awaiting human review (proposed memory, entities, relationships),
+   *  narrowed by `source` prefix, `nodeType` (memory|entity|relationship) and
+   *  `kind`. A `kind` filter excludes relationships (they have no kind). */
+  def pending(sourcePrefix: Option[String], nodeType: Option[String], kind: Option[String]): IO[AgentError, PendingProposals]
+  /** Accept proposals: if `ids` is non-empty, accept exactly those (resolved
+   *  across types); otherwise accept everything matching the
+   *  `source`/`nodeType`/`kind` filters. Returns per-type counts. */
+  def acceptAll(sourcePrefix: Option[String], nodeType: Option[String], kind: Option[String], ids: List[String]): IO[AgentError, AcceptAllResult]
 
   // Generic event log
   def logEvent(req: LogEventRequest): IO[AgentError, AuditEvent]
@@ -169,8 +178,8 @@ object PersonService {
         _   <- audit("memory.propose", "memory_item", Some(m.id.value), now)
       } yield m
 
-    def listMemory(personId: Option[PersonId]): IO[AgentError, List[MemoryItem]] =
-      memoryRepo.findAll(personId)
+    def listMemory(personId: Option[PersonId], status: Option[String], kind: Option[String]): IO[AgentError, List[MemoryItem]] =
+      memoryRepo.findAll(personId, status, kind)
 
     def acceptMemory(id: MemoryId): IO[AgentError, MemoryItem]              = transitionMemory(id, MemoryStatus.Accepted, "memory.accept", None)
     def rejectMemory(id: MemoryId, reason: Option[String]): IO[AgentError, MemoryItem] =
@@ -333,6 +342,68 @@ object PersonService {
         ents   <- entityRepo.findAll(None, Some("accepted"))
         rels   <- relationshipRepo.findAll(None, None, None, Some("accepted"), Some(now))
       } yield HouseholdGraph(ents, rels)
+
+    def pending(sourcePrefix: Option[String], nodeType: Option[String], kind: Option[String]): IO[AgentError, PendingProposals] =
+      validNodeType(nodeType) *> {
+        val wants = (t: String) => nodeType.forall(_ == t)
+        for {
+          mem  <- if (wants("memory")) memoryRepo.findAll(None, Some("proposed"), kind) else ZIO.succeed(List.empty[MemoryItem])
+          ents <- if (wants("entity")) entityRepo.findAll(kind, Some("proposed")) else ZIO.succeed(List.empty[Entity])
+          // Relationships have no `kind`, so a kind filter excludes them.
+          rels <- if (wants("relationship") && kind.isEmpty) relationshipRepo.findAll(None, None, None, Some("proposed"), None)
+                  else ZIO.succeed(List.empty[Relationship])
+        } yield PendingProposals(
+          memory        = mem.filter(m => sourceMatches(m.source, sourcePrefix)),
+          entities      = ents.filter(e => sourceMatches(e.source, sourcePrefix)),
+          relationships = rels.filter(r => sourceMatches(r.source, sourcePrefix))
+        )
+      }
+
+    def acceptAll(sourcePrefix: Option[String], nodeType: Option[String], kind: Option[String], ids: List[String]): IO[AgentError, AcceptAllResult] =
+      if (ids.nonEmpty)
+        ZIO.foreach(ids)(acceptById).map { kinds =>
+          AcceptAllResult(
+            memory        = kinds.count(_ == "memory"),
+            entities      = kinds.count(_ == "entity"),
+            relationships = kinds.count(_ == "relationship")
+          )
+        }
+      else
+        for {
+          proposals <- pending(sourcePrefix, nodeType, kind)
+          _         <- ZIO.foreachDiscard(proposals.memory)(m => acceptMemory(m.id))
+          _         <- ZIO.foreachDiscard(proposals.entities)(e => acceptEntity(e.id))
+          _         <- ZIO.foreachDiscard(proposals.relationships)(r => acceptRelationship(r.id))
+        } yield AcceptAllResult(proposals.memory.size, proposals.entities.size, proposals.relationships.size)
+
+    /** Accept one proposal by id, resolving its type across the three stores.
+     *  Returns the type name accepted; fails if the id matches nothing. */
+    private def acceptById(id: String): IO[AgentError, String] =
+      memoryRepo.findById(MemoryId(id)).flatMap {
+        case Some(_) => acceptMemory(MemoryId(id)).as("memory")
+        case None    =>
+          entityRepo.findById(EntityId(id)).flatMap {
+            case Some(_) => acceptEntity(EntityId(id)).as("entity")
+            case None    =>
+              relationshipRepo.findById(RelationshipId(id)).flatMap {
+                case Some(_) => acceptRelationship(RelationshipId(id)).as("relationship")
+                case None    => ZIO.fail(AgentError.NotFound("proposal", id))
+              }
+          }
+      }
+
+    private val NodeTypes = Set("memory", "entity", "relationship")
+    private def validNodeType(nodeType: Option[String]): IO[AgentError, Unit] =
+      nodeType match {
+        case Some(t) if !NodeTypes.contains(t) =>
+          ZIO.fail(AgentError.BadRequest(s"unknown --type '$t'; expected one of ${NodeTypes.mkString(", ")}"))
+        case _ => ZIO.unit
+      }
+
+    /** A `None` prefix matches everything; otherwise the item's source must start
+     *  with the prefix (e.g. `onboarding:` matches `onboarding:children`). */
+    private def sourceMatches(source: String, prefix: Option[String]): Boolean =
+      prefix.forall(p => source.startsWith(p))
 
     private def requireRelationship(id: RelationshipId): IO[AgentError, Relationship] =
       relationshipRepo.findById(id).someOrFail(AgentError.NotFound("relationship", id.value))

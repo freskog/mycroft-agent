@@ -108,7 +108,7 @@ object ToolRegistry {
       content.append(s"exit: $exit (${m.durationMs} ms)\n")
       if (out.nonEmpty) content.append(s"stdout:\n$out\n")
       if (err.nonEmpty) content.append(s"stderr:\n$err\n")
-      content.append(s"(full output: runlog ${m.stdoutLog})")
+      content.append(s"(full output: runlog ${m.runId} — e.g. `runlog show ${m.runId} --stream stdout --tail 200`)")
       ToolOutcome(ok, s"exit $exit, ${m.durationMs}ms, ${m.stdoutBytes}B stdout", truncate(content.toString))
     }
 

@@ -177,7 +177,7 @@ object PersonServiceSpec extends ZIOSpecDefault {
           oldM     <- proposeAndAcceptMemory(svc, "Fred works at Acme")
           newM     <- proposeAndAcceptMemory(svc, "Fred works at Beta Corp")
           _        <- svc.supersedeMemory(newM.id, oldM.id)
-          afterAll <- svc.listMemory(Some(FredId))
+          afterAll <- svc.listMemory(Some(FredId), None, None)
         } yield assertTrue(
           afterAll.find(_.id == oldM.id).flatMap(_.supersededById).contains(newM.id)
         )
@@ -456,7 +456,7 @@ object PersonServiceSpec extends ZIOSpecDefault {
           c <- proposeAndAcceptMemory(svc, "Fact C")
           _ <- svc.supersedeMemory(b.id, a.id)
           _ <- svc.supersedeMemory(c.id, b.id)
-          all <- svc.listMemory(Some(FredId))
+          all <- svc.listMemory(Some(FredId), None, None)
         } yield assertTrue(
           all.find(_.id == a.id).flatMap(_.supersededById).contains(b.id),
           all.find(_.id == b.id).flatMap(_.supersededById).contains(c.id),

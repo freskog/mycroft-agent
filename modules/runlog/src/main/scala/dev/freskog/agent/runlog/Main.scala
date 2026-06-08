@@ -11,7 +11,14 @@ import java.nio.file.{Path, Paths}
 
 object Main extends ZIOCliDefault {
 
-  val cwdOption = Options.directory("cwd").map(p => Paths.get(p.toUri))
+  // `--cwd` is optional: when omitted we look under the current working
+  // directory's `.agent/runs`. safe_run and runlog share the same process cwd,
+  // so the default resolves to the right run store without the caller needing
+  // to thread `--cwd` through every invocation.
+  val cwdOption = Options
+    .directory("cwd")
+    .map(p => Paths.get(p.toUri))
+    .withDefault(Paths.get(sys.props.getOrElse("user.dir", ".")))
   val streamOption = Options.text("stream").withDefault("stdout")
   val headOption = Options.integer("head").optional.map(_.map(_.toInt))
   val tailOption = Options.integer("tail").optional.map(_.map(_.toInt))

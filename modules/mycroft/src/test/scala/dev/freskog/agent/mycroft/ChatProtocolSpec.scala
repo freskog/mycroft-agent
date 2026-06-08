@@ -44,6 +44,25 @@ object ChatProtocolSpec extends ZIOSpecDefault {
       )
     },
 
+    test("parses the include_usage terminal chunk (empty choices + usage)") {
+      val line  = """data: {"choices":[],"usage":{"prompt_tokens":1234,"completion_tokens":56}}"""
+      val chunk = StreamParser.parseLine(line)
+      assertTrue(
+        chunk.flatMap(_.usage).flatMap(_.promptTokens).contains(1234),
+        chunk.flatMap(_.usage).flatMap(_.completionTokens).contains(56),
+        chunk.flatMap(_.contentDelta).isEmpty
+      )
+    },
+
+    test("parses a server timings block into prompt/predicted tok/s") {
+      val line  = """data: {"choices":[{"delta":{"content":"x"}}],"timings":{"prompt_per_second":812.5,"predicted_per_second":41.2}}"""
+      val chunk = StreamParser.parseLine(line)
+      assertTrue(
+        chunk.flatMap(_.timings).flatMap(_.promptPerSecond).contains(812.5),
+        chunk.flatMap(_.timings).flatMap(_.predictedPerSecond).contains(41.2)
+      )
+    },
+
     test("encodeBody includes tools and renders tool_calls + tool role") {
       val msgs = List(
         ChatMessage.system("sys"),
@@ -57,7 +76,8 @@ object ChatProtocolSpec extends ZIOSpecDefault {
         body.contains("\"tool_calls\""),
         body.contains("\"tool_call_id\":\"c1\""),
         body.contains("\"role\":\"tool\""),
-        body.contains("\"stream\":true")
+        body.contains("\"stream\":true"),
+        body.contains("\"include_usage\":true")
       )
     }
   )

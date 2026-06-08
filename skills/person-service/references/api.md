@@ -28,6 +28,15 @@ There are **no privacy scopes** — durable state is one shared household store 
 
 `--from-kind`/`--to-kind` are `person` or `entity`. Edges are time-bound (`--valid-from`/`--valid-until`) and supersedable, so job/school changes are recorded as transitions (close the old, open the new) rather than overwrites. `person household` returns the accepted, currently-active graph.
 
+## Review queue (proposed → accepted)
+
+New memory/entity/relationship items are created in **`proposed`** status (literal value `proposed`). `person household` and `person memory profile` only show **accepted** items.
+
+- `person pending [--source <prefix>] [--type memory|entity|relationship] [--kind <k>]` — proposed items with ids. `--source` is a startsWith prefix (e.g. `onboarding` matches `onboarding:work`); `--type` picks one bucket; `--kind` filters memory/entity kind (excludes relationships, which have no kind).
+- `person accept-all [--source <prefix>] [--type <t>] [--kind <k>] [--ids <id,id,…>]` — accept matching proposals in one call; returns per-type counts. `--ids` (comma-separated) overrides the filters and accepts exactly that subset (ids resolved across all three types).
+- `person memory list [--person <id>] [--kind <k>] [--status <s>]` — list memory items (e.g. `--status proposed`).
+- Per-item: `person memory accept <id>`, `person entity accept <id>`, `person relationship accept <id>` (and `… reject <id>`).
+
 ## Policy boundaries
 
 The agent **can**:
@@ -44,7 +53,7 @@ The agent **can**:
 - Propose entities and relationships; supersede them; reject its own proposals before review
 
 The agent **cannot**:
-- Accept memory items, entities, or relationships (only humans accept)
+- Accept memory items, entities, or relationships on its own initiative — acceptance (`person accept-all` / `… accept <id>`) is only run on the human's explicit approval, never autonomously
 - Accept or mark commitments done
 - Delete commitments, memory, events, goals, entities, or relationships
 - Edit the `text` of an existing memory item, or an entity/relationship in place — supersede instead

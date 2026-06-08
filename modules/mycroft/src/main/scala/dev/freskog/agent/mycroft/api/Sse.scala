@@ -30,7 +30,10 @@ object Sse {
           "stop_reason" -> Json.Str(d.stopReason),
           "tokens_in"   -> Json.Num(d.tokensIn),
           "tokens_out"  -> Json.Num(d.tokensOut),
-          "elapsed_ms"  -> Json.Num(d.elapsedMs)
+          "elapsed_ms"  -> Json.Num(d.elapsedMs),
+          "ttft_ms"     -> d.ttftMs.map(v => Json.Num(v)).getOrElse(Json.Null),
+          "gen_tps"     -> d.genTps.map(v => Json.Num(v)).getOrElse(Json.Null),
+          "pp_tps"      -> d.ppTps.map(v => Json.Num(v)).getOrElse(Json.Null)
         )
       case e: AgentEvent.Error      => List("kind" -> Json.Str(e.kind), "message" -> Json.Str(e.message))
     }

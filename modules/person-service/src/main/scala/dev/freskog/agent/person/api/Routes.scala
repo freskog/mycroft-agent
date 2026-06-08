@@ -88,6 +88,25 @@ object Routes {
         handleGet(service.household)
       },
 
+      // --- review queue: proposed items (by source/type/kind), and bulk-accept ---
+      Method.GET / "pending" -> handler { (req: Request) =>
+        handleGet(service.pending(
+          sourcePrefix = queryParam(req, "source"),
+          nodeType     = queryParam(req, "type"),
+          kind         = queryParam(req, "kind")
+        ))
+      },
+      Method.POST / "accept-all" -> handler { (req: Request) =>
+        handlePostOptional[AcceptAllRequest, AcceptAllResult](req) { r =>
+          service.acceptAll(
+            sourcePrefix = r.flatMap(_.source),
+            nodeType     = r.flatMap(_.nodeType),
+            kind         = r.flatMap(_.kind),
+            ids          = r.flatMap(_.ids).getOrElse(Nil)
+          )
+        }
+      },
+
       // --- channels & messages (mycroft) ---
       Method.POST / "channels" -> handler { (req: Request) =>
         handlePost[CreateChannelRequest, ChannelWithMembers](req)(service.createChannel)
@@ -136,7 +155,9 @@ object Routes {
       },
       Method.GET / "memory" -> handler { (req: Request) =>
         handleGet(service.listMemory(
-          personId = queryParam(req, "person").map(PersonId)
+          personId = queryParam(req, "person").map(PersonId),
+          status   = queryParam(req, "status"),
+          kind     = queryParam(req, "kind")
         ))
       },
       Method.GET / "memory" / "profile" -> handler { (req: Request) =>
@@ -331,15 +352,15 @@ object Routes {
   /** Run a read effect and serialise its result, mapping any AgentError to a
    *  status-coded JSON response. */
   private def handleGet[A: JsonEncoder](io: IO[AgentError, A]): UIO[Response] =
-    io.fold(errorToResponse, a => Response.json(a.toJson))
+    io.foldZIO(failed, a => ZIO.succeed(Response.json(a.toJson)))
 
   /** A get whose result may be `None`, translated to 404. */
   private def handleGetOption[A: JsonEncoder](io: IO[AgentError, Option[A]], targetType: String, id: String): UIO[Response] =
-    io.fold(
-      errorToResponse,
+    io.foldZIO(
+      failed,
       {
-        case Some(a) => Response.json(a.toJson)
-        case None    => errorToResponse(AgentError.NotFound(targetType, id))
+        case Some(a) => ZIO.succeed(Response.json(a.toJson))
+        case None    => failed(AgentError.NotFound(targetType, id))
       }
     )
 
@@ -347,22 +368,22 @@ object Routes {
    *  status on service errors. 201 Created on success. */
   private def handlePost[A: JsonDecoder, B: JsonEncoder](req: Request)(svc: A => IO[AgentError, B]): UIO[Response] =
     parseBody[A](req).flatMap {
-      case Left(err) => ZIO.succeed(errorToResponse(err))
-      case Right(a)  => svc(a).fold(errorToResponse, b => Response.json(b.toJson).status(Status.Created))
+      case Left(err) => failed(err)
+      case Right(a)  => svc(a).foldZIO(failed, b => ZIO.succeed(Response.json(b.toJson).status(Status.Created)))
     }
 
   /** Like `handlePost` but the body is optional: an empty body still succeeds. */
   private def handlePostOptional[A: JsonDecoder, B: JsonEncoder](req: Request)(svc: Option[A] => IO[AgentError, B]): UIO[Response] =
     req.body.asString.foldZIO(
-      _ => svc(None).fold(errorToResponse, b => Response.json(b.toJson)),
+      _ => svc(None).foldZIO(failed, b => ZIO.succeed(Response.json(b.toJson))),
       raw =>
-        if (raw.trim.isEmpty || raw.trim == "{}") svc(None).fold(errorToResponse, b => Response.json(b.toJson))
+        if (raw.trim.isEmpty || raw.trim == "{}") svc(None).foldZIO(failed, b => ZIO.succeed(Response.json(b.toJson)))
         else
           ZIO.fromEither(raw.fromJson[A])
             .mapError(msg => AgentError.BadRequest(s"invalid JSON body: $msg"))
             .foldZIO(
-              e => ZIO.succeed(errorToResponse(e)),
-              a => svc(Some(a)).fold(errorToResponse, b => Response.json(b.toJson))
+              failed,
+              a => svc(Some(a)).foldZIO(failed, b => ZIO.succeed(Response.json(b.toJson)))
             )
     )
 
@@ -388,18 +409,29 @@ object Routes {
   private def queryParam(req: Request, name: String): Option[String] =
     req.url.queryParams.getAll(name).headOption
 
+  private def statusOf(e: AgentError): Status = e match {
+    case _: AgentError.NotFound      => Status.NotFound
+    case _: AgentError.BadRequest    => Status.BadRequest
+    case _: AgentError.Validation    => Status.BadRequest
+    case _: AgentError.DecodeFailed  => Status.BadRequest
+    case _: AgentError.Persistence   => Status.InternalServerError
+    case _: AgentError.HttpFailed    => Status.BadGateway
+    case _: AgentError.HttpBadStatus => Status.BadGateway
+    case _: AgentError.Bug           => Status.InternalServerError
+  }
+
   /** Map an `AgentError` to an HTTP response with a structured JSON body. */
-  private def errorToResponse(e: AgentError): Response = {
-    val status = e match {
-      case _: AgentError.NotFound     => Status.NotFound
-      case _: AgentError.BadRequest   => Status.BadRequest
-      case _: AgentError.Validation   => Status.BadRequest
-      case _: AgentError.DecodeFailed => Status.BadRequest
-      case _: AgentError.Persistence  => Status.InternalServerError
-      case _: AgentError.HttpFailed   => Status.BadGateway
-      case _: AgentError.HttpBadStatus => Status.BadGateway
-      case _: AgentError.Bug          => Status.InternalServerError
-    }
-    Response.json(e.toJson).status(status)
+  private def errorToResponse(e: AgentError): Response =
+    Response.json(e.toJson).status(statusOf(e))
+
+  /** Log an error (5xx at error level so it surfaces in container logs, 4xx at
+   *  info) and produce the corresponding response. Use this on the error branch
+   *  of any handler that runs a service effect, so failures are never silent. */
+  private def failed(e: AgentError): UIO[Response] = {
+    val label = e.getClass.getSimpleName
+    val log   =
+      if (statusOf(e).code >= 500) ZIO.logError(s"$label: ${e.message}")
+      else ZIO.logInfo(s"$label: ${e.message}")
+    log.as(errorToResponse(e))
   }
 }

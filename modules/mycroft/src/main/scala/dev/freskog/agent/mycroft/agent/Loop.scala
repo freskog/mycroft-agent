@@ -12,7 +12,31 @@ import zio.json.ast.Json
 import java.time.{Instant, ZoneId}
 
 private[agent] final case class CallB(id: String, name: String, args: String)
-private[agent] final case class Accum(content: String, calls: Map[Int, CallB], finish: Option[String])
+
+/** Per-LLM-call accounting, folded while streaming one completion. `startNanos`
+ *  is when we began pulling the stream; `firstTokenNanos` the first streamed
+ *  token (reasoning or content); `lastTokenNanos` the most recent one. */
+private[agent] final case class Accum(
+  content: String,
+  calls: Map[Int, CallB],
+  finish: Option[String],
+  startNanos: Long = 0L,
+  firstTokenNanos: Option[Long] = None,
+  lastTokenNanos: Option[Long] = None,
+  usage: Option[ChatUsage] = None,
+  timings: Option[ChatTimings] = None
+)
+
+/** Throughput/latency for one model call, derived from an `Accum`. TTFT and
+ *  generation duration are measured client-side; token counts come from the
+ *  server `usage` chunk; tok/s prefer the server `timings` block when present. */
+private[agent] final case class CallMetrics(
+  promptTokens: Option[Int],
+  completionTokens: Option[Int],
+  ttftMs: Option[Long],
+  genTps: Option[Double],
+  ppTps: Option[Double]
+)
 
 /** A tool call the loop observed (any depth). For skill executions these are
  *  rolled up into the result contract's `actions` + `artifacts`. */
@@ -20,7 +44,7 @@ private[agent] final case class ObservedAction(tool: String, ok: Boolean, summar
 
 /** The outcome of one (possibly nested) loop run: the model's final text, the
  *  tool calls observed at this level, and whether the shared budget ran out. */
-private[agent] final case class LoopResult(content: String, actions: List[ObservedAction], hitCap: Boolean)
+private[agent] final case class LoopResult(content: String, actions: List[ObservedAction], hitCap: Boolean, metrics: Option[CallMetrics] = None)
 
 /** The turn lifecycle: resolve scopes, build the prompt, stream the LLM, run
  *  native tool calls and skill compositions, and publish typed events to the
@@ -62,7 +86,7 @@ final class Loop(
       _       <- ZIO.when(result.hitCap)(
                    hub.publish(AgentEvent.Error(channel, turnId, "max_tool_iterations", s"stopped after ${config.maxToolIterations} tool iterations"))
                  )
-      _       <- finalize(channel, turnId, result.content, t0)
+      _       <- finalize(channel, turnId, result.content, t0, result.metrics)
     } yield ()
 
     turn
@@ -106,7 +130,7 @@ final class Loop(
       _       <- ZIO.when(result.hitCap)(
                    hub.publish(AgentEvent.Error(channel, turnId, "max_tool_iterations", s"stopped after ${config.maxToolIterations} tool iterations"))
                  )
-      _       <- finalize(channel, turnId, result.content, t0)
+      _       <- finalize(channel, turnId, result.content, t0, result.metrics)
     } yield ()
 
     turn
@@ -132,7 +156,7 @@ final class Loop(
         iters.update(_ - 1) *>
           collect(channel, turnId, model, msgs).flatMap { acc =>
             val ordered = acc.calls.toList.sortBy(_._1).map(_._2).filter(_.name.nonEmpty)
-            if (ordered.isEmpty) ZIO.succeed(LoopResult(finalReply(acc), Nil, hitCap = false))
+            if (ordered.isEmpty) ZIO.succeed(LoopResult(finalReply(acc), Nil, hitCap = false, metrics = Some(metricsOf(acc))))
             else {
               val assistant = ChatMessage("assistant", Some(acc.content), toolCalls = ordered.map(c => ToolCallSpec(c.id, c.name, c.args)))
               runCalls(channel, turnId, sender, model, ordered, depthLeft, iters, seen).flatMap {
@@ -174,7 +198,10 @@ final class Loop(
     else runCall(channel, turnId, c)
 
   private def repeatedCall(channel: String, turnId: String, c: CallB): IO[AgentError, ChatMessage] = {
-    val note = "You already ran this exact command in this turn and it did not help. Do NOT repeat it — try a different command or answer with what you already know."
+    val note = "You already ran this exact command in this turn and it did not help. Do NOT repeat it. " +
+      "If you were trying to read output that was truncated, use the runlog tool on the run_id from that earlier preview " +
+      "(e.g. runlog(\"show <run_id> --stream stdout --tail 200\")) instead of re-running with different pipes. " +
+      "Otherwise try a genuinely different command or answer with what you already know."
     hub.publish(AgentEvent.ToolCall(channel, turnId, c.name, c.args)) *>
       hub.publish(AgentEvent.ToolResult(channel, turnId, c.name, ok = false, "repeated call skipped")).as(
         ChatMessage("tool", Some(s"Error: $note"), toolCallId = Some(c.id))
@@ -193,17 +220,42 @@ final class Loop(
     scala.util.Try(ZoneId.of(config.timezone)).getOrElse(ZoneId.of("UTC"))
 
   private def collect(channel: String, turnId: String, model: String, msgs: List[ChatMessage]): IO[AgentError, Accum] =
-    llm.chat(model, msgs, config.maxOutputTokens, Some(SkillTools.allToolsJson), sampling)
-      .runFoldZIO(Accum("", Map.empty, None)) { (acc, chunk) =>
-        for {
-          _ <- chunk.reasoningDelta.fold(ZIO.unit: IO[AgentError, Unit])(d => hub.publish(AgentEvent.Reasoning(channel, turnId, d)).unit)
-          _ <- chunk.contentDelta.fold(ZIO.unit: IO[AgentError, Unit])(d => hub.publish(AgentEvent.Content(channel, turnId, d)).unit)
-        } yield Accum(
-          content = acc.content + chunk.contentDelta.getOrElse(""),
-          calls   = chunk.toolCallDeltas.foldLeft(acc.calls)(mergeDelta),
-          finish  = chunk.finishReason.orElse(acc.finish)
-        )
-      }
+    Clock.nanoTime.flatMap { start =>
+      llm.chat(model, msgs, config.maxOutputTokens, Some(SkillTools.allToolsJson), sampling)
+        .runFoldZIO(Accum("", Map.empty, None, startNanos = start)) { (acc, chunk) =>
+          val isToken = chunk.reasoningDelta.isDefined || chunk.contentDelta.isDefined
+          for {
+            now <- Clock.nanoTime
+            _   <- chunk.reasoningDelta.fold(ZIO.unit: IO[AgentError, Unit])(d => hub.publish(AgentEvent.Reasoning(channel, turnId, d)).unit)
+            _   <- chunk.contentDelta.fold(ZIO.unit: IO[AgentError, Unit])(d => hub.publish(AgentEvent.Content(channel, turnId, d)).unit)
+          } yield acc.copy(
+            content         = acc.content + chunk.contentDelta.getOrElse(""),
+            calls           = chunk.toolCallDeltas.foldLeft(acc.calls)(mergeDelta),
+            finish          = chunk.finishReason.orElse(acc.finish),
+            firstTokenNanos = acc.firstTokenNanos.orElse(if (isToken) Some(now) else None),
+            lastTokenNanos  = if (isToken) Some(now) else acc.lastTokenNanos,
+            usage           = chunk.usage.orElse(acc.usage),
+            timings         = chunk.timings.orElse(acc.timings)
+          )
+        }
+    }
+
+  /** Derive throughput/latency from a completed call's accumulator. Prefers
+   *  server-reported tok/s; otherwise computes from client-measured durations
+   *  and the usage token counts. */
+  private def metricsOf(acc: Accum): CallMetrics = {
+    val ttftMs = acc.firstTokenNanos.map(f => (f - acc.startNanos) / 1_000_000)
+    val genMs  = for { f <- acc.firstTokenNanos; l <- acc.lastTokenNanos } yield (l - f) / 1_000_000
+    val prompt = acc.usage.flatMap(_.promptTokens)
+    val comp   = acc.usage.flatMap(_.completionTokens)
+    val genTps = acc.timings.flatMap(_.predictedPerSecond).orElse(
+      for { c <- comp; g <- genMs if g > 0 } yield c * 1000.0 / g
+    )
+    val ppTps = acc.timings.flatMap(_.promptPerSecond).orElse(
+      for { p <- prompt; t <- ttftMs if t > 0 } yield p * 1000.0 / t
+    )
+    CallMetrics(prompt, comp, ttftMs, genTps, ppTps)
+  }
 
   /** Never finalize a blank turn. If the model produced no tool call and no
    *  text, it almost always spun in a reasoning loop until it hit the token cap
@@ -358,11 +410,18 @@ final class Loop(
     if (summary.trim.isEmpty) ZIO.unit
     else person.logEvent("mycroft", s"skill.$skillName", EventCategory.SessionNote, Some(summary), None)
 
-  private def finalize(channel: String, turnId: String, reply: String, t0: Long): IO[AgentError, Unit] =
+  private def finalize(channel: String, turnId: String, reply: String, t0: Long, metrics: Option[CallMetrics]): IO[AgentError, Unit] =
     for {
       t1 <- Clock.nanoTime
       _  <- person.appendMessage(ChannelId(channel), MessageRole.Assistant, None, reply, None, Some(turnId))
-      _  <- hub.publish(AgentEvent.Done(channel, turnId, "stop", 0, Prompt.estimateTokens(reply), (t1 - t0) / 1_000_000))
+      tokensIn  = metrics.flatMap(_.promptTokens).getOrElse(0)
+      tokensOut = metrics.flatMap(_.completionTokens).getOrElse(Prompt.estimateTokens(reply))
+      _  <- hub.publish(AgentEvent.Done(
+              channel, turnId, "stop", tokensIn, tokensOut, (t1 - t0) / 1_000_000,
+              ttftMs = metrics.flatMap(_.ttftMs),
+              genTps = metrics.flatMap(_.genTps),
+              ppTps  = metrics.flatMap(_.ppTps)
+            ))
     } yield ()
 
   // --- helpers ---
@@ -399,7 +458,7 @@ final class Loop(
   private def lastContent(msgs: List[ChatMessage]): String =
     msgs.reverse.collectFirst { case ChatMessage("assistant", Some(c), _, _) if c.nonEmpty => c }.getOrElse("")
 
-  private val RunlogRef = """\(full output: runlog (\S+)\)""".r
+  private val RunlogRef = """\(full output: runlog (\S+)""".r
 
   private def extractRunlogRef(content: String): Option[String] =
     RunlogRef.findFirstMatchIn(content).map(_.group(1))

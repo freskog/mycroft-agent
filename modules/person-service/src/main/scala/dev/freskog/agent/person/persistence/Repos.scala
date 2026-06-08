@@ -24,7 +24,7 @@ trait CommitmentRepo {
 
 trait MemoryRepo {
   def create(item: MemoryItem): IO[AgentError, Unit]
-  def findAll(personId: Option[PersonId]): IO[AgentError, List[MemoryItem]]
+  def findAll(personId: Option[PersonId], status: Option[String], kind: Option[String]): IO[AgentError, List[MemoryItem]]
   def findById(id: MemoryId): IO[AgentError, Option[MemoryItem]]
   def updateStatus(id: MemoryId, status: MemoryStatus, updatedAt: Instant): IO[AgentError, Unit]
   def setSupersededBy(oldId: MemoryId, newId: MemoryId, updatedAt: Instant): IO[AgentError, Unit]
@@ -380,9 +380,11 @@ object Repos {
         m.supersededById, m.validFrom, m.validUntil, m.originEventId
       )
 
-    def findAll(personId: Option[PersonId]): IO[AgentError, List[MemoryItem]] = {
+    def findAll(personId: Option[PersonId], status: Option[String], kind: Option[String]): IO[AgentError, List[MemoryItem]] = {
       val clauses = List(
-        Clause.of("person_id = ?")(personId)
+        Clause.of("person_id = ?")(personId),
+        Clause.of("status = ?")(status),
+        Clause.of("kind = ?")(kind)
       ).flatten
       val sql = s"SELECT * FROM memory_items${whereSql("WHERE", clauses)} ORDER BY created_at DESC"
       db.query(sql, paramsOf(clauses): _*)(extractMemory)

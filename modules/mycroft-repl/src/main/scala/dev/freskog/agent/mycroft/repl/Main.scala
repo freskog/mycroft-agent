@@ -6,7 +6,8 @@ import zio.json.ast.Json
 
 import org.jline.reader.{EndOfFileException, LineReader, UserInterruptException}
 import org.jline.reader.impl.LineReaderImpl
-import org.jline.terminal.{Terminal, TerminalBuilder}
+import org.jline.terminal.{Attributes, Terminal, TerminalBuilder}
+import org.jline.utils.NonBlockingReader
 
 import java.io.{BufferedReader, InputStream, InputStreamReader, PrintWriter}
 import java.net.URI
@@ -162,11 +163,56 @@ object Main extends ZIOAppDefault {
         if (!ch.contains(cfg.channel) || !mid.contains(turnId)) go
         else ZIO.attempt(r.on(ev)).ignore *> (if (ev.event == "done" || ev.event == "error") ZIO.unit else go)
       }
-    go.timeout((maxTurnSeconds + 30).seconds).flatMap {
+    val render = go.timeout((maxTurnSeconds + 30).seconds).flatMap {
       case Some(_) => ZIO.unit
       case None    => printLine(terminal, s"[timed out after ${maxTurnSeconds + 30}s waiting for a response]")
     }
+    // On a real terminal, let ESC abort the turn (cancels it server-side and
+    // hands the prompt back instead of waiting for the timeout). Dumb terminals
+    // can't deliver a bare keypress, so they just render.
+    if (!ansiSupported(terminal)) render
+    else
+      withCbreak(terminal)(render.as(false).raceFirst(watchEsc(terminal).as(true))).flatMap { aborted =>
+        ZIO.when(aborted)(cancelTurn(cfg, turnId) *> printLine(terminal, "\n[aborted]")).unit
+      }
   }
+
+  /** Put the terminal in cbreak mode (no line buffering, no echo) for the
+   *  duration of `io`, restoring the saved attributes afterwards. Output flags
+   *  are left untouched so the live rendering still translates newlines. */
+  private def withCbreak[A](terminal: Terminal)(io: Task[A]): Task[A] =
+    ZIO.acquireReleaseWith(
+      ZIO.attempt {
+        val saved = terminal.getAttributes
+        val attrs = new Attributes(saved)
+        attrs.setLocalFlag(Attributes.LocalFlag.ICANON, false)
+        attrs.setLocalFlag(Attributes.LocalFlag.ECHO, false)
+        terminal.setAttributes(attrs)
+        saved
+      }
+    )(saved => ZIO.attempt(terminal.setAttributes(saved)).ignore)(_ => io)
+
+  /** Completes when the user presses a bare ESC. Polls with a short timeout so
+   *  it stays responsive to interruption (when the turn finishes first), and
+   *  distinguishes a real ESC from the start of an escape sequence (arrow keys)
+   *  by peeking for an immediately-following byte. */
+  private def watchEsc(terminal: Terminal): Task[Unit] = {
+    val reader = terminal.reader()
+    def loop: Task[Unit] =
+      ZIO.attemptBlocking(reader.read(150L)).flatMap {
+        case 27 =>
+          ZIO.attemptBlocking(reader.read(40L)).flatMap { next =>
+            if (next == NonBlockingReader.READ_EXPIRED) ZIO.unit // bare ESC -> abort
+            else loop                                            // escape sequence -> ignore
+          }
+        case -1 => ZIO.never                                     // input closed; let render win
+        case _  => loop                                          // timeout (-2) or any other key
+      }
+    loop
+  }
+
+  private def cancelTurn(cfg: Cfg, turnId: String): Task[Unit] =
+    post(cfg.mycroftUrl + s"/turns/$turnId/cancel", "{}").unit.catchAll(_ => ZIO.unit)
 
   /** Owns all terminal writes during a turn. Not thread-safe by design: only the
    *  turn loop (single fiber) calls it, and JLine is idle while it runs. */
@@ -268,10 +314,25 @@ object Main extends ZIOAppDefault {
       val elapsed = ev.json.flatMap(longField("elapsed_ms")).getOrElse {
         if (turnStart == 0L) 0L else (java.lang.System.nanoTime() - turnStart) / 1_000_000
       }
+      val tokIn  = ev.json.flatMap(intField("tokens_in")).getOrElse(0)
       val tokOut = ev.json.flatMap(intField("tokens_out")).getOrElse(0)
-      val parts  = List(s"${elapsed}ms") ++ (if (tokOut > 0) List(s"${tokOut} tok out") else Nil)
-      parts.mkString(", ")
+      val ttft   = ev.json.flatMap(longField("ttft_ms"))
+      val genTps = ev.json.flatMap(doubleField("gen_tps"))
+      val ppTps  = ev.json.flatMap(doubleField("pp_tps"))
+
+      val tokens =
+        if (tokIn > 0 || tokOut > 0) List(s"${tokIn} ctx → ${tokOut} gen tok") else Nil
+      val parts =
+        List(s"${elapsed}ms") ++
+          tokens ++
+          ttft.map(t => s"TTFT ${t}ms").toList ++
+          ppTps.map(t => s"PP ${fmtTps(t)} tok/s").toList ++
+          genTps.map(t => s"TG ${fmtTps(t)} tok/s").toList
+      parts.mkString(" · ")
     }
+
+    private def fmtTps(v: Double): String =
+      if (v >= 100) f"$v%.0f" else f"$v%.1f"
   }
 
   // --- inbox triage (thin trigger) ---
@@ -418,6 +479,14 @@ object Main extends ZIOAppDefault {
     case Json.Obj(fields) =>
       fields.collectFirst {
         case (k, Json.Num(n)) if k == name => n.longValue
+      }
+    case _ => None
+  }
+
+  private def doubleField(name: String)(json: Json): Option[Double] = json match {
+    case Json.Obj(fields) =>
+      fields.collectFirst {
+        case (k, Json.Num(n)) if k == name => n.doubleValue
       }
     case _ => None
   }

@@ -16,6 +16,11 @@ object Main extends ZIOCliDefault {
   object Cmd {
     case object Health extends Cmd
 
+    final case class PersonCreate(
+      id: String, displayName: String, timezone: String, locale: Option[String]
+    ) extends Cmd
+    case object PersonList extends Cmd
+
     final case class CommitmentPropose(
       owner: String, text: String,
       source: String, evidence: String, due: Option[String]
@@ -53,6 +58,7 @@ object Main extends ZIOCliDefault {
     final case class MemoryConflicts(person: Option[String], kind: String, text: String) extends Cmd
     final case class MemoryConsolidate(since: Option[String])                       extends Cmd
     final case class MemoryProfile(limit: Option[Int])                              extends Cmd
+    final case class MemoryList(person: Option[String], kind: Option[String], status: Option[String]) extends Cmd
 
     final case class EntityPropose(kind: String, name: String, attributesJson: Option[String], source: String, confidence: Option[BigDecimal]) extends Cmd
     final case class EntityList(kind: Option[String], status: Option[String])       extends Cmd
@@ -72,6 +78,9 @@ object Main extends ZIOCliDefault {
     final case class RelationshipSupersede(newId: String, oldId: String)            extends Cmd
 
     case object Household extends Cmd
+
+    final case class Pending(source: Option[String], nodeType: Option[String], kind: Option[String]) extends Cmd
+    final case class AcceptAll(source: Option[String], nodeType: Option[String], kind: Option[String], ids: Option[String]) extends Cmd
 
     final case class EventRecord(actor: Option[String], action: String, category: String, targetType: Option[String], targetId: Option[String], text: Option[String], payloadJson: Option[String]) extends Cmd
     final case class EventLog(category: Option[String], since: Option[String], until: Option[String], limit: Option[Int]) extends Cmd
@@ -198,10 +207,14 @@ object Main extends ZIOCliDefault {
     "profile",
     Options.integer("limit").optional
   ).map(limit => Cmd.MemoryProfile(limit.map(_.toInt)))
+  private val memoryList = Command(
+    "list",
+    Options.text("person").optional ++ Options.text("kind").optional ++ Options.text("status").optional
+  ).map { case (person, kind, status) => Cmd.MemoryList(person, kind, status) }
 
   private val memoryExt = Command("memory").subcommands(
     memoryPropose, memoryAccept, memoryReject, memoryArchive,
-    memorySupersede, memorySearch, memoryContext, memoryConflicts, memoryConsolidate, memoryProfile
+    memorySupersede, memorySearch, memoryContext, memoryConflicts, memoryConsolidate, memoryProfile, memoryList
   )
 
   // --- entity (household graph nodes) ---
@@ -257,6 +270,18 @@ object Main extends ZIOCliDefault {
 
   // Combined household snapshot (accepted, currently-active graph).
   private val household = Command("household").map(_ => Cmd.Household)
+
+  // Review queue: list everything proposed (by source/type/kind), and accept in
+  // bulk — by the same filters, or an explicit comma-separated --ids subset.
+  private val pending = Command(
+    "pending",
+    Options.text("source").optional ++ Options.text("type").optional ++ Options.text("kind").optional
+  ).map { case (source, nodeType, kind) => Cmd.Pending(source, nodeType, kind) }
+  private val acceptAll = Command(
+    "accept-all",
+    Options.text("source").optional ++ Options.text("type").optional ++
+      Options.text("kind").optional ++ Options.text("ids").optional
+  ).map { case (source, nodeType, kind, ids) => Cmd.AcceptAll(source, nodeType, kind, ids) }
 
   // --- event ---
   private val eventRecord = Command(
@@ -334,11 +359,23 @@ object Main extends ZIOCliDefault {
 
   private val calendar = Command("calendar").subcommands(calendarAgenda)
 
+  // --- person (household members / graph person-nodes) ---
+  private val personCreate = Command(
+    "create",
+    Options.text("id") ++ Options.text("display-name") ++
+      Options.text("timezone") ++ Options.text("locale").optional
+  ).map { case (id, name, tz, locale) => Cmd.PersonCreate(id, name, tz, locale) }
+
+  private val personList = Command("list").map(_ => Cmd.PersonList)
+
+  private val personSub = Command("person").subcommands(personCreate, personList)
+
   // --- top-level ---
   private val health = Command("health").map(_ => Cmd.Health)
 
   private val personCommand = Command("person").subcommands(
-    health, commitment, memoryExt, approval, goal, entity, relationship, household, event, gmail, inbox, calendar
+    health, personSub, commitment, memoryExt, approval, goal, entity, relationship, household,
+    pending, acceptAll, event, gmail, inbox, calendar
   )
 
   val cliApp = CliApp.make(
@@ -353,6 +390,18 @@ object Main extends ZIOCliDefault {
   private def dispatch(cmd: Cmd): IO[AgentError, Unit] = cmd match {
     case Cmd.Health =>
       HttpClient.get("/health").flatMap(out => Console.printLine(out).orDie)
+
+    case Cmd.PersonCreate(id, name, tz, locale) =>
+      val body = jsonObj(
+        "id"            -> id.toJson,
+        "displayName"   -> name.toJson,
+        "timezone"      -> tz.toJson,
+        "defaultLocale" -> locale.toJson
+      )
+      HttpClient.post("/persons", body).flatMap(out => Console.printLine(out).orDie)
+
+    case Cmd.PersonList =>
+      HttpClient.get("/persons").flatMap(out => Console.printLine(out).orDie)
 
     case Cmd.CommitmentPropose(owner, text, source, evidence, due) =>
       val body = jsonObj(
@@ -544,6 +593,24 @@ object Main extends ZIOCliDefault {
 
     case Cmd.Household =>
       HttpClient.get("/household").flatMap(out => Console.printLine(out).orDie)
+
+    case Cmd.MemoryList(person, kind, status) =>
+      HttpClient.get("/memory", paramsMap("person" -> person, "kind" -> kind, "status" -> status))
+        .flatMap(out => Console.printLine(out).orDie)
+
+    case Cmd.Pending(source, nodeType, kind) =>
+      HttpClient.get("/pending", paramsMap("source" -> source, "type" -> nodeType, "kind" -> kind))
+        .flatMap(out => Console.printLine(out).orDie)
+
+    case Cmd.AcceptAll(source, nodeType, kind, ids) =>
+      val idList = ids.map(_.split(",").toList.map(_.trim).filter(_.nonEmpty)).getOrElse(Nil)
+      val body = jsonObj(
+        "source" -> source.toJson,
+        "type"   -> nodeType.toJson,
+        "kind"   -> kind.toJson,
+        "ids"    -> idList.toJson
+      )
+      HttpClient.post("/accept-all", body).flatMap(out => Console.printLine(out).orDie)
 
     case Cmd.EventRecord(actor, action, category, ttype, tid, text, payload) =>
       val body = jsonObj(

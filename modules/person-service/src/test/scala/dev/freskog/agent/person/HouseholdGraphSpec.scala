@@ -249,6 +249,71 @@ object HouseholdGraphSpec extends ZIOSpecDefault {
           afterCut.map(_.id) == List(newEdge.id)
         )
       }
+    },
+
+    // --- review queue: pending + accept-all by source / type / kind / ids ---
+
+    test("pending --type narrows to one bucket; --kind excludes relationships") {
+      withService { svc =>
+        for {
+          _        <- svc.proposeMemory(ProposeMemoryRequest(Some(FredId), MemoryKind.Fact, "born 1980", "onboarding:household", Some(0.9)))
+          sch      <- svc.proposeEntity(ProposeEntityRequest(EntityKind.School, "Oakwood", None, "onboarding:kids", Some(0.9)))
+          _        <- svc.proposeRelationship(ProposeRelationshipRequest(
+                        FredId.value, NodeKind.Person, RelationshipType.Attends, sch.id.value, NodeKind.Entity, "onboarding:kids", Some(0.9)
+                      ))
+          all      <- svc.pending(None, None, None)
+          onlyRel  <- svc.pending(None, Some("relationship"), None)
+          schools  <- svc.pending(None, Some("entity"), Some("school"))
+          kindOnly <- svc.pending(None, None, Some("school"))
+        } yield assertTrue(
+          all.memory.size == 1 && all.entities.size == 1 && all.relationships.size == 1,
+          onlyRel.memory.isEmpty && onlyRel.entities.isEmpty && onlyRel.relationships.size == 1,
+          schools.entities.size == 1 && schools.memory.isEmpty && schools.relationships.isEmpty,
+          // a kind filter excludes relationships (they have no kind)
+          kindOnly.relationships.isEmpty && kindOnly.entities.size == 1
+        )
+      }
+    },
+    test("pending rejects an unknown --type") {
+      withService { svc =>
+        svc.pending(None, Some("bogus"), None).either.map(r => assertTrue(r.isLeft))
+      }
+    },
+    test("accept-all --source accepts only the matching namespace") {
+      withService { svc =>
+        for {
+          a   <- svc.proposeEntity(ProposeEntityRequest(EntityKind.Organization, "Workday", None, "onboarding:work", Some(0.9)))
+          b   <- svc.proposeEntity(ProposeEntityRequest(EntityKind.School, "Oakwood", None, "onboarding:kids", Some(0.9)))
+          res <- svc.acceptAll(Some("onboarding:work"), None, None, Nil)
+          work <- svc.listEntities(None, Some("accepted"))
+          kids <- svc.listEntities(None, Some("proposed"))
+        } yield assertTrue(
+          res.entities == 1,
+          work.exists(_.id == a.id),
+          kids.exists(_.id == b.id)
+        )
+      }
+    },
+    test("accept-all --ids accepts an explicit cross-type subset") {
+      withService { svc =>
+        for {
+          m   <- svc.proposeMemory(ProposeMemoryRequest(Some(FredId), MemoryKind.Fact, "born 1980", "chat", Some(0.9)))
+          e   <- svc.proposeEntity(ProposeEntityRequest(EntityKind.Organization, "Workday", None, "chat", Some(0.9)))
+          e2  <- svc.proposeEntity(ProposeEntityRequest(EntityKind.School, "Oakwood", None, "chat", Some(0.9)))
+          res <- svc.acceptAll(None, None, None, List(m.id.value, e.id.value))
+          accepted <- svc.listEntities(None, Some("accepted"))
+          stillProp <- svc.listEntities(None, Some("proposed"))
+        } yield assertTrue(
+          res.memory == 1 && res.entities == 1 && res.relationships == 0,
+          accepted.exists(_.id == e.id),
+          stillProp.exists(_.id == e2.id)
+        )
+      }
+    },
+    test("accept-all --ids fails on an unknown id") {
+      withService { svc =>
+        svc.acceptAll(None, None, None, List("does-not-exist")).either.map(r => assertTrue(r.isLeft))
+      }
     }
   )
 }

@@ -31,15 +31,29 @@ A third tool, `run_skill(name, task, params?)`, is **control-plane**: it runs a
 skill as an isolated sub-task and returns a structured result summary. Use it to
 compose skills (see "Composing skills"); it does not touch the OS.
 
-Do not guess command flags. Discover them first:
+Do not guess command flags — but do not grep top-level `--help` either. Prefer,
+in order:
+
+1. The command examples in the relevant **skill** (`skill show <name>`). The
+   `onboarding`, `memory`, and `person-service` skills list the exact flags for
+   every graph/memory/commitment command — use them verbatim and skip discovery.
+2. A **subcommand-scoped** help only when a skill doesn't cover it, e.g.
+   `safe_run("person memory --help")`. Avoid bare `person --help`: its output is
+   long and colour-coded, so it gets truncated in the preview and reading it
+   repeatedly burns the whole turn.
 
 ```
-safe_run("person --help")
-safe_run("person memory --help")
 safe_run("skill list")
 safe_run("skill search \"morning meetings\"")
 safe_run("skill show memory")
+safe_run("person memory --help")   # scoped help, only if no skill covers it
 ```
+
+When any `safe_run` preview is truncated (it ends with
+`(full output: runlog <run_id> …)`), read the rest with
+`runlog("show <run_id> --stream stdout --tail 200")` — do **not** re-run the
+command with different pipes (`cat -v`, `tr`, `sed`) to shrink it. Re-issuing the
+exact same command is refused by the loop ("repeated call skipped").
 
 ## Trusted CLIs available through `safe_run`
 

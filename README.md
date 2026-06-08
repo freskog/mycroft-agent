@@ -99,6 +99,8 @@ are no privacy scopes. Build the household graph (persons, entities, typed
 relationships) with:
 
 ```bash
+sbt "personCli/run person list"
+sbt 'personCli/run person create --id liam --display-name "Liam" --timezone Europe/Dublin --locale en-IE'
 sbt 'personCli/run entity propose --kind organization --name "MegaCorp" --source onboarding:work'
 sbt "personCli/run entity list --status accepted"
 sbt "personCli/run entity resolve megacorp"

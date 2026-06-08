@@ -25,11 +25,22 @@ object ChatMessage {
 /** A streamed token delta, demuxed by which OpenAI field it carried. */
 final case class ToolCallDelta(index: Int, id: Option[String], name: Option[String], argsFragment: Option[String])
 
+/** Token accounting from the final `usage` chunk (requires
+ *  `stream_options.include_usage`). Absent on per-token deltas. */
+final case class ChatUsage(promptTokens: Option[Int], completionTokens: Option[Int])
+
+/** Server-reported throughput, when the backend includes a `timings`/`stats`
+ *  block (llama.cpp / LM Studio). Preferred over client-side estimates because
+ *  it isolates prefill vs generation on the server. */
+final case class ChatTimings(promptPerSecond: Option[Double], predictedPerSecond: Option[Double])
+
 final case class ChatChunk(
   contentDelta: Option[String],
   reasoningDelta: Option[String],
   toolCallDeltas: List[ToolCallDelta],
-  finishReason: Option[String]
+  finishReason: Option[String],
+  usage: Option[ChatUsage] = None,
+  timings: Option[ChatTimings] = None
 )
 
 /** Sampling knobs sent to LM Studio. Defaults follow Qwen3's recommended
@@ -68,9 +79,14 @@ object ChatProtocol {
       "min_p"            -> Json.Num(sampling.minP),
       "presence_penalty" -> Json.Num(sampling.presencePenalty)
     )
+    // Ask the server to emit a final usage chunk so we can report token counts
+    // and prompt/generation throughput.
+    val withUsage =
+      if (stream) base :+ ("stream_options" -> Json.Obj("include_usage" -> Json.Bool(true)))
+      else base
     val withTools = toolsJson.flatMap(_.fromJson[Json].toOption) match {
-      case Some(arr) => base :+ ("tools" -> arr)
-      case None      => base
+      case Some(arr) => withUsage :+ ("tools" -> arr)
+      case None      => withUsage
     }
     Json.Obj(Chunk.fromIterable(withTools)).toJson
   }
@@ -102,16 +118,38 @@ object ChatProtocol {
   def parseChunk(dataJson: String): Option[ChatChunk] = {
     if (dataJson.trim == "[DONE]") None
     else dataJson.fromJson[Json].toOption.flatMap { json =>
-      field(json, "choices").flatMap(firstElem).map { first =>
+      val usage   = field(json, "usage").flatMap(parseUsage)
+      val timings = field(json, "timings").orElse(field(json, "stats")).flatMap(parseTimings)
+      val choice  = field(json, "choices").flatMap(firstElem).map { first =>
         val delta      = field(first, "delta")
         val content    = delta.flatMap(strField(_, "content"))
         val reasoning  = delta.flatMap(strField(_, "reasoning_content"))
         val finish     = strField(first, "finish_reason")
         val toolDeltas = delta.flatMap(field(_, "tool_calls")).map(parseToolDeltas).getOrElse(Nil)
-        ChatChunk(content, reasoning, toolDeltas, finish)
+        ChatChunk(content, reasoning, toolDeltas, finish, usage, timings)
       }
+      // The include_usage terminal chunk has an empty `choices` array but carries
+      // `usage` (and sometimes `timings`); surface it so the loop can record it.
+      choice.orElse(
+        if (usage.isDefined || timings.isDefined) Some(ChatChunk(None, None, Nil, None, usage, timings))
+        else None
+      )
     }
   }
+
+  private def parseUsage(json: Json): Option[ChatUsage] =
+    Some(ChatUsage(intField(json, "prompt_tokens"), intField(json, "completion_tokens")))
+
+  private def parseTimings(json: Json): Option[ChatTimings] = {
+    val pp = doubleField(json, "prompt_per_second").orElse(doubleField(json, "tokens_per_second_prompt"))
+    val tg = doubleField(json, "predicted_per_second")
+      .orElse(doubleField(json, "tokens_per_second"))
+      .orElse(doubleField(json, "generation_tokens_per_second"))
+    if (pp.isEmpty && tg.isEmpty) None else Some(ChatTimings(pp, tg))
+  }
+
+  private def doubleField(json: Json, name: String): Option[Double] =
+    field(json, name).collect { case Json.Num(n) => n.doubleValue }
 
   private def field(json: Json, name: String): Option[Json] = json match {
     case Json.Obj(fields) => fields.collectFirst { case (k, v) if k == name => v }

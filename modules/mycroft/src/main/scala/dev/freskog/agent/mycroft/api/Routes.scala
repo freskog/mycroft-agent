@@ -37,7 +37,15 @@ object Routes {
     implicit val codec: JsonCodec[ChannelCreate] = DeriveJsonCodec.gen[ChannelCreate]
   }
 
-  def make(loop: Loop, person: PersonClient, llm: LmStudioClient, hub: Hub[AgentEvent]): zio.http.Routes[Any, Response] =
+  /** A running turn we can interrupt on request: its channel (for the terminal
+   *  event) and the daemon fiber executing it. */
+  private final case class RunningTurn(channel: String, fiber: Fiber.Runtime[Nothing, Unit])
+
+  def make(loop: Loop, person: PersonClient, llm: LmStudioClient, hub: Hub[AgentEvent]): zio.http.Routes[Any, Response] = {
+    // turnId -> running turn, so a client (e.g. the REPL pressing ESC) can cancel
+    // a turn instead of waiting for it to finish or time out.
+    val running = new java.util.concurrent.ConcurrentHashMap[String, RunningTurn]()
+
     zio.http.Routes(
 
       Method.GET / "health" -> handler { (_: Request) =>
@@ -53,9 +61,23 @@ object Routes {
               case Some(skill) => loop.runSkill(in.channel, in.from, skill, in.content, in.params, turnId)
               case None        => loop.run(in.channel, in.from, in.content, in.externalId, turnId)
             }
-            start.forkDaemon.as(
-              Response.json(s"""{"message_id":"$turnId","channel":"${in.channel}"}""").status(Status.Accepted)
-            )
+            start
+              .ensuring(ZIO.succeed(running.remove(turnId)))
+              .forkDaemon
+              .flatMap(fib => ZIO.succeed(running.put(turnId, RunningTurn(in.channel, fib))))
+              .as(Response.json(s"""{"message_id":"$turnId","channel":"${in.channel}"}""").status(Status.Accepted))
+        }
+      },
+
+      // Cancel an in-flight turn: interrupt the fiber and publish a terminal
+      // `error` event so any connected stream closes the turn cleanly.
+      Method.POST / "turns" / string("id") / "cancel" -> handler { (id: String, _: Request) =>
+        Option(running.remove(id)) match {
+          case None      => ZIO.succeed(Response.json(s"""{"cancelled":null}""").status(Status.NotFound))
+          case Some(rt)  =>
+            rt.fiber.interrupt *>
+              hub.publish(AgentEvent.Error(rt.channel, id, "cancelled", "turn cancelled by user"))
+                .as(Response.json(s"""{"cancelled":"$id"}"""))
         }
       },
 
@@ -107,6 +129,7 @@ object Routes {
         }
       }
     )
+  }
 
   private def parseBody[A: JsonDecoder](req: Request): UIO[Either[AgentError, A]] =
     req.body.asString

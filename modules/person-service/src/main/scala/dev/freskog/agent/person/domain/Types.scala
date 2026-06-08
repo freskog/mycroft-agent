@@ -248,3 +248,32 @@ case class ConsolidatePayload(proposed: Int)
 object ConsolidatePayload {
   implicit val codec: JsonCodec[ConsolidatePayload] = DeriveJsonCodec.gen[ConsolidatePayload]
 }
+
+/** Everything awaiting human review, grouped by type. Backs `GET /pending`. */
+case class PendingProposals(
+  memory: List[MemoryItem],
+  entities: List[Entity],
+  relationships: List[Relationship]
+)
+object PendingProposals {
+  implicit val codec: JsonCodec[PendingProposals] = DeriveJsonCodec.gen[PendingProposals]
+}
+
+/** Selection for `POST /accept-all`. `ids` (explicit subset) takes precedence;
+ *  otherwise everything proposed is accepted, narrowed by `source` prefix,
+ *  `type` (memory|entity|relationship) and `kind`. */
+case class AcceptAllRequest(
+  source: Option[String] = None,
+  @jsonField("type") nodeType: Option[String] = None,
+  kind: Option[String] = None,
+  ids: Option[List[String]] = None
+)
+object AcceptAllRequest {
+  implicit val codec: JsonCodec[AcceptAllRequest] = DeriveJsonCodec.gen[AcceptAllRequest]
+}
+
+/** Per-type counts of items accepted by `POST /accept-all`. */
+case class AcceptAllResult(memory: Int, entities: Int, relationships: Int)
+object AcceptAllResult {
+  implicit val codec: JsonCodec[AcceptAllResult] = DeriveJsonCodec.gen[AcceptAllResult]
+}

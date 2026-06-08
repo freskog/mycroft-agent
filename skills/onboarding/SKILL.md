@@ -41,8 +41,9 @@ person memory profile --limit 100
 
 Interview adaptively — ask in natural batches, don't interrogate. Aim to capture:
 
-- **People**: each family member (adults, children, relevant extended family).
-  Names, the timezone/locale of the primary user, who is a parent/child/spouse.
+- **People**: each family member (adults, children, relevant extended family) —
+  created as person-nodes with `person person create` (see Commands). Capture
+  who is a parent/child/spouse as relationships.
 - **Entities** the people relate to:
   - `organization` — employers, agencies
   - `school` — nursery/primary/secondary/university
@@ -61,6 +62,24 @@ Capture the enabling facts for future coordination too: who the adults are, that
 children need supervision, default childcare/coverage, and shared resources (one
 car, etc.). Don't design a calendar here — just record the facts.
 
+## Order of operations
+
+Work in this order so ids exist before they're referenced — don't go exploring:
+
+1. `person person list` and `person household` — see what already exists.
+2. **Create the people** with `person person create` (reuse existing ids like
+   `fred`/`paula`; pick lowercase slugs for new ones). Note each id.
+3. **Propose the entities** (`person entity propose`); note the returned ids.
+4. **Propose the relationships** (`person relationship propose`) wiring the
+   person/entity ids together (`spouse`, `parent_of`, `employed_by`, `attends`…).
+5. **Propose pinned facts** (`person memory propose --source onboarding:<topic>`),
+   each `--person <id>` referencing a person you created in step 2.
+6. Log a `session_note` event.
+7. Summarise and **ask the user to accept** the proposals. When they approve,
+   run `person accept-all --source onboarding` (see "Accepting").
+
+Capture in batches; you don't need every detail before you start proposing.
+
 ## Prefer derivable facts over snapshots
 
 Store the **stable** fact and let the clock derive the rest:
@@ -72,12 +91,24 @@ This way nothing silently goes stale between sessions.
 
 ## Commands
 
-Persons (created via person-service; ask an operator if a new person id is needed):
-```
-person household                      # current graph
-```
+These are the only commands you need — they're listed here so you do **not** have
+to explore `--help` (its output is long and colour-coded; reading it repeatedly
+wastes your turn). Run them via `safe_run`. Use the exact flags below.
 
-Entities:
+People are graph **person-nodes**. Create them directly (they're structural
+identities, not proposals); use a **lowercase slug** as the id:
+```
+person person list                    # who already exists (check before creating)
+person person create --id liam --display-name "Liam" --timezone Europe/Dublin --locale en-IE
+```
+Reuse an existing id (e.g. seeded `fred`, `paula`) rather than creating a duplicate.
+`--timezone` is required — reuse the primary user's zone for family members unless
+told otherwise. There is no "person" entity kind; family members are person-nodes,
+not entities.
+
+Entities (employers, schools, clubs, GPs, vehicles, places — a **fixed** set of
+kinds: `organization` / `school` / `club` / `medical` / `vehicle` / `place` /
+`other`; do not invent others):
 ```
 person entity propose --kind school --name 'Oakwood Primary' \
   --attributes-json '{"phase":"primary"}' --source onboarding:children
@@ -107,6 +138,29 @@ person event record --action onboarding.session --category session_note \
   --text 'Initial onboarding: captured 2 adults, 2 children, employer + school'
 ```
 
+## Accepting (when the user approves)
+
+Everything you proposed sits in **`proposed`** status (the status value is
+literally `proposed`, not "pending"). Profile (`person memory profile`) and
+`person household` show **accepted** items only, so proposals won't appear there
+until accepted. To review and accept:
+
+```
+person pending --source onboarding              # list ALL proposed memory/entities/relationships (optionally by source prefix)
+person accept-all --source onboarding           # accept everything proposed under that source in one call
+```
+
+`--source` is a prefix filter, so `onboarding` matches `onboarding:children`,
+`onboarding:work`, etc. Omit it to act on every proposal. When the user says
+"looks good / approved", run `person accept-all --source onboarding` — do **not**
+go exploring `--help`. To accept individually instead, use the per-type verbs
+with the id from `person pending`:
+```
+person memory accept <id>
+person entity accept <id>
+person relationship accept <id>
+```
+
 ## Refresh / diff mode (job change, new grade, new club, move)
 
 A change is a **transition**, not an overwrite — preserve history so `--as-of`
@@ -126,8 +180,9 @@ queries stay correct. For each change:
 
 ## Rules
 
-1. Everything you create is **proposed**. End the session by asking the user to
-   review/accept the proposals — only humans accept.
+1. Everything you create is **proposed** (status value `proposed`). End the
+   session by asking the user to review/accept — only humans accept. On approval,
+   `person accept-all --source onboarding`; review with `person pending`.
 2. Resolve before you create. Don't duplicate an existing person/entity; don't
    auto-merge ambiguous matches.
 3. Prefer derivable facts (dates) over snapshots (ages, grades).

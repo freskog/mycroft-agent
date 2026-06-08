@@ -49,12 +49,37 @@ person relationship propose --from fred --from-kind person --type employed_by \
 person household        # accepted, currently-active persons/entities/relationships
 ```
 
+### Review queue: list & accept proposals
+
+Everything proposed sits in **`proposed`** status (that literal string — not
+"pending"). `person household` and `person memory profile` show **accepted**
+items only, so use these to see and act on what's awaiting review:
+
+```
+person pending                              # all proposed memory + entities + relationships, with ids
+person pending --source onboarding          # by source prefix (startsWith)
+person pending --type relationship          # by type: memory | entity | relationship
+person pending --type entity --kind school  # by kind (memory/entity kind; excludes relationships)
+person accept-all                           # accept every proposal in one call
+person accept-all --source onboarding:work  # accept only matching proposals
+person accept-all --type entity --kind school   # accept by category
+person accept-all --ids <id1>,<id2>,<id3>   # accept an explicit subset (ids from `person pending`)
+person memory list --status proposed        # just proposed memory (also --person / --kind filters)
+```
+
+`--type` selects which buckets to act on; `--kind` filters memory/entity kind
+(relationships have no kind, so a `--kind` filter excludes them). `--ids` takes a
+comma-separated list and overrides the filters — use it to accept an arbitrary
+subset precisely. To accept one item at a time you can also run the per-type verb
+with an id from `person pending`: `person memory accept <id>`,
+`person entity accept <id>`, `person relationship accept <id>` (likewise `… reject <id>`).
+
 Building and updating the graph is covered in the dedicated `onboarding` skill. Commitments are covered in `commitments`. Goals and plans are covered in `goals` and `plans`. Semantic facts and the episodic event log are covered in `memory` and `events`.
 
 ## Rules
 
 1. Always check health first if unsure whether the service is running.
-2. Memory proposals are not automatically accepted — they require human review.
+2. Memory/entity/relationship proposals are not auto-accepted — they require human review. List them with `person pending`; accept on the user's approval with `person accept-all` (or per-item `… accept <id>`). The status value is `proposed`.
 3. Never propose memory that contains credentials, tokens, or passwords.
 4. Approval requests are for actions that need human authorization before execution.
 5. The `person` CLI must be used inside `safe-run` — never call the HTTP API directly.

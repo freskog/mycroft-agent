@@ -30,12 +30,16 @@ Returns JSON with:
 
 ### Inspect output with runlog
 
+The `<run_id>` is the id printed in the `(full output: runlog <run_id> …)`
+line of a truncated `safe_run` preview. `--cwd` is optional and defaults to the
+working directory, so you normally omit it:
+
 ```
-runlog list --cwd /tmp/workspace
-runlog show --cwd /tmp/workspace <run_id> --stream stdout --head 100
-runlog show --cwd /tmp/workspace <run_id> --stream stderr --tail 50
-runlog grep --cwd /tmp/workspace <run_id> --stream stdout --pattern "ERROR"
-runlog range --cwd /tmp/workspace <run_id> --stream stdout --start-line 100 --end-line 200
+runlog list
+runlog show <run_id> --stream stdout --head 100
+runlog show <run_id> --stream stderr --tail 50
+runlog grep <run_id> --stream stdout --pattern "ERROR"
+runlog range <run_id> --stream stdout --start-line 100 --end-line 200
 ```
 
 ## Rules
