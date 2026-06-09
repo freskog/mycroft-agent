@@ -16,6 +16,7 @@ import java.util.UUID
 
 trait PersonService {
   def createPerson(req: CreatePersonRequest): IO[AgentError, Person]
+  def updatePerson(id: PersonId, req: UpdatePersonRequest): IO[AgentError, Person]
   def listPersons: IO[AgentError, List[Person]]
   def proposeCommitment(req: ProposeCommitmentRequest): IO[AgentError, Commitment]
   def listCommitments(owner: Option[PersonId], status: Option[String]): IO[AgentError, List[Commitment]]
@@ -89,7 +90,7 @@ trait PersonService {
   def gmailAuthUrl(ownerPersonId: PersonId): IO[AgentError, GmailAuthUrlResponse]
   def gmailOAuthExchange(req: GmailOAuthExchangeRequest): IO[AgentError, GmailCredentialSummary]
   def gmailSync(ownerPersonId: PersonId, since: Option[Instant]): IO[AgentError, GmailSyncResult]
-  def listInbox(ownerPersonId: PersonId, status: Option[String], limit: Int, oldestFirst: Boolean = false): IO[AgentError, List[InboxMessage]]
+  def listInbox(ownerPersonId: PersonId, status: Option[String], limit: Int, oldestFirst: Boolean = false): IO[AgentError, List[InboxSummary]]
   def getInbox(id: InboxMessageId): IO[AgentError, Option[InboxMessage]]
   def downloadAttachment(id: InboxMessageId, attachmentId: String): IO[AgentError, AttachmentDownload]
   def skipInbox(id: InboxMessageId): IO[AgentError, InboxMessage]
@@ -131,7 +132,24 @@ object PersonService {
       personRepo.create(p).as(p)
     }
 
+    /** Partial, gateless update of an existing person's mutable metadata. */
+    def updatePerson(id: PersonId, req: UpdatePersonRequest): IO[AgentError, Person] =
+      for {
+        existing <- personRepo.findById(id).someOrFail(AgentError.NotFound("person", id.value))
+        updated   = existing.copy(
+                      displayName   = req.displayName.getOrElse(existing.displayName),
+                      timezone      = req.timezone.getOrElse(existing.timezone),
+                      defaultLocale = req.defaultLocale.orElse(existing.defaultLocale)
+                    )
+        _        <- personRepo.update(updated)
+        now      <- Clock.instant
+        _        <- audit("person.update", "person", Some(id.value), now)
+      } yield updated
+
     val listPersons: IO[AgentError, List[Person]] = personRepo.findAll
+
+    private def toInboxSummary(m: InboxMessage): InboxSummary =
+      InboxSummary(m.id, m.fromAddr, m.subject, m.receivedAt, m.triageStatus, m.attachments.size, m.threadId)
 
     // --- Commitments ---
 
@@ -715,8 +733,8 @@ object PersonService {
         pending  <- inboxRepo.countPending(ownerPersonId)
       } yield GmailSyncResult(fetched = ids.size, inserted = inserted, pending = pending)
 
-    def listInbox(ownerPersonId: PersonId, status: Option[String], limit: Int, oldestFirst: Boolean = false): IO[AgentError, List[InboxMessage]] =
-      requirePerson(ownerPersonId) *> inboxRepo.findAll(Some(ownerPersonId), status, limit, oldestFirst)
+    def listInbox(ownerPersonId: PersonId, status: Option[String], limit: Int, oldestFirst: Boolean = false): IO[AgentError, List[InboxSummary]] =
+      requirePerson(ownerPersonId) *> inboxRepo.findAll(Some(ownerPersonId), status, limit, oldestFirst).map(_.map(toInboxSummary))
 
     def getInbox(id: InboxMessageId): IO[AgentError, Option[InboxMessage]] =
       inboxRepo.findById(id)

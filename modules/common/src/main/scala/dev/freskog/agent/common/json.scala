@@ -219,5 +219,6 @@ object JsonCodecs {
   implicit val credentialCodec: JsonCodec[Credential]       = DeriveJsonCodec.gen[Credential]
   implicit val inboxAttachmentCodec: JsonCodec[InboxAttachment] = DeriveJsonCodec.gen[InboxAttachment]
   implicit val inboxMessageCodec: JsonCodec[InboxMessage]   = DeriveJsonCodec.gen[InboxMessage]
+  implicit val inboxSummaryCodec: JsonCodec[InboxSummary]   = DeriveJsonCodec.gen[InboxSummary]
   implicit val calendarEventCodec: JsonCodec[CalendarEvent] = DeriveJsonCodec.gen[CalendarEvent]
 }

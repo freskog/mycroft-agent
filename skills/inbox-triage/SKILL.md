@@ -79,9 +79,9 @@ context, not a substitute for durable state. See the `calendar` skill for detail
 | Signal in the item | Action |
 |-----------------------|--------|
 | An action the owner must take, with a deadline ("return the slip by Friday", "pay fees by the 30th") | `person commitment propose` (quote the ask as `--evidence`, infer `--due`) |
-| A dated event to attend / be aware of (parents' evening, exam, sports day, school closure) | `person event record --category observation` with the date in the note (or a commitment if the owner must actively prepare/respond) |
-| Multi-step durable outcome ("prepare and approve the Q3 report") | `person goal propose` with an observable `--outcome` + testable `--evidence-rule` |
-| Preference / context worth remembering long-term | `person event record --category observation` |
+| A dated event to attend / be aware of (parents' evening, exam, sports day, school closure) | `person event record --action <label> --category observation --text '…'` with the date in the text (or a commitment if the owner must actively prepare/respond) |
+| Multi-step durable outcome ("prepare and approve the Q3 report") | `person goal request` (gated — a human approves) with an observable `--outcome` + testable `--evidence-rule` |
+| Preference / context worth remembering long-term | `person event record --action <label> --category observation --text '…'` |
 | Genuinely actionable nothing — marketing, promotions, social/login notifications, receipts with no future action | `person inbox skip <inbox-id>` |
 
 ## Dedup is automatic — do NOT pre-check
@@ -102,14 +102,26 @@ person commitment propose --owner <owner> \
   --due 2026-05-25T17:00:00Z
 ```
 
-Goal (multi-step contract):
+Goal (multi-step contract — **gated**, requested not created):
 ```
-person goal propose --owner <owner> \
+person goal request --owner <owner> \
   --title 'Approve Q3 report' \
   --outcome 'Q3 report committed to main and acknowledged by stakeholders' \
   --evidence-rule 'Git commit on main + stakeholder confirmation email' \
-  --source email:gmail-msg-456
+  --source email:gmail-msg-456 --channel <channel>
 ```
+This creates a `goal.create` approval; the goal exists only once a human approves
+(see `goals`/`approvals`). Tell the owner it's awaiting approval; don't claim the
+goal was created.
+
+Observation (a dated event or durable fact — **events are not owner-scoped**: use
+`--action`/`--category`/`--text`, there is no `--owner`):
+```
+person event record --action obs.school.parents-evening --category observation \
+  --text 'Parents evening at St Kilians on 2026-06-20 18:00' \
+  --source email:gmail-msg-789
+```
+See the `events` skill for the full field reference.
 
 Mark triaged after acting:
 ```
@@ -153,7 +165,9 @@ written. Only download when the task actually needs the file's contents.
    action is often a PDF. Note it; download with `person inbox download` only if
    you must read its contents to extract the action.
 7. Attribute, don't route by scope. Set `--owner` to the household member the item
-   concerns (resolved via the household graph); there are no privacy scopes. If an
+   concerns on **commitments and goals** (resolved via the household graph); there
+   are no privacy scopes. Note `person event record` has **no `--owner`** — events
+   are keyed by `--action`/`--category`, not owner; put the person in the `--text`. If an
    email reveals a durable household fact (a new employer, a child's new school, a
    changed address), consider proposing the entity/relationship update too — follow
    the belief-revision rules in the `memory` / `onboarding` skills (resolve, then

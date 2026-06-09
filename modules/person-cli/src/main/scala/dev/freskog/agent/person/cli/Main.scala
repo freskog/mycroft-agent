@@ -19,6 +19,9 @@ object Main extends ZIOCliDefault {
     final case class PersonCreate(
       id: String, displayName: String, timezone: String, locale: Option[String]
     ) extends Cmd
+    final case class PersonUpdate(
+      id: String, displayName: Option[String], timezone: Option[String], locale: Option[String]
+    ) extends Cmd
     case object PersonList extends Cmd
 
     final case class CommitmentPropose(
@@ -365,9 +368,16 @@ object Main extends ZIOCliDefault {
       Options.text("timezone") ++ Options.text("locale").optional
   ).map { case (id, name, tz, locale) => Cmd.PersonCreate(id, name, tz, locale) }
 
+  // Update mutable metadata of an existing person (gateless). id is the slug.
+  private val personUpdate = Command(
+    "update",
+    Options.text("display-name").optional ++ Options.text("timezone").optional ++ Options.text("locale").optional,
+    Args.text("id")
+  ).map { case ((name, tz, locale), id) => Cmd.PersonUpdate(id, name, tz, locale) }
+
   private val personList = Command("list").map(_ => Cmd.PersonList)
 
-  private val personSub = Command("person").subcommands(personCreate, personList)
+  private val personSub = Command("person").subcommands(personCreate, personUpdate, personList)
 
   // --- top-level ---
   private val health = Command("health").map(_ => Cmd.Health)
@@ -398,6 +408,14 @@ object Main extends ZIOCliDefault {
         "defaultLocale" -> locale.toJson
       )
       HttpClient.post("/persons", body).flatMap(out => Console.printLine(out).orDie)
+
+    case Cmd.PersonUpdate(id, name, tz, locale) =>
+      val body = jsonObj(
+        "displayName"   -> name.toJson,
+        "timezone"      -> tz.toJson,
+        "defaultLocale" -> locale.toJson
+      )
+      HttpClient.post(s"/persons/$id", body).flatMap(out => Console.printLine(out).orDie)
 
     case Cmd.PersonList =>
       HttpClient.get("/persons").flatMap(out => Console.printLine(out).orDie)

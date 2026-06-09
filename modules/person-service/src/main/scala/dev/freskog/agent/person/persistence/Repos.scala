@@ -13,6 +13,7 @@ trait PersonRepo {
   def create(person: Person): IO[AgentError, Unit]
   def findAll: IO[AgentError, List[Person]]
   def findById(id: PersonId): IO[AgentError, Option[Person]]
+  def update(person: Person): IO[AgentError, Unit]
 }
 
 trait CommitmentRepo {
@@ -352,6 +353,12 @@ object Repos {
 
     def findById(id: PersonId): IO[AgentError, Option[Person]] =
       db.queryOne("SELECT * FROM persons WHERE id = ?", id)(extractPerson)
+
+    def update(p: Person): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE persons SET display_name = ?, timezone = ?, default_locale = ?, active = ? WHERE id = ?",
+        p.displayName, p.timezone, p.defaultLocale, if (p.active) 1 else 0, p.id
+      )
   }
 
   def sqliteCommitmentRepo(db: Sqlite): CommitmentRepo = new CommitmentRepo {

@@ -83,6 +83,11 @@ object Prompt {
        |Tool rules:
        |  - If a command fails, read the error and correct it (or run it with `--help`).
        |    NEVER repeat the same failing command — it will keep failing.
+       |  - Report honestly: if a command errored or you couldn't do something, say so —
+       |    never summarise a failed or skipped step as if it succeeded.
+       |  - For real computation (math, dates, parsing JSON/CSV, slicing big output),
+       |    write a small python3 snippet and run it via safe_run rather than guessing
+       |    (see the code-interpreter skill).
        |  - After a call or two, reply to the user with what you found.
        |Reasoning you emit is hidden from the user; your final assistant message is
        |the reply they see.

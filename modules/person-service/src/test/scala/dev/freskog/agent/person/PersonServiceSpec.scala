@@ -63,6 +63,21 @@ object PersonServiceSpec extends ZIOSpecDefault {
         )
       }
     },
+    test("update person changes given fields, leaves the rest, fails on unknown id") {
+      withService { svc =>
+        for {
+          updated <- svc.updatePerson(FredId, UpdatePersonRequest(timezone = Some("Europe/Dublin"), defaultLocale = Some("en-IE")))
+          fetched <- svc.listPersons.map(_.find(_.id == FredId))
+          missing <- svc.updatePerson(PersonId("nope"), UpdatePersonRequest(timezone = Some("UTC"))).either
+        } yield assertTrue(
+          updated.timezone == "Europe/Dublin",
+          updated.defaultLocale.contains("en-IE"),
+          updated.displayName.nonEmpty,                       // untouched field preserved
+          fetched.exists(_.timezone == "Europe/Dublin"),
+          missing.swap.toOption.exists(_.isInstanceOf[AgentError.NotFound])
+        )
+      }
+    },
     test("seeded goal is available and open") {
       withService { svc =>
         svc.listGoals(None, None).map(goals =>

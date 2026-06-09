@@ -477,6 +477,19 @@ case class InboxAttachment(
   sizeBytes: Long
 )
 
+/** Metadata-only inbox row for listings — no `bodyText` (read the full message
+ *  with `inbox show`). Keeps `inbox list` small enough not to flood the agent's
+ *  context. */
+case class InboxSummary(
+  id: InboxMessageId,
+  fromAddr: String,
+  subject: String,
+  receivedAt: Instant,
+  triageStatus: TriageStatus,
+  attachmentCount: Int,
+  threadId: Option[String]
+)
+
 case class InboxMessage(
   id: InboxMessageId,
   provider: String,

@@ -67,8 +67,11 @@ car, etc.). Don't design a calendar here — just record the facts.
 Work in this order so ids exist before they're referenced — don't go exploring:
 
 1. `person person list` and `person household` — see what already exists.
-2. **Create the people** with `person person create` (reuse existing ids like
-   `fred`/`paula`; pick lowercase slugs for new ones). Note each id.
+2. **Create or update the people.** New members: `person person create` (pick a
+   lowercase slug id). Someone who **already exists** (e.g. `fred`/`paula`) but has
+   the wrong timezone/locale/name: `person person update <id> --timezone … --locale …`
+   — do **not** `create` them again (duplicate id fails), and don't claim you
+   updated them unless the command succeeded. Note each id (the slug, not the name).
 3. **Propose the entities** (`person entity propose`); note the returned ids.
 4. **Propose the relationships** (`person relationship propose`) wiring the
    person/entity ids together (`spouse`, `parent_of`, `employed_by`, `attends`…).

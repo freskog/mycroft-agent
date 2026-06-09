@@ -382,9 +382,18 @@ object Main extends ZIOAppDefault {
     post(cfg.mycroftUrl + "/channels", body).unit
       .flatMap(_ => printLine(terminal, s"Registered channel '${cfg.channel}' (member=${cfg.as})."))
       .catchAll {
-        case t if isAlreadyExists(t) => printLine(terminal, s"Channel '${cfg.channel}' already registered.")
-        case t                       => printLine(terminal, s"channel register skipped: ${describe(t)}")
+        case t if isAlreadyExists(t)   => printLine(terminal, s"Channel '${cfg.channel}' already registered.")
+        case t if isUnknownPerson(t)   =>
+          printLine(terminal, s"Channel register failed: no person '${cfg.as}'. Pass --as <person-id> (a lowercase slug like 'fred', not a display name).")
+        case t                         => printLine(terminal, s"channel register skipped: ${describe(t)}")
       }
+  }
+
+  /** A channel_members insert that hit a FK violation — the `--as` person id
+   *  doesn't exist (usually a display name was passed instead of the slug). */
+  private def isUnknownPerson(t: Throwable): Boolean = {
+    val m = Option(t.getMessage).getOrElse("")
+    m.contains("FOREIGN KEY") || m.contains("channel_members")
   }
 
   private def sendInbound(cfg: Cfg, content: String): Task[String] = {

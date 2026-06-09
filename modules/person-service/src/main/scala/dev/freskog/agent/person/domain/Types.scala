@@ -74,6 +74,17 @@ object CreatePersonRequest {
   implicit val codec: JsonCodec[CreatePersonRequest] = DeriveJsonCodec.gen[CreatePersonRequest]
 }
 
+/** Partial update of an existing person's mutable metadata; `id` comes from the
+ *  path. Absent fields are left unchanged. Gateless (low-risk, reversible). */
+case class UpdatePersonRequest(
+  displayName: Option[String] = None,
+  timezone: Option[String] = None,
+  defaultLocale: Option[String] = None
+)
+object UpdatePersonRequest {
+  implicit val codec: JsonCodec[UpdatePersonRequest] = DeriveJsonCodec.gen[UpdatePersonRequest]
+}
+
 case class ProposeGoalRequest(
   ownerPersonId: PersonId,
   title: String,

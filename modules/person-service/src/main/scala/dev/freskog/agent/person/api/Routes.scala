@@ -30,6 +30,9 @@ object Routes {
       Method.POST / "persons" -> handler { (req: Request) =>
         handlePost[CreatePersonRequest, Person](req)(service.createPerson)
       },
+      Method.POST / "persons" / string("id") -> handler { (id: String, req: Request) =>
+        handlePost[UpdatePersonRequest, Person](req)(r => service.updatePerson(PersonId(id), r))
+      },
 
       // --- household graph: entities ---
       Method.POST / "entities" / "propose" -> handler { (req: Request) =>

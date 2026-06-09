@@ -64,7 +64,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     util-linux \
     bash \
-    && rm -rf /var/lib/apt/lists/*
+    python3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/python3 /usr/local/bin/python
 
 COPY --from=builder /out/ /usr/local/bin/
 
