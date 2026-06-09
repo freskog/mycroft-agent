@@ -10,7 +10,8 @@ import dev.freskog.agent.person.calendar._
 import zio._
 import zio.json._
 
-import java.time.Instant
+import java.security.{MessageDigest, SecureRandom}
+import java.time.{Duration, Instant}
 import java.util.UUID
 
 trait PersonService {
@@ -22,14 +23,24 @@ trait PersonService {
   def listMemory(personId: Option[PersonId], status: Option[String], kind: Option[String]): IO[AgentError, List[MemoryItem]]
   def requestApproval(req: RequestApprovalRequest): IO[AgentError, Approval]
   def listApprovals(status: Option[String]): IO[AgentError, List[Approval]]
+  def getApproval(id: ApprovalId): IO[AgentError, Option[Approval]]
+  /** Mint a fresh one-time decision code for a pending approval and return the
+   *  plaintext (only its hash is stored). Served on the PRIVATE interface only —
+   *  the agent cannot reach it, so it never obtains a code. Reissues (invalidating
+   *  any prior code) so the latest notification always carries a working code. */
+  def issueDecisionCode(id: ApprovalId): IO[AgentError, String]
+  /** A human approves or rejects a pending approval. On approve the privileged
+   *  action executes server-side, the result is recorded, and an `executed` event
+   *  is emitted. Idempotent — re-approving an already-executed approval returns the
+   *  stored result. This is the trusted human action — never the agent. */
+  def decideApproval(id: ApprovalId, req: DecideApprovalRequest): IO[AgentError, Approval]
   def proposeGoal(req: ProposeGoalRequest): IO[AgentError, Goal]
   def listGoals(owner: Option[PersonId], status: Option[String]): IO[AgentError, List[Goal]]
   def getGoal(id: GoalId): IO[AgentError, Option[GoalWithEvidence]]
   def updateGoalStatus(id: GoalId, req: UpdateGoalStatusRequest): IO[AgentError, Goal]
   def appendGoalEvidence(id: GoalId, req: AppendGoalEvidenceRequest): IO[AgentError, GoalEvidence]
 
-  // Memory lifecycle
-  def acceptMemory(id: MemoryId): IO[AgentError, MemoryItem]
+  // Memory lifecycle (gateless: facts are written accepted; these are corrections)
   def rejectMemory(id: MemoryId, reason: Option[String]): IO[AgentError, MemoryItem]
   def archiveMemory(id: MemoryId): IO[AgentError, MemoryItem]
   def supersedeMemory(newId: MemoryId, oldId: MemoryId): IO[AgentError, MemoryItem]
@@ -43,9 +54,8 @@ trait PersonService {
    *  into every turn regardless of recency. */
   def profileFacts(limit: Int): IO[AgentError, List[MemoryItem]]
 
-  // Household graph: entities + relationships (propose -> accept lifecycle)
+  // Household graph: entities + relationships (gateless write; reject/supersede correct)
   def proposeEntity(req: ProposeEntityRequest): IO[AgentError, Entity]
-  def acceptEntity(id: EntityId): IO[AgentError, Entity]
   def rejectEntity(id: EntityId, reason: Option[String]): IO[AgentError, Entity]
   def supersedeEntity(newId: EntityId, oldId: EntityId): IO[AgentError, Entity]
   def listEntities(kind: Option[String], status: Option[String]): IO[AgentError, List[Entity]]
@@ -53,21 +63,11 @@ trait PersonService {
   def resolveEntities(name: String): IO[AgentError, List[Entity]]
 
   def proposeRelationship(req: ProposeRelationshipRequest): IO[AgentError, Relationship]
-  def acceptRelationship(id: RelationshipId): IO[AgentError, Relationship]
   def rejectRelationship(id: RelationshipId, reason: Option[String]): IO[AgentError, Relationship]
   def supersedeRelationship(newId: RelationshipId, oldId: RelationshipId): IO[AgentError, Relationship]
   def listRelationships(fromId: Option[String], toId: Option[String], relType: Option[String], status: Option[String], asOf: Option[Instant]): IO[AgentError, List[Relationship]]
   /** Accepted, currently-active household graph for context injection. */
   def household: IO[AgentError, HouseholdGraph]
-
-  /** Items awaiting human review (proposed memory, entities, relationships),
-   *  narrowed by `source` prefix, `nodeType` (memory|entity|relationship) and
-   *  `kind`. A `kind` filter excludes relationships (they have no kind). */
-  def pending(sourcePrefix: Option[String], nodeType: Option[String], kind: Option[String]): IO[AgentError, PendingProposals]
-  /** Accept proposals: if `ids` is non-empty, accept exactly those (resolved
-   *  across types); otherwise accept everything matching the
-   *  `source`/`nodeType`/`kind` filters. Returns per-type counts. */
-  def acceptAll(sourcePrefix: Option[String], nodeType: Option[String], kind: Option[String], ids: List[String]): IO[AgentError, AcceptAllResult]
 
   // Generic event log
   def logEvent(req: LogEventRequest): IO[AgentError, AuditEvent]
@@ -119,7 +119,9 @@ object PersonService {
     channelMemberRepo: ChannelMemberRepo,
     messageRepo: MessageRepo,
     credentialRepo: CredentialRepo,
-    inboxRepo: InboxMessageRepo
+    inboxRepo: InboxMessageRepo,
+    approvalHub: Hub[ApprovalEvent],
+    decisionCodeTtl: Duration = Duration.ofHours(48)
   ): PersonService = new PersonService {
 
     // --- Persons ---
@@ -168,7 +170,7 @@ object PersonService {
         m    = MemoryItem(
                  id = MemoryId(newUuid),
                  personId = req.personId,
-                 status = MemoryStatus.Proposed, kind = req.kind,
+                 status = MemoryStatus.Accepted, kind = req.kind,
                  text = req.text, source = req.source, confidence = req.confidence,
                  createdAt = now, updatedAt = now,
                  validFrom = req.validFrom, validUntil = req.validUntil,
@@ -181,7 +183,6 @@ object PersonService {
     def listMemory(personId: Option[PersonId], status: Option[String], kind: Option[String]): IO[AgentError, List[MemoryItem]] =
       memoryRepo.findAll(personId, status, kind)
 
-    def acceptMemory(id: MemoryId): IO[AgentError, MemoryItem]              = transitionMemory(id, MemoryStatus.Accepted, "memory.accept", None)
     def rejectMemory(id: MemoryId, reason: Option[String]): IO[AgentError, MemoryItem] =
       transitionMemory(id, MemoryStatus.Rejected, "memory.reject", reason)
     def archiveMemory(id: MemoryId): IO[AgentError, MemoryItem]             = transitionMemory(id, MemoryStatus.Archived, "memory.archive", None)
@@ -255,7 +256,7 @@ object PersonService {
         now <- Clock.instant
         e    = Entity(
                  id = EntityId(newUuid), kind = req.kind, name = req.name,
-                 attributesJson = req.attributesJson, status = MemoryStatus.Proposed,
+                 attributesJson = req.attributesJson, status = MemoryStatus.Accepted,
                  source = req.source, confidence = req.confidence,
                  supersededById = None, createdAt = now, updatedAt = now
                )
@@ -263,7 +264,6 @@ object PersonService {
         _   <- audit("entity.propose", "entity", Some(e.id.value), now)
       } yield e
 
-    def acceptEntity(id: EntityId): IO[AgentError, Entity]                     = transitionEntity(id, MemoryStatus.Accepted, "entity.accept", None)
     def rejectEntity(id: EntityId, reason: Option[String]): IO[AgentError, Entity] = transitionEntity(id, MemoryStatus.Rejected, "entity.reject", reason)
 
     private def transitionEntity(id: EntityId, to: MemoryStatus, action: String, reason: Option[String]): IO[AgentError, Entity] =
@@ -302,7 +302,7 @@ object PersonService {
         r    = Relationship(
                  id = RelationshipId(newUuid), fromId = req.fromId, fromKind = req.fromKind,
                  relType = req.relType, toId = req.toId, toKind = req.toKind,
-                 status = MemoryStatus.Proposed, source = req.source, confidence = req.confidence,
+                 status = MemoryStatus.Accepted, source = req.source, confidence = req.confidence,
                  note = req.note, supersededById = None,
                  validFrom = req.validFrom, validUntil = req.validUntil,
                  createdAt = now, updatedAt = now
@@ -311,7 +311,6 @@ object PersonService {
         _   <- audit("relationship.propose", "relationship", Some(r.id.value), now)
       } yield r
 
-    def acceptRelationship(id: RelationshipId): IO[AgentError, Relationship]                     = transitionRelationship(id, MemoryStatus.Accepted, "relationship.accept", None)
     def rejectRelationship(id: RelationshipId, reason: Option[String]): IO[AgentError, Relationship] = transitionRelationship(id, MemoryStatus.Rejected, "relationship.reject", reason)
 
     private def transitionRelationship(id: RelationshipId, to: MemoryStatus, action: String, reason: Option[String]): IO[AgentError, Relationship] =
@@ -343,68 +342,6 @@ object PersonService {
         rels   <- relationshipRepo.findAll(None, None, None, Some("accepted"), Some(now))
       } yield HouseholdGraph(ents, rels)
 
-    def pending(sourcePrefix: Option[String], nodeType: Option[String], kind: Option[String]): IO[AgentError, PendingProposals] =
-      validNodeType(nodeType) *> {
-        val wants = (t: String) => nodeType.forall(_ == t)
-        for {
-          mem  <- if (wants("memory")) memoryRepo.findAll(None, Some("proposed"), kind) else ZIO.succeed(List.empty[MemoryItem])
-          ents <- if (wants("entity")) entityRepo.findAll(kind, Some("proposed")) else ZIO.succeed(List.empty[Entity])
-          // Relationships have no `kind`, so a kind filter excludes them.
-          rels <- if (wants("relationship") && kind.isEmpty) relationshipRepo.findAll(None, None, None, Some("proposed"), None)
-                  else ZIO.succeed(List.empty[Relationship])
-        } yield PendingProposals(
-          memory        = mem.filter(m => sourceMatches(m.source, sourcePrefix)),
-          entities      = ents.filter(e => sourceMatches(e.source, sourcePrefix)),
-          relationships = rels.filter(r => sourceMatches(r.source, sourcePrefix))
-        )
-      }
-
-    def acceptAll(sourcePrefix: Option[String], nodeType: Option[String], kind: Option[String], ids: List[String]): IO[AgentError, AcceptAllResult] =
-      if (ids.nonEmpty)
-        ZIO.foreach(ids)(acceptById).map { kinds =>
-          AcceptAllResult(
-            memory        = kinds.count(_ == "memory"),
-            entities      = kinds.count(_ == "entity"),
-            relationships = kinds.count(_ == "relationship")
-          )
-        }
-      else
-        for {
-          proposals <- pending(sourcePrefix, nodeType, kind)
-          _         <- ZIO.foreachDiscard(proposals.memory)(m => acceptMemory(m.id))
-          _         <- ZIO.foreachDiscard(proposals.entities)(e => acceptEntity(e.id))
-          _         <- ZIO.foreachDiscard(proposals.relationships)(r => acceptRelationship(r.id))
-        } yield AcceptAllResult(proposals.memory.size, proposals.entities.size, proposals.relationships.size)
-
-    /** Accept one proposal by id, resolving its type across the three stores.
-     *  Returns the type name accepted; fails if the id matches nothing. */
-    private def acceptById(id: String): IO[AgentError, String] =
-      memoryRepo.findById(MemoryId(id)).flatMap {
-        case Some(_) => acceptMemory(MemoryId(id)).as("memory")
-        case None    =>
-          entityRepo.findById(EntityId(id)).flatMap {
-            case Some(_) => acceptEntity(EntityId(id)).as("entity")
-            case None    =>
-              relationshipRepo.findById(RelationshipId(id)).flatMap {
-                case Some(_) => acceptRelationship(RelationshipId(id)).as("relationship")
-                case None    => ZIO.fail(AgentError.NotFound("proposal", id))
-              }
-          }
-      }
-
-    private val NodeTypes = Set("memory", "entity", "relationship")
-    private def validNodeType(nodeType: Option[String]): IO[AgentError, Unit] =
-      nodeType match {
-        case Some(t) if !NodeTypes.contains(t) =>
-          ZIO.fail(AgentError.BadRequest(s"unknown --type '$t'; expected one of ${NodeTypes.mkString(", ")}"))
-        case _ => ZIO.unit
-      }
-
-    /** A `None` prefix matches everything; otherwise the item's source must start
-     *  with the prefix (e.g. `onboarding:` matches `onboarding:children`). */
-    private def sourceMatches(source: String, prefix: Option[String]): Boolean =
-      prefix.forall(p => source.startsWith(p))
-
     private def requireRelationship(id: RelationshipId): IO[AgentError, Relationship] =
       relationshipRepo.findById(id).someOrFail(AgentError.NotFound("relationship", id.value))
 
@@ -421,23 +358,148 @@ object PersonService {
       conf * recency
     }
 
-    // --- Approvals ---
+    // --- Approvals (HITL gate) ---
 
+    /** Idempotent propose: an open (requested/approved, not-yet-executed) approval
+     *  for the same requester + action + payload is reused, so the agent
+     *  re-proposing the same action doesn't pile up duplicates. Emits `requested`
+     *  on the event stream so subscribed clients can surface it. */
     def requestApproval(req: RequestApprovalRequest): IO[AgentError, Approval] =
-      for {
-        now <- Clock.instant
-        a    = Approval(ApprovalId(newUuid), req.requestedBy, req.requiredPersonId,
-                        req.actionType, req.payloadJson, ApprovalStatus.Requested, now, None)
-        _   <- approvalRepo.create(a)
-        _   <- auditPayloadRaw(
-                 actor = req.requestedBy, action = "approval.request",
-                 targetType = "approval", targetId = Some(a.id.value),
-                 now = now, payloadJson = req.payloadJson
-               )
-      } yield a
+      approvalRepo.findApprovable(req.requestedBy, req.actionType, req.payloadJson).flatMap {
+        case Some(existing) => ZIO.succeed(existing)
+        case None =>
+          for {
+            now <- Clock.instant
+            a    = Approval(
+                     ApprovalId(newUuid), req.requestedBy, req.requiredPersonId,
+                     req.actionType, req.payloadJson, ApprovalStatus.Requested, now, None,
+                     continuationSkill = req.continuationSkill,
+                     continuationParams = req.continuationParams,
+                     channel = req.channel
+                   )
+            _   <- approvalRepo.create(a)
+            _   <- auditPayloadRaw(
+                     actor = req.requestedBy, action = "approval.request",
+                     targetType = "approval", targetId = Some(a.id.value),
+                     now = now, payloadJson = req.payloadJson
+                   )
+            _   <- approvalHub.publish(ApprovalEvent("requested", a)).unit
+          } yield a
+      }
 
     def listApprovals(status: Option[String]): IO[AgentError, List[Approval]] =
       approvalRepo.findAll(status)
+
+    def getApproval(id: ApprovalId): IO[AgentError, Option[Approval]] =
+      approvalRepo.findById(id)
+
+    /** The human's decision. On approve, the action executes server-side
+     *  immediately (person-service holds the credentials; the agent never does),
+     *  the result is recorded, and `executed` is emitted (carrying the result +
+     *  any continuation) so mycroft can run the saga's next step. On reject, only
+     *  the status changes. Re-approving an already-executed approval is a no-op
+     *  that returns the stored result. */
+    def decideApproval(id: ApprovalId, req: DecideApprovalRequest): IO[AgentError, Approval] =
+      requireApproval(id).flatMap { a =>
+        // Idempotent: already executed — return the recorded result unchanged.
+        if (a.executedAt.isDefined) ZIO.succeed(a)
+        else
+          for {
+            _   <- ZIO.when(a.status != ApprovalStatus.Requested)(
+                     ZIO.fail(AgentError.BadRequest(
+                       s"approval ${id.value} is already ${ApprovalStatus.asString(a.status)}; only a requested approval can be decided")))
+            _   <- a.requiredPersonId match {
+                     case Some(required) if !req.decidedBy.contains(required) =>
+                       ZIO.fail(AgentError.BadRequest(
+                         s"approval ${id.value} must be decided by ${required.value}"))
+                     case _ => ZIO.unit
+                   }
+            // The gate: a valid, unexpired, unused one-time code the agent never saw.
+            _   <- verifyAndConsumeCode(id, req.code)
+            now <- Clock.instant
+            updated <-
+              if (req.approve)
+                for {
+                  _      <- approvalRepo.decide(id, ApprovalStatus.Approved, req.decidedBy, now)
+                  result <- performApproved(a)
+                  doneAt <- Clock.instant
+                  _      <- approvalRepo.markExecuted(id, result, doneAt)
+                  _      <- auditPayload("approval.approved", "approval", Some(id.value), now, StatusChangePayload(req.reason))
+                  _      <- auditPayloadRaw("agent", "approval.executed", "approval", Some(id.value), doneAt, result)
+                  done   <- requireApproval(id)
+                  _      <- approvalHub.publish(ApprovalEvent("executed", done)).unit
+                } yield done
+              else
+                for {
+                  _    <- approvalRepo.decide(id, ApprovalStatus.Rejected, req.decidedBy, now)
+                  _    <- auditPayload("approval.rejected", "approval", Some(id.value), now, StatusChangePayload(req.reason))
+                  done <- requireApproval(id)
+                  _    <- approvalHub.publish(ApprovalEvent("rejected", done)).unit
+                } yield done
+          } yield updated
+      }
+
+    def issueDecisionCode(id: ApprovalId): IO[AgentError, String] =
+      for {
+        a    <- requireApproval(id)
+        _    <- ZIO.when(a.status != ApprovalStatus.Requested || a.executedAt.isDefined)(
+                  ZIO.fail(AgentError.BadRequest(s"approval ${id.value} is not awaiting a decision")))
+        now  <- Clock.instant
+        code  = newCode()
+        _    <- approvalRepo.putCode(id, hashCode(code), now.plus(decisionCodeTtl))
+      } yield code
+
+    /** Verify the one-time code and consume it. Constant-time compare; rejects
+     *  expired/used/missing/mismatched codes. The agent never holds a code, so this
+     *  is what blocks it from deciding even if it can reach the endpoint. */
+    private def verifyAndConsumeCode(id: ApprovalId, code: String): IO[AgentError, Unit] =
+      for {
+        now    <- Clock.instant
+        stored <- approvalRepo.findCode(id)
+        _      <- stored match {
+                    case Some(c) if c.usedAt.isEmpty && c.expiresAt.isAfter(now) && constantTimeEquals(hashCode(code), c.codeHash) =>
+                      approvalRepo.markCodeUsed(id, now)
+                    case _ =>
+                      ZIO.fail(AgentError.Validation(s"invalid, expired, or already-used decision code for approval ${id.value}"))
+                  }
+      } yield ()
+
+    /** Dispatch an approved action to its privileged executor. The authoritative
+     *  payload is the one stored on the approval (immutable post-request), so no
+     *  agent-supplied argument can redefine what was approved. New action types
+     *  register here. `approval.ping` is a no-op echo for testing the full loop
+     *  without external scopes; `goal.create` records a durable goal (the agent
+     *  can only ever propose one — creation is gated through here). */
+    private def performApproved(a: Approval): IO[AgentError, String] =
+      a.actionType match {
+        case "approval.ping" =>
+          ZIO.succeed(s"""{"executed":"approval.ping","payload":${a.payloadJson}}""")
+        case "goal.create" =>
+          ZIO.fromEither(a.payloadJson.fromJson[ProposeGoalRequest])
+            .mapError(e => AgentError.BadRequest(s"goal.create payload: $e"))
+            .flatMap(proposeGoal)
+            .map(_.toJson)
+        case other =>
+          ZIO.fail(AgentError.BadRequest(s"no executor registered for action_type '$other'"))
+      }
+
+    private def requireApproval(id: ApprovalId): IO[AgentError, Approval] =
+      approvalRepo.findById(id).someOrFail(AgentError.NotFound("approval", id.value))
+
+    // --- One-time decision code crypto ---
+    private val codeRng = new SecureRandom()
+    /** 128-bit random, hex. Machine-echoed (repl) or carried in a push, not typed. */
+    private def newCode(): String = {
+      val bytes = new Array[Byte](16)
+      codeRng.nextBytes(bytes)
+      bytes.map(b => f"${b & 0xff}%02x").mkString
+    }
+    private def hashCode(code: String): String = {
+      val md = MessageDigest.getInstance("SHA-256")
+      md.digest(code.getBytes("UTF-8")).map(b => f"${b & 0xff}%02x").mkString
+    }
+    private def constantTimeEquals(a: String, b: String): Boolean =
+      MessageDigest.isEqual(a.getBytes("UTF-8"), b.getBytes("UTF-8"))
 
     // --- Goals ---
 
@@ -551,7 +613,7 @@ object PersonService {
       val item = MemoryItem(
         id = MemoryId(newUuid),
         personId = None,
-        status = MemoryStatus.Proposed, kind = MemoryKind.Fact,
+        status = MemoryStatus.Accepted, kind = MemoryKind.Fact,
         text = e.text.getOrElse(e.payloadJson),
         source = s"event:${e.id.value}", confidence = Some(DefaultConfidence),
         createdAt = now, updatedAt = now,

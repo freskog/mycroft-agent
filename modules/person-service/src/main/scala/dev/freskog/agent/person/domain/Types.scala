@@ -38,10 +38,30 @@ case class RequestApprovalRequest(
   requestedBy: String,
   requiredPersonId: Option[PersonId],
   actionType: String,
-  payloadJson: String
+  payloadJson: String,
+  // Optional saga link: the skill (+ params) mycroft runs once this action
+  // executes, letting a gated multi-step workflow resume from durable state.
+  continuationSkill: Option[String] = None,
+  continuationParams: Option[String] = None,
+  // The conversation this arose from; the continuation/notification turn runs here.
+  channel: Option[String] = None
 )
 object RequestApprovalRequest {
   implicit val codec: JsonCodec[RequestApprovalRequest] = DeriveJsonCodec.gen[RequestApprovalRequest]
+}
+
+/** A human's decision on a pending approval. `code` is the one-time decision code
+ *  the human received out-of-band (never visible to the agent); it is the gate.
+ *  `decidedBy` records who (validated against `requiredPersonId` when set);
+ *  `approve=false` rejects. This is the trusted human action — never the agent. */
+case class DecideApprovalRequest(
+  code: String,
+  decidedBy: Option[PersonId] = None,
+  approve: Boolean,
+  reason: Option[String] = None
+)
+object DecideApprovalRequest {
+  implicit val codec: JsonCodec[DecideApprovalRequest] = DeriveJsonCodec.gen[DecideApprovalRequest]
 }
 
 case class CreatePersonRequest(
@@ -249,31 +269,3 @@ object ConsolidatePayload {
   implicit val codec: JsonCodec[ConsolidatePayload] = DeriveJsonCodec.gen[ConsolidatePayload]
 }
 
-/** Everything awaiting human review, grouped by type. Backs `GET /pending`. */
-case class PendingProposals(
-  memory: List[MemoryItem],
-  entities: List[Entity],
-  relationships: List[Relationship]
-)
-object PendingProposals {
-  implicit val codec: JsonCodec[PendingProposals] = DeriveJsonCodec.gen[PendingProposals]
-}
-
-/** Selection for `POST /accept-all`. `ids` (explicit subset) takes precedence;
- *  otherwise everything proposed is accepted, narrowed by `source` prefix,
- *  `type` (memory|entity|relationship) and `kind`. */
-case class AcceptAllRequest(
-  source: Option[String] = None,
-  @jsonField("type") nodeType: Option[String] = None,
-  kind: Option[String] = None,
-  ids: Option[List[String]] = None
-)
-object AcceptAllRequest {
-  implicit val codec: JsonCodec[AcceptAllRequest] = DeriveJsonCodec.gen[AcceptAllRequest]
-}
-
-/** Per-type counts of items accepted by `POST /accept-all`. */
-case class AcceptAllResult(memory: Int, entities: Int, relationships: Int)
-object AcceptAllResult {
-  implicit val codec: JsonCodec[AcceptAllResult] = DeriveJsonCodec.gen[AcceptAllResult]
-}

@@ -239,7 +239,30 @@ object Migrations {
 
     // Source lookup for idempotent propose-by-source (dedup as a tool guarantee)
     "CREATE INDEX IF NOT EXISTS idx_commitments_source ON commitments(owner_person_id, source)",
-    "CREATE INDEX IF NOT EXISTS idx_goals_source ON goals(owner_person_id, source)"
+    "CREATE INDEX IF NOT EXISTS idx_goals_source ON goals(owner_person_id, source)",
+
+    // V6: HITL approval lifecycle — who decided, when the action executed (on
+    // approval), the recorded result (so re-approve is idempotent), and an
+    // optional saga continuation (skill + params run once the action executes).
+    "ALTER TABLE approvals ADD COLUMN decided_by TEXT",
+    "ALTER TABLE approvals ADD COLUMN executed_at TEXT",
+    "ALTER TABLE approvals ADD COLUMN result_json TEXT",
+    "ALTER TABLE approvals ADD COLUMN continuation_skill TEXT",
+    "ALTER TABLE approvals ADD COLUMN continuation_params TEXT",
+    "ALTER TABLE approvals ADD COLUMN channel TEXT",
+
+    // V7: one-time decision codes. The plaintext code is delivered ONLY to the
+    // human (private code endpoint / client push) and never stored or exposed on
+    // any agent-readable surface — we keep just its hash here. Deciding requires
+    // echoing the code back, so the agent (which never sees it) cannot self-approve.
+    // One active code per approval (rotated on reissue).
+    """CREATE TABLE IF NOT EXISTS approval_codes (
+      |  approval_id TEXT PRIMARY KEY,
+      |  code_hash TEXT NOT NULL,
+      |  expires_at TEXT NOT NULL,
+      |  used_at TEXT,
+      |  FOREIGN KEY (approval_id) REFERENCES approvals(id)
+      |)""".stripMargin
   )
 
   def migrate(db: Sqlite): IO[dev.freskog.agent.common.AgentError, Unit] =

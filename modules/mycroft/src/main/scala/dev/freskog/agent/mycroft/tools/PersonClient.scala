@@ -6,9 +6,12 @@ import dev.freskog.agent.common.JsonCodecs._
 import zio._
 import zio.json._
 import zio.json.ast.Json
+import zio.stream.ZStream
 
+import java.io.{BufferedReader, InputStreamReader}
 import java.net.URI
 import java.net.http.{HttpClient => JHttpClient, HttpRequest, HttpResponse}
+import java.nio.charset.StandardCharsets
 import java.time.Instant
 
 /** Small typed HTTP client for mycroft's own bookkeeping against person-service:
@@ -26,6 +29,9 @@ trait PersonClient {
   def appendMessage(channelId: ChannelId, role: MessageRole, from: Option[PersonId], content: String, toolCallsJson: Option[String], externalId: Option[String]): IO[AgentError, Message]
   def listMessages(channelId: ChannelId, since: Option[Instant], limit: Int): IO[AgentError, List[Message]]
   def logEvent(actor: String, action: String, category: String, text: Option[String], payloadJson: Option[String]): IO[AgentError, Unit]
+  /** Subscribe to person-service's approval-lifecycle SSE stream. The stream ends
+   *  on connection close (the caller is expected to retry/reconnect). */
+  def subscribeApprovals(person: Option[PersonId]): ZStream[Any, AgentError, ApprovalEvent]
 }
 
 object PersonClient {
@@ -100,6 +106,41 @@ object PersonClient {
       ).toJson
       post("/events", body).unit
     }
+
+    def subscribeApprovals(person: Option[PersonId]): ZStream[Any, AgentError, ApprovalEvent] = {
+      val query = person.map(p => s"?person=${enc(p.value)}").getOrElse("")
+      val request = HttpRequest.newBuilder()
+        .uri(URI.create(s"$baseUrl/approvals/stream$query"))
+        .GET().header("Accept", "text/event-stream").build()
+      ZStream.unwrapScoped {
+        ZIO.acquireRelease(
+          ZIO.attemptBlocking(client.send(request, HttpResponse.BodyHandlers.ofInputStream()).body())
+            .mapError(t => AgentError.HttpFailed(s"GET /approvals/stream: ${errMsg(t)}", Some(t)))
+        )(is => ZIO.attempt(is.close()).ignore).map { is =>
+          val reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))
+          // Each SSE frame's `data:` line is the full ApprovalEvent JSON; the
+          // `event:`/`: comment` lines are skipped. EOF ends the stream.
+          ZStream.repeatZIOOption {
+            ZIO.attemptBlocking(Option(nextDataLine(reader)))
+              .mapError(t => Option(AgentError.HttpFailed(s"reading approvals stream: ${errMsg(t)}", Some(t))))
+              .flatMap {
+                case None       => ZIO.fail(None)
+                case Some(json) => ZIO.fromEither(json.fromJson[ApprovalEvent])
+                                     .mapError(e => Option(AgentError.DecodeFailed(s"approval event: $e")))
+              }
+          }
+        }
+      }
+    }
+
+    /** Read forward to the next `data:` line and return its payload, or null at EOF. */
+    private def nextDataLine(reader: BufferedReader): String = {
+      var line = reader.readLine()
+      while (line != null && !line.startsWith("data:")) line = reader.readLine()
+      if (line == null) null else line.stripPrefix("data:").trim
+    }
+
+    private def errMsg(t: Throwable): String = Option(t.getMessage).getOrElse(t.getClass.getSimpleName)
 
     // --- HTTP plumbing ---
 

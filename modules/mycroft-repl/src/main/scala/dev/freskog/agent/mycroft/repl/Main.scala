@@ -1,5 +1,8 @@
 package dev.freskog.agent.mycroft.repl
 
+import dev.freskog.agent.common.ApprovalEvent
+import dev.freskog.agent.common.JsonCodecs._
+
 import zio._
 import zio.json._
 import zio.json.ast.Json
@@ -25,7 +28,7 @@ import java.util.concurrent.Executors
  *  The two phases never overlap, so there is a single terminal writer at a time. */
 object Main extends ZIOAppDefault {
 
-  final case class Cfg(channel: String, as: String, mycroftUrl: String, personServiceUrl: String, register: Boolean)
+  final case class Cfg(channel: String, as: String, mycroftUrl: String, personServiceUrl: String, personServicePrivateUrl: String, register: Boolean)
   final case class Ev(event: String, json: Option[Json])
 
   /** A LineReader that summarises bracketed pastes. While editing, a multi-line
@@ -61,6 +64,9 @@ object Main extends ZIOAppDefault {
 
   private val defaultUrl: String = sys.env.getOrElse("MYCROFT_URL", "http://127.0.0.1:8090")
   private val defaultPersonUrl: String = sys.env.getOrElse("PERSON_SERVICE_URL", "http://127.0.0.1:8080")
+  // The private decision endpoint. Falls back to the public URL for local dev
+  // (where person-service serves decide on the public interface).
+  private val defaultPersonPrivateUrl: String = sys.env.getOrElse("PERSON_SERVICE_PRIVATE_URL", defaultPersonUrl)
   private val maxTurnSeconds: Int = sys.env.getOrElse("MYCROFT_MAX_TURN_SECONDS", "240").toIntOption.getOrElse(240)
 
   // Daemon-threaded HTTP/1.1 client: daemon threads can't keep the JVM alive
@@ -90,7 +96,7 @@ object Main extends ZIOAppDefault {
         case "--person-service-url" :: v :: t => go(t, channel, as, url, v, register)
         case "--register" :: t             => go(t, channel, as, url, personUrl, register = true)
         case _ :: t                         => go(t, channel, as, url, personUrl, register)
-        case Nil                             => Cfg(channel.getOrElse("repl"), as, url, personUrl, register)
+        case Nil                             => Cfg(channel.getOrElse("repl"), as, url, personUrl, defaultPersonPrivateUrl, register)
       }
     go(args, None, "fred", defaultUrl, defaultPersonUrl, register = false)
   }
@@ -106,6 +112,7 @@ object Main extends ZIOAppDefault {
       queue    <- Queue.unbounded[Ev]
       _        <- ZIO.when(cfg.register)(registerChannel(cfg, terminal))
       _        <- streamEvents(cfg, queue, rt).forkScoped
+      _        <- streamApprovals(cfg, terminal).forkScoped
       _        <- printLine(terminal, s"Connected to ${cfg.mycroftUrl} on channel '${cfg.channel}' as '${cfg.as}'. Ctrl-D twice to quit.")
       _        <- loop(cfg, terminal, reader, queue, lastWasEof = false)
     } yield ()
@@ -137,6 +144,14 @@ object Main extends ZIOAppDefault {
         else if (trimmed == "exit" || trimmed == "quit") printLine(terminal, "bye")
         else if (trimmed == "/triage" || trimmed.startsWith("/triage "))
           runTriage(cfg, terminal, reader, queue, trimmed) *> loop(cfg, terminal, reader, queue, lastWasEof = false)
+        else if (trimmed == "/approvals")
+          listApprovals(cfg, terminal) *> loop(cfg, terminal, reader, queue, lastWasEof = false)
+        else if (trimmed.startsWith("/approve "))
+          decideApproval(cfg, terminal, queue, trimmed.stripPrefix("/approve ").trim, approve = true) *>
+            loop(cfg, terminal, reader, queue, lastWasEof = false)
+        else if (trimmed.startsWith("/reject "))
+          decideApproval(cfg, terminal, queue, trimmed.stripPrefix("/reject ").trim, approve = false) *>
+            loop(cfg, terminal, reader, queue, lastWasEof = false)
         else
           for {
             turnId <- sendInbound(cfg, input).catchAll(t => printLine(terminal, s"send failed: ${describe(t)}").as(""))
@@ -446,6 +461,118 @@ object Main extends ZIOAppDefault {
     }(closeQuietly(is))
 
   private def closeQuietly(is: InputStream): UIO[Unit] = ZIO.attempt(is.close()).ignore
+
+  // --- approvals (person-service) ---
+
+  /** Subscribe to person-service's approval stream and surface `requested`
+   *  prompts to the user. `executed` arrives separately as a normal continuation
+   *  turn over the mycroft SSE, so it isn't printed here. */
+  private def streamApprovals(cfg: Cfg, terminal: Terminal): Task[Unit] =
+    ZIO.acquireReleaseWith(openApprovalStream(cfg))(closeQuietly)(consumeApprovals(_, terminal))
+      .retry(Schedule.spaced(2.seconds) && Schedule.recurs(30))
+      .unit
+
+  private def openApprovalStream(cfg: Cfg): Task[InputStream] =
+    ZIO.attemptBlocking {
+      val req = HttpRequest.newBuilder()
+        .uri(URI.create(cfg.personServiceUrl + "/approvals/stream?person=" + enc(cfg.as)))
+        .header("Accept", "text/event-stream")
+        .build()
+      client.send(req, HttpResponse.BodyHandlers.ofInputStream()).body()
+    }
+
+  private def consumeApprovals(is: InputStream, terminal: Terminal): Task[Unit] =
+    ZIO.attemptBlockingCancelable {
+      val reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))
+      var line   = reader.readLine()
+      while (line != null) {
+        if (line.startsWith("data:")) {
+          val data = line.drop("data:".length).trim
+          data.fromJson[ApprovalEvent].toOption.foreach { ev =>
+            val a = ev.approval
+            val msg = ev.kind match {
+              case "requested" =>
+                Some(s"\n⚖  Approval needed [${a.id.value}]: ${a.actionType}  ${a.payloadJson}\n" +
+                  s"   /approve ${a.id.value}   |   /reject ${a.id.value} [reason]")
+              case "rejected" => Some(s"\n✗  Approval ${a.id.value} rejected.")
+              case _          => None // `executed` shows up as a continuation turn
+            }
+            msg.foreach { m => terminal.writer().println(m); terminal.flush() }
+          }
+        }
+        line = reader.readLine()
+      }
+    }(closeQuietly(is))
+
+  /** The human's decision goes straight to person-service. On approve, the action
+   *  executes server-side and mycroft fires the continuation — which we render by
+   *  adopting the next turn that starts on this channel. */
+  private def decideApproval(cfg: Cfg, terminal: Terminal, queue: Queue[Ev], rest: String, approve: Boolean): Task[Unit] = {
+    val parts  = rest.split("\\s+", 2)
+    val id     = parts.headOption.getOrElse("")
+    val reason = if (parts.length > 1 && parts(1).trim.nonEmpty) Some(parts(1).trim) else None
+    if (id.isEmpty) printLine(terminal, "usage: /approve <id>  |  /reject <id> [reason]")
+    else {
+      // Fetch the one-time code over the private interface (the agent can't reach
+      // this), then echo it back on decide. The human just types /approve <id>.
+      val flow = for {
+        codeResp <- httpGet(cfg.personServicePrivateUrl + s"/approvals/$id/code")
+        code      = codeResp.fromJson[Json].toOption.flatMap(strField("code")).getOrElse("")
+        body      = Json.Obj(
+                      "code"      -> Json.Str(code),
+                      "decidedBy" -> Json.Str(cfg.as),
+                      "approve"   -> Json.Bool(approve),
+                      "reason"    -> reason.map(Json.Str(_)).getOrElse(Json.Null)
+                    ).toJson
+        _        <- post(cfg.personServicePrivateUrl + s"/approvals/$id/decide", body)
+      } yield ()
+      flow.foldZIO(
+        t => printLine(terminal, s"decision failed: ${describe(t)}"),
+        _ =>
+          if (approve) printLine(terminal, s"approved $id — running continuation…") *> renderNextTurn(cfg, terminal, queue)
+          else printLine(terminal, s"rejected $id")
+      )
+    }
+  }
+
+  private def listApprovals(cfg: Cfg, terminal: Terminal): Task[Unit] =
+    httpGet(cfg.personServiceUrl + "/approvals?status=requested").foldZIO(
+      t    => printLine(terminal, s"list failed: ${describe(t)}"),
+      body => printLine(terminal, body)
+    )
+
+  /** Render the next turn that starts on this channel, whatever its id — used for
+   *  mycroft-initiated continuation/notification turns whose turnId we don't know. */
+  private def renderNextTurn(cfg: Cfg, terminal: Terminal, queue: Queue[Ev]): Task[Unit] = {
+    val r = new Renderer(terminal, ansiSupported(terminal))
+    def go(adopted: Option[String]): Task[Unit] =
+      queue.take.flatMap { ev =>
+        val ch  = ev.json.flatMap(strField("channel"))
+        val mid = ev.json.flatMap(strField("message_id"))
+        if (!ch.contains(cfg.channel)) go(adopted)
+        else adopted match {
+          case None      => if (ev.event == "started") ZIO.attempt(r.on(ev)).ignore *> go(mid) else go(None)
+          case Some(tid) =>
+            if (!mid.contains(tid)) go(adopted)
+            else ZIO.attempt(r.on(ev)).ignore *> (if (ev.event == "done" || ev.event == "error") ZIO.unit else go(adopted))
+        }
+      }
+    go(None).timeout((maxTurnSeconds + 30).seconds).flatMap {
+      case Some(_) => ZIO.unit
+      case None    => printLine(terminal, s"[timed out waiting for the continuation]")
+    }
+  }
+
+  private def httpGet(url: String): Task[String] =
+    ZIO.attemptBlocking {
+      val req  = HttpRequest.newBuilder().uri(URI.create(url)).GET().header("Accept", "application/json").build()
+      val resp = client.send(req, HttpResponse.BodyHandlers.ofString())
+      if (resp.statusCode() >= 400) throw new RuntimeException(s"${resp.statusCode()}: ${resp.body()}")
+      resp.body()
+    }
+
+  private def enc(v: String): String =
+    java.net.URLEncoder.encode(v, StandardCharsets.UTF_8)
 
   // --- helpers ---
 

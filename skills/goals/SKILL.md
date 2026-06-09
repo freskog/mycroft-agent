@@ -33,17 +33,29 @@ The immutability of `outcome` and `evidence-rule` is by design: it prevents envi
 
 ## Commands
 
-### Propose a goal
+### Request a goal (gated — you cannot create one directly)
+
+Goal creation is **hard-gated**: unlike memory/entities (gateless, cheap,
+reversible), a wrongly-derived goal sets a durable, immutable contract you'll
+pursue across sessions, so a human must approve it first. You **request** it; the
+goal does not exist until they approve. There is no `person goal propose`.
 
 ```
 safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
-  "person goal propose \
+  "person goal request \
     --owner fred \
     --title 'Approve Q3 report' \
     --outcome 'Q3 report committed to main branch and acknowledged by stakeholders' \
     --evidence-rule 'Git commit hash on main + stakeholder confirmation email' \
-    --source email:gmail-msg-456"
+    --source email:gmail-msg-456 \
+    --channel <this conversation's channel>"
 ```
+
+This creates a `goal.create` approval (see the `approvals` skill). Tell the user
+you've requested the goal and **stop** — don't wait or poll. A human approves out
+of band (inline in chat, or via a push notification); person-service then creates
+the goal. You'll be re-invoked if a continuation was attached. You never approve
+your own goal, and you can't create one without approval.
 
 ### List goals
 
@@ -79,9 +91,10 @@ person goal status <goal-id> --to cancelled
 
 ## Rules
 
+0. **Goal creation is gated — `person goal request`, never create directly.** A human approves before the goal exists; you can't approve your own. (Status/evidence updates below are *not* gated — only creation is.)
 1. Outcome must be **observable**, not vague. "Reviewed" is bad; "PR merged to main with two approvals" is good.
 2. Evidence-rule must be **testable**. Cite a concrete artifact (commit hash, email id, file path) the human can verify.
-3. Never edit a goal's `outcome` or `evidence-rule` — the service rejects this, and the audit log would catch it anyway. Cancel and propose a new goal instead.
+3. Never edit a goal's `outcome` or `evidence-rule` — the service rejects this, and the audit log would catch it anyway. Cancel and request a new goal instead.
 4. Mark a goal `done` only when the evidence-rule is actually satisfied. If you're not sure, leave it `open` or `blocked` and append a note.
 5. Use the `plans` skill for the working scratchpad. The goal is the contract; the plan is the path.
 6. When the user expresses an obligation in passing (not a multi-step goal), use the `commitments` skill instead.

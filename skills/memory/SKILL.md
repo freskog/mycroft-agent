@@ -1,6 +1,6 @@
 ---
 name: memory
-description: Write and consolidate durable facts — propose, supersede, accept/reject/archive memory about people, projects, and preferences. Recall is auto-injected each turn; this skill is for the WRITE side.
+description: Write and consolidate durable facts about people, projects, and preferences — record (gateless), supersede, reject/archive, consolidate. Recall is auto-injected each turn; this skill is for the WRITE side.
 version: 1.1.0
 capabilities: [person, safe_run]
 ---
@@ -9,7 +9,7 @@ capabilities: [person, safe_run]
 
 ## Purpose
 
-Semantic memory is the agent's evolving store of **durable facts** — preferences, project notes, role/relationship details, procedure knowledge. This skill covers the **write side**: proposing, superseding, accepting/rejecting/archiving, and consolidating facts.
+Semantic memory is the agent's evolving store of **durable facts** — preferences, project notes, role/relationship details, procedure knowledge. This skill covers the **write side**: recording facts (gateless — live on write), superseding, correcting (reject/archive), and consolidating from events.
 
 **Recall is not your job.** The harness auto-injects the relevant memory (one global, relevance-ranked context bundle plus a task-relevant search) into your context every turn — you never choose "memory vs the task." The `search` / `context` commands below exist only for the rare case where you need to look something up beyond what was injected.
 
@@ -25,14 +25,14 @@ Memory is **not** the conversation log. For raw "this happened" content, use the
 | `personId`        | Subject of the fact (about whom). Optional for household-wide facts.                 |
 | `kind`            | `preference` / `fact` / `project_note` / `procedure_note`                            |
 | `text`            | The fact itself, in prose                                                            |
-| `status`          | `proposed` → `accepted`/`rejected` → `archived`                                      |
+| `status`          | created `accepted` (gateless); correct via `rejected` / `archived` / supersede        |
 | `confidence`      | 0..1 quality estimate. Defaults to 0.5 when consolidating from events.               |
 | `validFrom`       | World-time start (optional). Use when a fact holds over a period.                    |
 | `validUntil`      | World-time end (optional, exclusive).                                                |
 | `supersededById`  | Set when a newer item replaces this one. Old item is preserved.                      |
 | `originEventId`   | The event in the audit/episodic log that produced this fact.                         |
 
-`proposed` and `rejected` are not in normal recall results. Only `accepted` facts (that aren't superseded at the query's `as-of` time) show up in `search` and `context`.
+Writing a fact is **gateless**: it is `accepted` immediately and recalled from the next turn — there is no human accept step. Safety comes from reversibility, not a gate: `text` is immutable (supersede, never edit), every fact carries provenance (`originEventId`/`source`) and a `confidence`, and a human (or you, on realising you were wrong) can `reject`/`archive`/supersede it after the fact. `rejected`/`archived`/superseded facts drop out of recall; only live `accepted` facts (not superseded at the query's `as-of` time) show up in `search` and `context`.
 
 ## Commands
 
@@ -61,13 +61,14 @@ Returns accepted items with matching kind and overlapping text. If something clo
 ### Lifecycle transitions
 
 ```
-person memory accept    <id>
 person memory reject    <id> --reason "user said no, they meant the opposite"
 person memory archive   <id>
 person memory supersede --new <new-id> --old <old-id>
 ```
 
-Only humans should typically accept; the agent can reject its own proposals when it realises they're wrong before review.
+Facts are live on write, so there is nothing to "accept". These are **correction**
+tools: `reject`/`archive` to retract a fact you (or the user) realise is wrong,
+`supersede` to replace one with a better version (preserving history).
 
 ### Recall (only if needed — normally auto-injected)
 
@@ -89,7 +90,7 @@ person memory profile --limit 50   # pinned onboarding facts only, no decay
 person memory consolidate --since 2026-05-25T00:00:00Z
 ```
 
-Reads `observation` and `session_note` events since the cutoff and proposes one `memory_item` per event with `originEventId` set. Idempotent — events with an existing referencing memory item are skipped. New items are `proposed`; humans accept.
+Reads `observation` and `session_note` events since the cutoff and records one `memory_item` per event with `originEventId` set. Idempotent — events with an existing referencing memory item are skipped. New items are `accepted` (gateless); the `originEventId` link is the provenance trail back to what produced each fact.
 
 ## Rules
 
@@ -110,6 +111,6 @@ A new fact (from an email, a chat, an observation) **proposes** a revision; it n
    - A different value for the same slot → a **transition**, not a contradiction: set `validUntil` on the old (close it) and propose the new with `validFrom`. History is preserved and `--as-of` stays correct.
    - Same value already there → idempotent; just refine `validFrom`/confidence if needed.
 3. **Attach provenance + confidence.** Use the originating email/chat as `--source` and a single-source confidence; let the consolidator/origin event link the observation.
-4. **Propose → human accepts.** The old accepted belief wins recall until acceptance. A future-dated `validFrom` is remembered now but only becomes active on its date.
+4. **Write it (live immediately).** Prefer `supersede`/`validUntil`-close over overwriting, so the prior belief is preserved, not lost. A future-dated `validFrom` is recorded now but only becomes active on its date. If you later realise it was wrong, `reject`/supersede it.
 
 Only flag (don't auto-apply) a genuine **same-time-window** contradiction against a high-confidence or human-stated fact.

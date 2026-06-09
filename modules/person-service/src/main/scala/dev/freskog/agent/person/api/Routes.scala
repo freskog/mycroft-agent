@@ -8,12 +8,15 @@ import dev.freskog.agent.person.service.PersonService
 import zio._
 import zio.http._
 import zio.json._
+import zio.json.ast.Json
+import zio.stream.ZStream
 
+import java.nio.charset.StandardCharsets
 import java.time.Instant
 
 object Routes {
 
-  def make(service: PersonService): zio.http.Routes[Any, Response] =
+  def make(service: PersonService, approvalHub: Hub[ApprovalEvent]): zio.http.Routes[Any, Response] =
     zio.http.Routes(
 
       Method.GET / "health" -> handler { (_: Request) =>
@@ -45,9 +48,6 @@ object Routes {
       Method.POST / "entities" / "supersede" -> handler { (req: Request) =>
         handlePost[SupersedeEntityRequest, Entity](req)(r => service.supersedeEntity(r.newId, r.oldId))
       },
-      Method.POST / "entities" / string("id") / "accept" -> handler { (id: String, _: Request) =>
-        handleGet(service.acceptEntity(EntityId(id)))
-      },
       Method.POST / "entities" / string("id") / "reject" -> handler { (id: String, req: Request) =>
         handlePostOptional[RejectMemoryRequest, Entity](req) { reqOpt =>
           service.rejectEntity(EntityId(id), reqOpt.flatMap(_.reason))
@@ -74,9 +74,6 @@ object Routes {
       Method.POST / "relationships" / "supersede" -> handler { (req: Request) =>
         handlePost[SupersedeRelationshipRequest, Relationship](req)(r => service.supersedeRelationship(r.newId, r.oldId))
       },
-      Method.POST / "relationships" / string("id") / "accept" -> handler { (id: String, _: Request) =>
-        handleGet(service.acceptRelationship(RelationshipId(id)))
-      },
       Method.POST / "relationships" / string("id") / "reject" -> handler { (id: String, req: Request) =>
         handlePostOptional[RejectMemoryRequest, Relationship](req) { reqOpt =>
           service.rejectRelationship(RelationshipId(id), reqOpt.flatMap(_.reason))
@@ -86,25 +83,6 @@ object Routes {
       // --- household graph: combined snapshot ---
       Method.GET / "household" -> handler { (_: Request) =>
         handleGet(service.household)
-      },
-
-      // --- review queue: proposed items (by source/type/kind), and bulk-accept ---
-      Method.GET / "pending" -> handler { (req: Request) =>
-        handleGet(service.pending(
-          sourcePrefix = queryParam(req, "source"),
-          nodeType     = queryParam(req, "type"),
-          kind         = queryParam(req, "kind")
-        ))
-      },
-      Method.POST / "accept-all" -> handler { (req: Request) =>
-        handlePostOptional[AcceptAllRequest, AcceptAllResult](req) { r =>
-          service.acceptAll(
-            sourcePrefix = r.flatMap(_.source),
-            nodeType     = r.flatMap(_.nodeType),
-            kind         = r.flatMap(_.kind),
-            ids          = r.flatMap(_.ids).getOrElse(Nil)
-          )
-        }
       },
 
       // --- channels & messages (mycroft) ---
@@ -204,9 +182,6 @@ object Routes {
             text = text
           ))
       },
-      Method.POST / "memory" / string("id") / "accept" -> handler { (id: String, _: Request) =>
-        handleGet(service.acceptMemory(MemoryId(id)))
-      },
       Method.POST / "memory" / string("id") / "reject" -> handler { (id: String, req: Request) =>
         handlePostOptional[RejectMemoryRequest, MemoryItem](req) { reqOpt =>
           service.rejectMemory(MemoryId(id), reqOpt.flatMap(_.reason))
@@ -225,11 +200,34 @@ object Routes {
           status = queryParam(req, "status")
         ))
       },
+      // Approval lifecycle event stream. Edges subscribe and hold the connection;
+      // person-service streams events down it (clients render `requested`, mycroft
+      // acts on `executed`). Optional `?person=<id>` filters to approvals that
+      // person must decide (plus untargeted ones). The core never dials out.
+      Method.GET / "approvals" / "stream" -> handler { (req: Request) =>
+        val person   = queryParam(req, "person")
+        val greeting = ZStream.succeed(": connected\n\n")
+        val events   = ZStream.fromHub(approvalHub)
+          .filter(e => person.isEmpty || e.approval.requiredPersonId.isEmpty || e.approval.requiredPersonId.map(_.value) == person)
+          .map(e => s"event: ${e.kind}\ndata: ${e.toJson}\n\n")
+        val bytes = (greeting ++ events).mapConcatChunk(s => Chunk.fromArray(s.getBytes(StandardCharsets.UTF_8)))
+        ZIO.succeed(
+          Response(body = Body.fromStreamChunked(bytes)).addHeader("Content-Type", "text/event-stream")
+        )
+      },
+      Method.GET / "approvals" / string("id") -> handler { (id: String, _: Request) =>
+        handleGetOption(service.getApproval(ApprovalId(id)), "approval", id)
+      },
+      // NOTE: the decision endpoint (POST /approvals/:id/decide) is deliberately
+      // NOT here. It lives in `decideRoutes`, served on a separate private
+      // interface the agent's network can't reach — see Main. This is the
+      // structural guarantee that a compromised agent cannot approve its own
+      // proposals.
 
       // --- goals ---
-      Method.POST / "goals" -> handler { (req: Request) =>
-        handlePost[ProposeGoalRequest, Goal](req)(service.proposeGoal)
-      },
+      // NOTE: there is no POST /goals. Goal creation is gated — the agent requests
+      // a `goal.create` approval; person-service creates the goal only on human
+      // approval (the executor calls proposeGoal). Status/evidence below stay direct.
       Method.GET / "goals" -> handler { (req: Request) =>
         handleGet(service.listGoals(
           owner = queryParam(req, "owner").map(PersonId),
@@ -344,6 +342,24 @@ object Routes {
                 }
             }
         }
+      }
+    )
+
+  /** The decision plane, served on person-service's PRIVATE interface only (a
+   *  network the agent can't route to). Issuing a one-time code is here so the
+   *  agent can never obtain one; `decide` requires that code. Approving executes
+   *  the action server-side and emits an `executed` event on the (public) stream. */
+  def decideRoutes(service: PersonService): zio.http.Routes[Any, Response] =
+    zio.http.Routes(
+      // Mint a one-time decision code for a pending approval (returns plaintext).
+      Method.GET / "approvals" / string("id") / "code" -> handler { (id: String, _: Request) =>
+        service.issueDecisionCode(ApprovalId(id)).foldZIO(
+          failed,
+          code => ZIO.succeed(Response.json(Json.Obj("code" -> Json.Str(code)).toJson))
+        )
+      },
+      Method.POST / "approvals" / string("id") / "decide" -> handler { (id: String, req: Request) =>
+        handlePost[DecideApprovalRequest, Approval](req)(r => service.decideApproval(ApprovalId(id), r))
       }
     )
 

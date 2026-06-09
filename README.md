@@ -85,7 +85,9 @@ sbt "safeRun/run --cwd /tmp --timeout 30 --shell bash -- echo hello"
 ```bash
 sbt "personCli/run health"
 sbt "personCli/run commitment list --owner fred"
-sbt 'personCli/run goal propose --owner fred --title "Approve Q3 report" --outcome "..." --evidence-rule "..."'
+# Goal creation is hard-gated: `goal request` creates a goal.create approval; the
+# goal exists only after a human approves it. (There is no `goal propose`.)
+sbt 'personCli/run goal request --owner fred --title "Approve Q3 report" --outcome "..." --evidence-rule "..." --channel fred'
 sbt "personCli/run goal list --owner fred --status open"
 sbt 'personCli/run memory search "morning meetings" --person fred'
 sbt "personCli/run memory context --person fred"
@@ -95,19 +97,43 @@ sbt "personCli/run memory consolidate"
 ```
 
 Durable state is one shared household store keyed by `person` and `entity` — there
-are no privacy scopes. Build the household graph (persons, entities, typed
-relationships) with:
+are no privacy scopes. **Writing knowledge is gateless** — memory, entities and
+relationships are `accepted` on write (reversible via `reject`/`archive`/`supersede`);
+there is no accept/pending/accept-all step. Build the household graph (persons,
+entities, typed relationships) with:
 
 ```bash
 sbt "personCli/run person list"
 sbt 'personCli/run person create --id liam --display-name "Liam" --timezone Europe/Dublin --locale en-IE'
-sbt 'personCli/run entity propose --kind organization --name "MegaCorp" --source onboarding:work'
+sbt 'personCli/run entity propose --kind organization --name "MegaCorp" --source onboarding:work'  # live immediately
 sbt "personCli/run entity list --status accepted"
 sbt "personCli/run entity resolve megacorp"
 sbt 'personCli/run relationship propose --from fred --from-kind person --type employed_by --to <entity-id> --to-kind entity --source onboarding:work --valid-from 2024-01-01T00:00:00Z'
 sbt "personCli/run relationship list --from fred --type employed_by"
 sbt "personCli/run household"   # accepted, currently-active graph
 ```
+
+### Human-in-the-loop approvals
+
+Outside-effect actions and **goal creation** are hard-gated. The agent only ever
+*requests*; a human decides; person-service executes. The decision is protected
+two ways so a compromised agent can't self-approve: the decision endpoint is served
+**only on a private network interface** the agent can't route to, and deciding
+requires a **one-time code** person-service delivers only to the human (never on any
+agent-readable surface).
+
+```bash
+# agent side (request only):
+sbt 'personCli/run approval request --action-type calendar.create_event --payload-json "{...}" --required-person fred --channel fred'
+sbt "personCli/run approval list --status requested"   # read-only; no code shown
+# (no approve/reject verb exists on the agent CLI — deciding is the human's act)
+```
+
+In the REPL, an approval surfaces inline; `/approve <id>` fetches the one-time code
+over the private interface and decides for you. In Docker, `person-service` runs two
+servers — a public one (everything except the decision) on `agentnet`, and a
+decision-only server on a separate `approvalnet` that `mycroft` is not attached to.
+See [docs/architecture.md](docs/architecture.md#human-in-the-loop-gateless-writes-gated-actions--goals).
 
 ### Run skill catalogue
 

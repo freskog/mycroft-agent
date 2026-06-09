@@ -62,7 +62,24 @@ If the agent could directly write to the database, a compromised or confused age
 - Overwrite memory
 - Corrupt family data
 
-By placing all writes behind the sidecar's API, we enforce a proposal/approval boundary. The agent proposes; humans (or explicit approval flows) finalize.
+All writes go through the sidecar's API, but the gate strength is matched to risk (see "Human-in-the-Loop" below): reversible internal knowledge is written directly; durable contracts and outside-effect actions require a human decision the agent structurally cannot forge.
+
+### Human-in-the-Loop: gateless writes, gated actions & goals
+
+Not everything needs the same gate. We grade by risk:
+
+- **Gateless (memory, entities, relationships):** written **live** (`accepted` on write). These are internal and reversible, so the safety net is provenance + reversibility, not a sign-off: `text`/`outcome` fields are immutable (you supersede, never edit), every item carries `origin_event_id`/`source` and a `confidence`, and a human (or the agent, on realising it erred) can `reject`/`archive`/`supersede` after the fact. Requiring human acceptance of every learned fact was friction that fought continuous learning; we dropped it. There is no `accept`/`pending`/`accept-all`.
+- **Hard-gated (goals, and any outside-effect action):** these go through the **approval mechanism**. A goal is a durable, immutable contract (a wrongly-inferred one is costly); an action (send mail, create a calendar event) is irreversible and outward. The agent can only **request** — it never approves or executes.
+
+The approval lifecycle, deliberately with **no suspended fibers** (so it survives restarts and overnight async waits):
+
+1. **Propose** — the agent creates an `Approval` (`requested`). Non-blocking; the turn ends. `person goal request` is sugar that creates a `goal.create` approval; `person approval request` covers other action types.
+2. **Surface** — clients subscribe to person-service's `GET /approvals/stream` and render `requested` events. mycroft *also* subscribes, but only for `executed` (to run continuations). The agent can *see* approvals; it cannot decide them.
+3. **Decide** — a human approves/rejects. This is gated two ways: the decision endpoint is served **only on a private network interface** the agent's plane (`agentnet`) cannot route to; and it requires a **one-time decision code** that person-service issues and delivers only to the human (over the private code endpoint, or a client push), hashed at rest and **never present on any agent-readable surface**. So even reaching the endpoint, the agent has no code. Codes are single-use, id-bound, and have a generous (default 48h) TTL so an overnight approval still works.
+4. **Execute** — on approve, person-service runs the action server-side (it holds the credentials), records the result, and emits `executed`.
+5. **Continue (saga)** — an approval may carry a continuation `{skill, params}`; on `executed`, mycroft runs it. A gated multi-step workflow is decomposed at its approval boundaries and resumes from durable state (the recorded result + the goal + memory), never from an in-memory paused process.
+
+This keeps a *compromised* agent unable to bypass the gate — it can neither route to the decision endpoint nor produce a valid code — while the gateless path keeps everyday learning autonomous.
 
 ### Why Credentials Must Not Be in the Sandbox
 
@@ -104,7 +121,7 @@ This is a personal/family substrate. There is one deployment, one family. Multi-
 
 ### Goals Are Durable; Plans Are Replaceable
 
-Goals are durable completion contracts kept in `person-service`. A goal carries `title`, `outcome`, `evidence_rule`, `status`, `blocked_reason`, evidence, source, timestamps. Status and evidence are mutable. **`outcome` and `evidence_rule` are immutable once created** — there are no service operations to edit them. This is deliberate: environmental text (a README, an email reply, an injected instruction) must not silently redefine the contract. If the user actually wants a different outcome, the agent cancels the goal and proposes a new one.
+Goals are durable completion contracts kept in `person-service`. A goal carries `title`, `outcome`, `evidence_rule`, `status`, `blocked_reason`, evidence, source, timestamps. Status and evidence are mutable. **`outcome` and `evidence_rule` are immutable once created** — there are no service operations to edit them. This is deliberate: environmental text (a README, an email reply, an injected instruction) must not silently redefine the contract. If the user actually wants a different outcome, the agent cancels the goal and requests a new one. **Goal *creation* is hard-gated** (see Human-in-the-Loop): the agent `goal request`s; the goal exists only after a human approves the `goal.create` action. Status/evidence updates are not gated.
 
 Plans, by contrast, are working artifacts. They live as files in the workspace at `/workspace/goals/<goal-id>/PLANS.md`, with older versions snapshotted under `plans/`. Plans are agent-editable, replaceable, and not durable across sandbox resets. The `plans` skill codifies the convention; no code enforces it.
 
@@ -136,8 +153,8 @@ Both tables are indexed with persistent SQLite FTS5 virtual tables kept in sync 
 
 The flow between them:
 1. Agent logs raw experience as events (cheap, high-volume)
-2. `person memory consolidate` walks recent `observation` + `session_note` events and proposes one `memory_item` per event with `origin_event_id` set
-3. A human accepts or rejects (the proposal/approval boundary)
+2. `person memory consolidate` walks recent `observation` + `session_note` events and records one `memory_item` per event with `origin_event_id` set
+3. Facts are written `accepted` (gateless — see Human-in-the-Loop); a human can later `reject`/`supersede` a wrong one
 4. Accepted facts feed the **context bundle** (`person memory context`) — top-k ranked by `confidence × recency` plus recent relevant events — for harness injection
 5. Active recall (`person memory search`, `person event search`) is FTS5-ranked and supports point-in-time `--as-of` queries that respect supersession and `valid_from`/`valid_until`
 6. Provenance: from any accepted fact, follow `origin_event_id` to the event that produced it; from there, the audit trail explains the rest

@@ -18,6 +18,7 @@ object PersonServiceSpec extends ZIOSpecDefault {
         db      <- Sqlite.live(":memory:").build.map(_.get[Sqlite])
         _       <- Migrations.migrate(db)
         _       <- SeedData.seed(db)
+        hub     <- Hub.sliding[ApprovalEvent](16)
         service  = PersonService.live(
           Repos.sqlitePersonRepo(db),
           Repos.sqliteCommitmentRepo(db),
@@ -32,23 +33,20 @@ object PersonServiceSpec extends ZIOSpecDefault {
           Repos.sqliteChannelMemberRepo(db),
           Repos.sqliteMessageRepo(db),
           Repos.sqliteCredentialRepo(db),
-          Repos.sqliteInboxMessageRepo(db)
+          Repos.sqliteInboxMessageRepo(db),
+          hub
         )
         result  <- f(service)
       } yield result
     }
 
+  // Memory is gateless: a propose is immediately accepted, so these helpers just
+  // write the fact.
   private def proposeAndAcceptMemory(svc: PersonService, text: String, kind: MemoryKind = MemoryKind.Fact, confidence: Double = 0.7): IO[AgentError, MemoryItem] =
-    for {
-      m <- svc.proposeMemory(ProposeMemoryRequest(Some(FredId), kind, text, "chat", Some(confidence)))
-      a <- svc.acceptMemory(m.id)
-    } yield a
+    svc.proposeMemory(ProposeMemoryRequest(Some(FredId), kind, text, "chat", Some(confidence)))
 
   private def proposeAcceptProfileFact(svc: PersonService, text: String): IO[AgentError, MemoryItem] =
-    for {
-      m <- svc.proposeMemory(ProposeMemoryRequest(Some(FredId), MemoryKind.Fact, text, "onboarding:profile", Some(0.9)))
-      a <- svc.acceptMemory(m.id)
-    } yield a
+    svc.proposeMemory(ProposeMemoryRequest(Some(FredId), MemoryKind.Fact, text, "onboarding:profile", Some(0.9)))
 
   def spec: Spec[Any, AgentError] = suite("PersonServiceSpec")(
 
@@ -138,7 +136,7 @@ object PersonServiceSpec extends ZIOSpecDefault {
 
     // --- Memory lifecycle ---
 
-    test("propose memory creates with proposed status") {
+    test("propose memory is gateless — created accepted") {
       withService { svc =>
         svc.proposeMemory(ProposeMemoryRequest(
           personId = Some(FredId),
@@ -148,19 +146,17 @@ object PersonServiceSpec extends ZIOSpecDefault {
           confidence = Some(0.9)
         )).map(m =>
           assertTrue(
-            m.status == MemoryStatus.Proposed,
+            m.status == MemoryStatus.Accepted,
             m.kind == MemoryKind.Preference,
             m.text == "Prefer draft-only email actions"
           )
         )
       }
     },
-    test("propose then accept memory transitions status") {
+    test("a written fact is immediately accepted (gateless)") {
       withService { svc =>
-        for {
-          m  <- svc.proposeMemory(ProposeMemoryRequest(Some(FredId), MemoryKind.Preference, "Likes morning meetings", "chat", Some(0.7)))
-          ac <- svc.acceptMemory(m.id)
-        } yield assertTrue(ac.status == MemoryStatus.Accepted, ac.id == m.id)
+        svc.proposeMemory(ProposeMemoryRequest(Some(FredId), MemoryKind.Preference, "Likes morning meetings", "chat", Some(0.7)))
+          .map(m => assertTrue(m.status == MemoryStatus.Accepted))
       }
     },
     test("reject memory records reason") {
@@ -338,7 +334,7 @@ object PersonServiceSpec extends ZIOSpecDefault {
           second <- svc.consolidateMemory(None)
         } yield assertTrue(
           first.size == 2,
-          first.forall(_.status == MemoryStatus.Proposed),
+          first.forall(_.status == MemoryStatus.Accepted),
           first.forall(_.originEventId.isDefined),
           first.flatMap(_.originEventId).toSet == Set(e1.id, e2.id),
           second.isEmpty
@@ -411,9 +407,9 @@ object PersonServiceSpec extends ZIOSpecDefault {
 
     // --- New edge cases (hardening) ---
 
-    test("accept on nonexistent memory id fails with NotFound") {
+    test("reject on nonexistent memory id fails with NotFound") {
       withService { svc =>
-        svc.acceptMemory(MemoryId("nope")).either.map(e =>
+        svc.rejectMemory(MemoryId("nope"), None).either.map(e =>
           assertTrue(e.swap.toOption.collect { case AgentError.NotFound(t, id) => (t, id) }.contains(("memory_item", "nope")))
         )
       }
@@ -473,7 +469,6 @@ object PersonServiceSpec extends ZIOSpecDefault {
                  Some(FredId), MemoryKind.Fact, "Worked at Acme 2026",
                  "chat", Some(0.8), validFrom = Some(t0), validUntil = Some(t1)
                ))
-          _ <- svc.acceptMemory(m.id)
           inside <- svc.searchMemory("Acme", None, None,
                                      Some(java.time.Instant.parse("2026-03-15T00:00:00Z")), 10)
           after  <- svc.searchMemory("Acme", None, None,

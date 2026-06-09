@@ -75,10 +75,11 @@ Work in this order so ids exist before they're referenced — don't go exploring
 5. **Propose pinned facts** (`person memory propose --source onboarding:<topic>`),
    each `--person <id>` referencing a person you created in step 2.
 6. Log a `session_note` event.
-7. Summarise and **ask the user to accept** the proposals. When they approve,
-   run `person accept-all --source onboarding` (see "Accepting").
+7. Summarise what you recorded back to the user (writes are live immediately —
+   `person household` / `person memory profile` already reflect them). If you got
+   something wrong, correct it with `reject`/`supersede`. There is no accept step.
 
-Capture in batches; you don't need every detail before you start proposing.
+Capture in batches; you don't need every detail before you start writing.
 
 ## Prefer derivable facts over snapshots
 
@@ -138,28 +139,17 @@ person event record --action onboarding.session --category session_note \
   --text 'Initial onboarding: captured 2 adults, 2 children, employer + school'
 ```
 
-## Accepting (when the user approves)
+## Writes are live (gateless)
 
-Everything you proposed sits in **`proposed`** status (the status value is
-literally `proposed`, not "pending"). Profile (`person memory profile`) and
-`person household` show **accepted** items only, so proposals won't appear there
-until accepted. To review and accept:
+Everything you record — people, entities, relationships, facts — is **live the
+moment you write it**; it shows up in `person household` / `person memory profile`
+immediately. There is no accept step and no review queue. So don't promise to
+"save" later — just write as you go, then summarise what you recorded.
 
-```
-person pending --source onboarding              # list ALL proposed memory/entities/relationships (optionally by source prefix)
-person accept-all --source onboarding           # accept everything proposed under that source in one call
-```
-
-`--source` is a prefix filter, so `onboarding` matches `onboarding:children`,
-`onboarding:work`, etc. Omit it to act on every proposal. When the user says
-"looks good / approved", run `person accept-all --source onboarding` — do **not**
-go exploring `--help`. To accept individually instead, use the per-type verbs
-with the id from `person pending`:
-```
-person memory accept <id>
-person entity accept <id>
-person relationship accept <id>
-```
+If you got something wrong, **correct it**, don't leave it: `person memory reject
+<id>` / `archive` / `supersede`, and `person entity reject` / `person relationship
+reject` for the graph. Prefer `supersede`/`--valid-until` over deletion so history
+is preserved.
 
 ## Refresh / diff mode (job change, new grade, new club, move)
 
@@ -180,9 +170,9 @@ queries stay correct. For each change:
 
 ## Rules
 
-1. Everything you create is **proposed** (status value `proposed`). End the
-   session by asking the user to review/accept — only humans accept. On approval,
-   `person accept-all --source onboarding`; review with `person pending`.
+1. Everything you create is **live on write** (gateless) and reversible. Don't
+   wait for approval and don't claim you'll save later — record as you learn, then
+   summarise. Fix mistakes with `reject`/`supersede`, not by asking permission.
 2. Resolve before you create. Don't duplicate an existing person/entity; don't
    auto-merge ambiguous matches.
 3. Prefer derivable facts (dates) over snapshots (ages, grades).

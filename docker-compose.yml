@@ -35,11 +35,17 @@ services:
       PERSON_SERVICE_DB:   "/state/person.sqlite"
       PERSON_SERVICE_SEED: "true"
       GMAIL_CLIENT_SECRET_FILE: "/run/client-secret.json"
+      # Decision endpoint bound to the approvalnet interface only — unreachable
+      # from agentnet (where mycroft lives), so a compromised agent cannot decide.
+      PERSON_SERVICE_PRIVATE_HOST: "172.31.7.2"
+      PERSON_SERVICE_PRIVATE_PORT: "8090"
     volumes:
       - person-state:/state
       - ./modules/person-service/src/main/resources/client-secret.json:/run/client-secret.json:ro
     networks:
-      - agentnet
+      agentnet: {}
+      approvalnet:
+        ipv4_address: 172.31.7.2
     ports: ["8081:8080"]
 
   # Local-LLM agent harness. Talks to person-service on the internal network
@@ -80,11 +86,14 @@ services:
     environment:
       MYCROFT_URL: "http://mycroft:8090"
       PERSON_SERVICE_URL: "http://person-service:8080"
+      # The decision endpoint, reachable only on approvalnet (which mycroft is NOT on).
+      PERSON_SERVICE_PRIVATE_URL: "http://172.31.7.2:8090"
       MYCROFT_MAX_TURN_SECONDS: "240"
     depends_on:
       - mycroft
     networks:
-      - agentnet
+      agentnet: {}
+      approvalnet: {}
     stdin_open: true
     tty: true
 
@@ -114,5 +123,14 @@ volumes:
   person-state:
 
 networks:
+  # Agent plane: mycroft, person-service (public), and the repl all see each other.
   agentnet:
     driver: bridge
+  # Approval plane: ONLY the repl (channel client) and person-service. mycroft is
+  # absent, so the agent has no route to the private decision endpoint. The static
+  # subnet lets person-service bind the decision server to a known approvalnet IP.
+  approvalnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.7.0/24

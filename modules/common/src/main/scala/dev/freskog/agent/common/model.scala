@@ -243,6 +243,13 @@ object ApprovalStatus {
     case "expired"   => Right(Expired)
     case _           => Left(s"Unknown approval status: $s")
   }
+
+  def asString(s: ApprovalStatus): String = s match {
+    case Requested => "requested"
+    case Approved  => "approved"
+    case Rejected  => "rejected"
+    case Expired   => "expired"
+  }
 }
 
 case class Person(
@@ -329,8 +336,27 @@ case class Approval(
   payloadJson: String,
   status: ApprovalStatus,
   createdAt: Instant,
-  decidedAt: Option[Instant]
+  decidedAt: Option[Instant],
+  // Set when a human decides the approval; `decidedBy` records who.
+  decidedBy: Option[PersonId] = None,
+  // Set when the action executes server-side on approval. `resultJson` holds the
+  // recorded outcome so a re-approve of an already-executed approval is idempotent
+  // (returns the stored result rather than re-executing).
+  executedAt: Option[Instant] = None,
+  resultJson: Option[String] = None,
+  // Optional saga link: the skill (+ params) mycroft runs once this approval
+  // executes, so a gated multi-step workflow resumes from durable state.
+  continuationSkill: Option[String] = None,
+  continuationParams: Option[String] = None,
+  // The conversation the approval arose from; the continuation/notification turn
+  // runs here so the user sees it in context.
+  channel: Option[String] = None
 )
+
+/** An approval-lifecycle event streamed by person-service. Edges subscribe to
+ *  `GET /approvals/stream`: clients render `requested`; mycroft acts on `executed`
+ *  (running the continuation). `kind` is one of requested|approved|rejected|executed. */
+case class ApprovalEvent(kind: String, approval: Approval)
 
 /** Note: `targetId` is intentionally a `String` — it's a polymorphic foreign
  *  key whose interpretation depends on `targetType`. `actor` is also a String

@@ -39,7 +39,22 @@ trait MemoryRepo {
 trait ApprovalRepo {
   def create(approval: Approval): IO[AgentError, Unit]
   def findAll(status: Option[String]): IO[AgentError, List[Approval]]
+  def findById(id: ApprovalId): IO[AgentError, Option[Approval]]
+  /** An open (requested or approved, not-yet-redeemed) approval matching the
+   *  same requester + action + payload, used to dedupe repeated requests. */
+  def findApprovable(requestedBy: String, actionType: String, payloadJson: String): IO[AgentError, Option[Approval]]
+  def decide(id: ApprovalId, status: ApprovalStatus, decidedBy: Option[PersonId], decidedAt: Instant): IO[AgentError, Unit]
+  def markExecuted(id: ApprovalId, resultJson: String, executedAt: Instant): IO[AgentError, Unit]
+  // One-time decision codes (separate table, never joined into Approval, so the
+  // hash can't leak onto an agent-readable surface).
+  def putCode(approvalId: ApprovalId, codeHash: String, expiresAt: Instant): IO[AgentError, Unit]
+  def findCode(approvalId: ApprovalId): IO[AgentError, Option[ApprovalCode]]
+  def markCodeUsed(approvalId: ApprovalId, usedAt: Instant): IO[AgentError, Unit]
 }
+
+/** Internal-only row: a one-time decision code's hash + lifecycle. Never serialised
+ *  to any HTTP surface. */
+final case class ApprovalCode(codeHash: String, expiresAt: Instant, usedAt: Option[Instant])
 
 trait AuditRepo {
   def create(event: AuditEvent): IO[AgentError, Unit]
@@ -169,7 +184,13 @@ object Repos {
       payloadJson = col(rs, "payload_json"),
       status = ApprovalStatus.fromString(col(rs, "status")).getOrElse(ApprovalStatus.Requested),
       createdAt = instant(rs, "created_at"),
-      decidedAt = optInstant(rs, "decided_at")
+      decidedAt = optInstant(rs, "decided_at"),
+      decidedBy = opt(rs, "decided_by").map(PersonId),
+      executedAt = optInstant(rs, "executed_at"),
+      resultJson = opt(rs, "result_json"),
+      continuationSkill = opt(rs, "continuation_skill"),
+      continuationParams = opt(rs, "continuation_params"),
+      channel = opt(rs, "channel")
     )
 
   private def extractEvent(rs: ResultSet): AuditEvent =
@@ -483,9 +504,13 @@ object Repos {
 
     def create(a: Approval): IO[AgentError, Unit] =
       db.execute(
-        "INSERT INTO approvals (id, requested_by, required_person_id, action_type, payload_json, status, created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        """INSERT INTO approvals
+          | (id, requested_by, required_person_id, action_type, payload_json, status,
+          |  created_at, decided_at, continuation_skill, continuation_params, channel)
+          | VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""".stripMargin,
         a.id, a.requestedBy, a.requiredPersonId,
-        a.actionType, a.payloadJson, statusStr(a.status), a.createdAt, a.decidedAt
+        a.actionType, a.payloadJson, statusStr(a.status), a.createdAt, a.decidedAt,
+        a.continuationSkill, a.continuationParams, a.channel
       )
 
     def findAll(status: Option[String]): IO[AgentError, List[Approval]] = {
@@ -495,6 +520,44 @@ object Repos {
       val sql = s"SELECT * FROM approvals${whereSql("WHERE", clauses)} ORDER BY created_at DESC"
       db.query(sql, paramsOf(clauses): _*)(extractApproval)
     }
+
+    def findById(id: ApprovalId): IO[AgentError, Option[Approval]] =
+      db.queryOne("SELECT * FROM approvals WHERE id = ?", id)(extractApproval)
+
+    def findApprovable(requestedBy: String, actionType: String, payloadJson: String): IO[AgentError, Option[Approval]] =
+      db.queryOne(
+        """SELECT * FROM approvals
+          | WHERE requested_by = ? AND action_type = ? AND payload_json = ?
+          |   AND status IN ('requested','approved') AND executed_at IS NULL
+          | ORDER BY created_at DESC LIMIT 1""".stripMargin,
+        requestedBy, actionType, payloadJson
+      )(extractApproval)
+
+    def decide(id: ApprovalId, status: ApprovalStatus, decidedBy: Option[PersonId], decidedAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE approvals SET status = ?, decided_by = ?, decided_at = ? WHERE id = ?",
+        statusStr(status), decidedBy, decidedAt, id
+      )
+
+    def markExecuted(id: ApprovalId, resultJson: String, executedAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE approvals SET executed_at = ?, result_json = ? WHERE id = ?",
+        executedAt, resultJson, id
+      )
+
+    def putCode(approvalId: ApprovalId, codeHash: String, expiresAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "INSERT OR REPLACE INTO approval_codes (approval_id, code_hash, expires_at, used_at) VALUES (?, ?, ?, NULL)",
+        approvalId, codeHash, expiresAt
+      )
+
+    def findCode(approvalId: ApprovalId): IO[AgentError, Option[ApprovalCode]] =
+      db.queryOne("SELECT * FROM approval_codes WHERE approval_id = ?", approvalId)(rs =>
+        ApprovalCode(col(rs, "code_hash"), instant(rs, "expires_at"), optInstant(rs, "used_at"))
+      )
+
+    def markCodeUsed(approvalId: ApprovalId, usedAt: Instant): IO[AgentError, Unit] =
+      db.execute("UPDATE approval_codes SET used_at = ? WHERE approval_id = ?", usedAt, approvalId)
   }
 
   def sqliteAuditRepo(db: Sqlite): AuditRepo = new AuditRepo {

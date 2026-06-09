@@ -204,6 +204,7 @@ object JsonCodecs {
   implicit val commitmentCodec: JsonCodec[Commitment]       = DeriveJsonCodec.gen[Commitment]
   implicit val memoryItemCodec: JsonCodec[MemoryItem]       = DeriveJsonCodec.gen[MemoryItem]
   implicit val approvalCodec: JsonCodec[Approval]           = DeriveJsonCodec.gen[Approval]
+  implicit val approvalEventCodec: JsonCodec[ApprovalEvent] = DeriveJsonCodec.gen[ApprovalEvent]
   implicit val auditEventCodec: JsonCodec[AuditEvent]       = DeriveJsonCodec.gen[AuditEvent]
   implicit val goalCodec: JsonCodec[Goal]                   = DeriveJsonCodec.gen[Goal]
   implicit val goalEvidenceCodec: JsonCodec[GoalEvidence]   = DeriveJsonCodec.gen[GoalEvidence]
