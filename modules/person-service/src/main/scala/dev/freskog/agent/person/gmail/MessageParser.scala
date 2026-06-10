@@ -37,8 +37,8 @@ object MessageParser {
           id = i,
           threadId = threadId,
           from = headers.getOrElse("from", ""),
-          subject = headers.getOrElse("subject", ""),
-          bodyText = body.getOrElse(""),
+          subject = sanitize(headers.getOrElse("subject", "")),
+          bodyText = sanitize(body.getOrElse("")),
           internalDateMillis = internal,
           attachments = attaches
         )
@@ -109,6 +109,23 @@ object MessageParser {
 
   private def stripHtml(html: String): String =
     html.replaceAll("<[^>]+>", " ").replaceAll("\\s+", " ").trim
+
+  /** Neutralise covert prompt-injection vectors in email text before it ever
+   *  reaches the agent: drop every Unicode *format* char (Cf — zero-width spaces,
+   *  joiners, bidi overrides/isolates, the U+E00xx tag block) and other control
+   *  chars, keeping only ordinary whitespace. This kills "invisible instruction"
+   *  tricks; it does NOT (and cannot) neutralise plainly-worded injection — that is
+   *  the job of the untrusted-content framing and the human-approval gate. */
+  private def sanitize(s: String): String = {
+    val out = new java.lang.StringBuilder(s.length)
+    s.codePoints().forEach { cp =>
+      val keep =
+        cp == '\n' || cp == '\r' || cp == '\t' ||
+        (!Character.isISOControl(cp) && Character.getType(cp) != Character.FORMAT.toInt)
+      if (keep) out.appendCodePoint(cp)
+    }
+    out.toString
+  }
 
   private def str(fields: Chunk[(String, Json)], name: String): Option[String] =
     fields.collectFirst { case (k, Json.Str(v)) if k == name => v }

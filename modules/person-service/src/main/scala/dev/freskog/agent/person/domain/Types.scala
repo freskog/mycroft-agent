@@ -44,7 +44,9 @@ case class RequestApprovalRequest(
   continuationSkill: Option[String] = None,
   continuationParams: Option[String] = None,
   // The conversation this arose from; the continuation/notification turn runs here.
-  channel: Option[String] = None
+  channel: Option[String] = None,
+  // Provenance (e.g. `email:gmail-msg-X`) — surfaced to the human at decision time.
+  source: Option[String] = None
 )
 object RequestApprovalRequest {
   implicit val codec: JsonCodec[RequestApprovalRequest] = DeriveJsonCodec.gen[RequestApprovalRequest]

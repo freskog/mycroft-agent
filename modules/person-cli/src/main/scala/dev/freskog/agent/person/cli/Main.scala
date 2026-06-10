@@ -41,7 +41,7 @@ object Main extends ZIOCliDefault {
       actionType: String, payloadJson: String,
       requiredPerson: Option[String],
       continuationSkill: Option[String], continuationParams: Option[String],
-      channel: Option[String]
+      channel: Option[String], source: Option[String]
     ) extends Cmd
     final case class ApprovalList(status: Option[String])                          extends Cmd
     final case class ApprovalShow(id: String)                                      extends Cmd
@@ -137,9 +137,9 @@ object Main extends ZIOCliDefault {
     Options.text("action-type") ++ Options.text("payload-json") ++
       Options.text("required-person").optional ++
       Options.text("continuation-skill").optional ++ Options.text("continuation-params").optional ++
-      Options.text("channel").optional
-  ).map { case (actionType, payloadJson, requiredPerson, contSkill, contParams, channel) =>
-    Cmd.ApprovalRequest(actionType, payloadJson, requiredPerson, contSkill, contParams, channel)
+      Options.text("channel").optional ++ Options.text("source").optional
+  ).map { case (actionType, payloadJson, requiredPerson, contSkill, contParams, channel, source) =>
+    Cmd.ApprovalRequest(actionType, payloadJson, requiredPerson, contSkill, contParams, channel, source)
   }
   private val approvalList = Command("list", Options.text("status").optional).map(s => Cmd.ApprovalList(s))
   private val approvalShow = Command("show", Args.text("id")).map(id => Cmd.ApprovalShow(id))
@@ -450,7 +450,7 @@ object Main extends ZIOCliDefault {
         _       <- Console.printLine(out).orDie
       } yield ()
 
-    case Cmd.ApprovalRequest(actionType, payloadJson, requiredPerson, contSkill, contParams, channel) =>
+    case Cmd.ApprovalRequest(actionType, payloadJson, requiredPerson, contSkill, contParams, channel, source) =>
       val body = jsonObj(
         "requestedBy"        -> "\"agent\"",
         "requiredPersonId"   -> requiredPerson.toJson,
@@ -458,7 +458,8 @@ object Main extends ZIOCliDefault {
         "payloadJson"        -> payloadJson.toJson,
         "continuationSkill"  -> contSkill.toJson,
         "continuationParams" -> contParams.toJson,
-        "channel"            -> channel.toJson
+        "channel"            -> channel.toJson,
+        "source"             -> source.toJson
       )
       HttpClient.post("/approvals/request", body).flatMap(out => Console.printLine(out).orDie)
 
@@ -485,7 +486,8 @@ object Main extends ZIOCliDefault {
         "requiredPersonId" -> requiredPerson.orElse(Some(owner)).toJson,
         "actionType"       -> "\"goal.create\"",
         "payloadJson"      -> goalJson.toJson,
-        "channel"          -> channel.toJson
+        "channel"          -> channel.toJson,
+        "source"           -> source.toJson
       )
       HttpClient.post("/approvals/request", body).flatMap(out => Console.printLine(out).orDie)
 

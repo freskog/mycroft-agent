@@ -350,7 +350,11 @@ case class Approval(
   continuationParams: Option[String] = None,
   // The conversation the approval arose from; the continuation/notification turn
   // runs here so the user sees it in context.
-  channel: Option[String] = None
+  channel: Option[String] = None,
+  // Provenance of the request (e.g. `email:gmail-msg-X`, `chat`). Surfaced to the
+  // human at decision time so a request that originated in untrusted content (an
+  // email/web page) can be judged accordingly.
+  source: Option[String] = None
 )
 
 /** An approval-lifecycle event streamed by person-service. Edges subscribe to

@@ -72,6 +72,15 @@ services:
     networks:
       - agentnet
     ports: ["8090:8090"]
+    # Hardening: mycroft is the component exposed to untrusted content (email/web),
+    # so shrink what a hijacked agent can do at the OS level. cap_drop ALL also
+    # prevents remounting the read-only skills bind. (Next step, needs a non-root
+    # user + writable /workspace in the image: `user:` + `read_only: true` + a
+    # tmpfs for /workspace — deferred until the image ships a non-root user.)
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
 
   # REPL channel adapter (interactive). Runs on a JVM (JLine terminal UI), not
   # native — it is started once and latency does not matter. Build once with

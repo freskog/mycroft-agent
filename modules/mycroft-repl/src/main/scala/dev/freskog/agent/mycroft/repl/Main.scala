@@ -501,7 +501,8 @@ object Main extends ZIOAppDefault {
             val a = ev.approval
             val msg = ev.kind match {
               case "requested" =>
-                Some(s"\n⚖  Approval needed [${a.id.value}]: ${a.actionType}  ${a.payloadJson}\n" +
+                val prov = a.source.map(s => s"  (from $s)").getOrElse("")
+                Some(s"\n⚖  Approval needed [${a.id.value}]: ${a.actionType}$prov  ${a.payloadJson}\n" +
                   s"   /approve ${a.id.value}   |   /reject ${a.id.value} [reason]")
               case "rejected" => Some(s"\n✗  Approval ${a.id.value} rejected.")
               case _          => None // `executed` shows up as a continuation turn

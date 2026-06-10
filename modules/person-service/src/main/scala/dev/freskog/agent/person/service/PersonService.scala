@@ -393,7 +393,8 @@ object PersonService {
                      req.actionType, req.payloadJson, ApprovalStatus.Requested, now, None,
                      continuationSkill = req.continuationSkill,
                      continuationParams = req.continuationParams,
-                     channel = req.channel
+                     channel = req.channel,
+                     source = req.source
                    )
             _   <- approvalRepo.create(a)
             _   <- auditPayloadRaw(

@@ -81,6 +81,17 @@ The approval lifecycle, deliberately with **no suspended fibers** (so it survive
 
 This keeps a *compromised* agent unable to bypass the gate — it can neither route to the decision endpoint nor produce a valid code — while the gateless path keeps everyday learning autonomous.
 
+### Untrusted content & prompt injection
+
+The agent reads attacker-controllable content — email bodies, attachments, and (in future) web pages. Prompt injection is **not reliably solvable at the model layer**, so we assume the model can be fooled and defend in layers, strongest first:
+
+1. **Capability containment (primary).** A hijacked agent still can't take any outside-effect action (send mail, create events/goals) without a human approving via a one-time code on a network it can't reach. So injection can't directly cause irreversible harm — at worst it produces an approval request the human scrutinises. **The exfiltration gap opens with web fetch:** untrusted content + an agent-controlled outbound request is the channel. The fetch tool (when built) **must** have egress control from day one — fetch only via an allowlist/proxy, and the `mycroft` container's general egress locked down so the constrained tool is the only way out. Sanitisation is moot without this.
+2. **Instruction/data separation (general harness rule).** Only the system prompt and the sender's messages are authoritative. **All** tool output (`safe_run`/`runlog`/`run_skill` — email, web, attachments, command output) is fenced as `<<<UNTRUSTED_TOOL_OUTPUT … >>>` (`Loop.untrusted`) and the system prompt forbids obeying instructions found inside it.
+3. **Sanitisation at the source (per-tool, covert-channel scrub).** Format-specific, so it lives in each reader: email bodies are scrubbed of invisible/format Unicode (zero-width, bidi overrides, the tag block) and hidden HTML in `MessageParser.sanitize`; a future web tool readability-extracts visible text. Kills *invisible* injection; cannot neutralise a plainly-worded one — that's what layers 1–2 are for.
+4. **Provenance at the decision point.** An approval carries its `source` (e.g. `email:gmail-msg-X`), surfaced to the human so a request that originated in untrusted content is judged accordingly. Memory written from untrusted sources stays low-confidence/observation, never silently authoritative.
+
+OS-level, `mycroft` (the component exposed to untrusted content) runs with `cap_drop: ALL` + `no-new-privileges` and skills mounted read-only; a non-root user + read-only root fs is the next hardening step.
+
 ### Why Credentials Must Not Be in the Sandbox
 
 Credentials (OAuth tokens, API keys, SSH keys) in the sandbox would let a compromised agent:

@@ -191,7 +191,8 @@ object Repos {
       resultJson = opt(rs, "result_json"),
       continuationSkill = opt(rs, "continuation_skill"),
       continuationParams = opt(rs, "continuation_params"),
-      channel = opt(rs, "channel")
+      channel = opt(rs, "channel"),
+      source = opt(rs, "source")
     )
 
   private def extractEvent(rs: ResultSet): AuditEvent =
@@ -513,11 +514,11 @@ object Repos {
       db.execute(
         """INSERT INTO approvals
           | (id, requested_by, required_person_id, action_type, payload_json, status,
-          |  created_at, decided_at, continuation_skill, continuation_params, channel)
-          | VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""".stripMargin,
+          |  created_at, decided_at, continuation_skill, continuation_params, channel, source)
+          | VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""".stripMargin,
         a.id, a.requestedBy, a.requiredPersonId,
         a.actionType, a.payloadJson, statusStr(a.status), a.createdAt, a.decidedAt,
-        a.continuationSkill, a.continuationParams, a.channel
+        a.continuationSkill, a.continuationParams, a.channel, a.source
       )
 
     def findAll(status: Option[String]): IO[AgentError, List[Approval]] = {

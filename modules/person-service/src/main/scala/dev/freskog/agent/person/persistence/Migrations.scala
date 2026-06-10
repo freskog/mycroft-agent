@@ -262,7 +262,10 @@ object Migrations {
       |  expires_at TEXT NOT NULL,
       |  used_at TEXT,
       |  FOREIGN KEY (approval_id) REFERENCES approvals(id)
-      |)""".stripMargin
+      |)""".stripMargin,
+
+    // V8: provenance of an approval request (surfaced to the human at decision time).
+    "ALTER TABLE approvals ADD COLUMN source TEXT"
   )
 
   def migrate(db: Sqlite): IO[dev.freskog.agent.common.AgentError, Unit] =
