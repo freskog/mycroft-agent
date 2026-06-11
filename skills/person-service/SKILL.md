@@ -19,39 +19,39 @@ Interact with the trusted person-service sidecar for durable personal and family
 safe-run --cwd /tmp/workspace --timeout 5 --shell bash -- "person health"
 ```
 
-### Propose memory
+### Record memory
 
 ```
 safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
-  "person memory propose \
+  "person memory record \
     --person fred \
     --kind preference \
     --text 'Prefer draft-only email actions' \
-    --source chat:local"
+    --source chat:local --trust user-stated"
 ```
 
-### Request approval
+### Request approval (gated)
 
 ```
 safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
   "person approval request \
-    --action-type calendar.propose_event \
+    --action-type calendar.create_event \
     --payload-json '{\"summary\":\"Family dinner\",\"date\":\"2026-05-30\"}'"
 ```
 
 ### Household graph (entities & relationships)
 
 ```
-person entity propose --kind organization --name 'MegaCorp' --source onboarding:work
+person entity record --kind organization --name 'MegaCorp' --source onboarding:work
 person entity list --status accepted
-person relationship propose --from fred --from-kind person --type employed_by \
+person relationship record --from fred --from-kind person --type employed_by \
   --to <entity-id> --to-kind entity --source onboarding:work --valid-from 2024-01-01T00:00:00Z
 person household        # accepted, currently-active persons/entities/relationships
 ```
 
 ### Writing state is gateless; correct it after the fact
 
-Memory, entities, and relationships are written **live** — a `propose` creates an
+Memory, entities, and relationships are written **live** — a `record` creates an
 `accepted` item immediately; there is no review queue and no accept step. `person
 household` and `person memory profile` show that live, accepted state. Safety is
 reversibility, not a gate:

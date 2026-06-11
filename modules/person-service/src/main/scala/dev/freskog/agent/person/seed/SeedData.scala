@@ -18,8 +18,8 @@ object SeedData {
     val goalRepo   = Repos.sqliteGoalRepo(db)
 
     val persons = List(
-      Person(FredId, "Fred", "Europe/London", Some("en-GB"), active = true),
-      Person(PaulaId, "Paula", "Europe/London", None, active = true)
+      Person(FredId, "Fred", "Europe/Dublin", Some("en-IE"), active = true),
+      Person(PaulaId, "Paula", "Europe/Dublin", None, active = true)
     )
 
     for {

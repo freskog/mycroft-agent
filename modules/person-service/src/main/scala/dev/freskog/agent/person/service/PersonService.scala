@@ -20,6 +20,7 @@ trait PersonService {
   def listPersons: IO[AgentError, List[Person]]
   def proposeCommitment(req: ProposeCommitmentRequest): IO[AgentError, Commitment]
   def listCommitments(owner: Option[PersonId], status: Option[String]): IO[AgentError, List[Commitment]]
+  def updateCommitmentStatus(id: CommitmentId, status: CommitmentStatus, reason: Option[String]): IO[AgentError, Commitment]
   def proposeMemory(req: ProposeMemoryRequest): IO[AgentError, MemoryItem]
   def listMemory(personId: Option[PersonId], status: Option[String], kind: Option[String]): IO[AgentError, List[MemoryItem]]
   def requestApproval(req: RequestApprovalRequest): IO[AgentError, Approval]
@@ -169,16 +170,28 @@ object PersonService {
                           audit("commitment.propose.update", "commitment", Some(c.id.value), now)
                             .as(c.copy(text = req.text, evidence = req.evidence, dueAt = req.dueAt, updatedAt = now))
                       case None =>
+                        // Gateless: a commitment is written live as `Open` (tracked) and
+                        // is reversible (cancel/ignore/done). `Open` means tracked, NOT
+                        // that the person has agreed to it.
                         val c = Commitment(CommitmentId(newUuid), req.ownerPersonId,
-                                           CommitmentStatus.Proposed, req.text, req.source, req.evidence,
+                                           CommitmentStatus.Open, req.text, req.source, req.evidence,
                                            req.dueAt, now, now)
                         commitmentRepo.create(c) *>
-                          audit("commitment.propose", "commitment", Some(c.id.value), now).as(c)
+                          audit("commitment.record", "commitment", Some(c.id.value), now).as(c)
                     }
       } yield result
 
     def listCommitments(owner: Option[PersonId], status: Option[String]): IO[AgentError, List[Commitment]] =
       commitmentRepo.findAll(owner, status)
+
+    def updateCommitmentStatus(id: CommitmentId, status: CommitmentStatus, reason: Option[String]): IO[AgentError, Commitment] =
+      for {
+        _       <- commitmentRepo.findById(id).someOrFail(AgentError.NotFound("commitment", id.value))
+        now     <- Clock.instant
+        _       <- commitmentRepo.updateStatus(id, status, now)
+        _       <- auditPayload(s"commitment.status.${CommitmentStatus.asString(status)}", "commitment", Some(id.value), now, StatusChangePayload(reason))
+        updated <- commitmentRepo.findById(id).someOrFail(AgentError.NotFound("commitment", id.value))
+      } yield updated
 
     // --- Memory ---
 
@@ -192,7 +205,9 @@ object PersonService {
                  text = req.text, source = req.source, confidence = req.confidence,
                  createdAt = now, updatedAt = now,
                  validFrom = req.validFrom, validUntil = req.validUntil,
-                 originEventId = req.originEventId
+                 originEventId = req.originEventId,
+                 trust = req.trust.getOrElse(TrustLevel.AgentInference),
+                 sender = req.sender
                )
         _   <- memoryRepo.create(m)
         _   <- audit("memory.propose", "memory_item", Some(m.id.value), now)
@@ -384,7 +399,10 @@ object PersonService {
      *  on the event stream so subscribed clients can surface it. */
     def requestApproval(req: RequestApprovalRequest): IO[AgentError, Approval] =
       approvalRepo.findApprovable(req.requestedBy, req.actionType, req.payloadJson).flatMap {
-        case Some(existing) => ZIO.succeed(existing)
+        // Idempotent: the same request already exists. Re-publish `requested` so a
+        // repeat ask re-surfaces the still-pending approval to subscribed clients
+        // (e.g. if the human missed the first prompt).
+        case Some(existing) => approvalHub.publish(ApprovalEvent("requested", existing)).as(existing)
         case None =>
           for {
             now <- Clock.instant
@@ -407,7 +425,12 @@ object PersonService {
       }
 
     def listApprovals(status: Option[String]): IO[AgentError, List[Approval]] =
-      approvalRepo.findAll(status)
+      // "pending" is the natural word for an awaiting approval, but the stored
+      // status is `requested`; accept it as an alias so the obvious query works.
+      approvalRepo.findAll(status.map {
+        case s if s.equalsIgnoreCase("pending") => "requested"
+        case s                                  => s
+      })
 
     def getApproval(id: ApprovalId): IO[AgentError, Option[Approval]] =
       approvalRepo.findById(id)
@@ -534,12 +557,12 @@ object PersonService {
                     }
         result   <- existing match {
                       case Some(g) =>
-                        goalRepo.updateContent(g.id, req.title, req.constraintsJson, now) *>
+                        goalRepo.updateContent(g.id, req.title, req.constraintsJson, req.dueAt, now) *>
                           audit("goal.propose.update", "goal", Some(g.id.value), now)
-                            .as(g.copy(title = req.title, constraintsJson = req.constraintsJson, updatedAt = now))
+                            .as(g.copy(title = req.title, constraintsJson = req.constraintsJson, dueAt = req.dueAt, updatedAt = now))
                       case None =>
                         val g = Goal(GoalId(newUuid), req.ownerPersonId, req.title, req.outcome,
-                                     req.evidenceRule, req.constraintsJson, GoalStatus.Open, None, req.source, now, now)
+                                     req.evidenceRule, req.constraintsJson, GoalStatus.Open, None, req.source, now, now, req.dueAt)
                         goalRepo.create(g) *>
                           audit("goal.propose", "goal", Some(g.id.value), now).as(g)
                     }
@@ -593,7 +616,8 @@ object PersonService {
                  targetType = req.targetType.getOrElse("event"),
                  targetId = req.targetId,
                  text = req.text, payloadJson = req.payloadJson.getOrElse("{}"),
-                 createdAt = now
+                 createdAt = now,
+                 source = req.source
                )
         _   <- auditRepo.create(ev)
       } yield ev
@@ -629,6 +653,7 @@ object PersonService {
       } yield items
 
     private def consolidateOne(e: AuditEvent, now: Instant): IO[AgentError, MemoryItem] = {
+      val (trust, sender) = classifyOrigin(e.source)
       val item = MemoryItem(
         id = MemoryId(newUuid),
         personId = None,
@@ -636,10 +661,26 @@ object PersonService {
         text = e.text.getOrElse(e.payloadJson),
         source = s"event:${e.id.value}", confidence = Some(DefaultConfidence),
         createdAt = now, updatedAt = now,
-        originEventId = Some(e.id)
+        originEventId = Some(e.id),
+        trust = trust, sender = sender
       )
       memoryRepo.create(item).as(item)
     }
+
+    /** Derive a belief's trust + sender from the originating event's provenance.
+     *  A claim from untrusted external content (`email:…`, `web:…`, a URL) is
+     *  `ExternalContent` — usable for reasoning but never an authoritative profile
+     *  fact (the profile is onboarding-sourced) nor sufficient to authorize a gated
+     *  action. Everything else (chat/agent/none) is the agent's own inference. The
+     *  sender is parsed from an `email:<id>|<sender>` suffix when present. */
+    private def classifyOrigin(source: Option[String]): (TrustLevel, Option[String]) =
+      source.map(_.toLowerCase) match {
+        case Some(s) if s.startsWith("email:") || s.startsWith("web:") || s.startsWith("http") =>
+          val sender = source.flatMap(_.split('|').drop(1).headOption.map(_.trim).filter(_.nonEmpty))
+          (TrustLevel.ExternalContent, sender)
+        case _ =>
+          (TrustLevel.AgentInference, None)
+      }
 
     // --- Channels & messages ---
 
@@ -820,34 +861,43 @@ object PersonService {
       since.map(s => s"$base after:${s.getEpochSecond}").getOrElse(base)
     }
 
+    /** Sync one message. New messages are inserted (return 1). A message we
+     *  already have but that is still `pending` is re-fetched and re-parsed, so
+     *  improvements to `MessageParser` heal previously-ingested bodies (return 0
+     *  — not new). An already-triaged message is left untouched and not re-fetched. */
     private def syncOneMessage(accessToken: String, externalId: String, owner: PersonId, now: Instant): IO[AgentError, Int] =
-      inboxRepo.existsExternal(GmailConfig.ProviderName, externalId, owner).flatMap {
-        case true => ZIO.succeed(0)
-        case false =>
+      inboxRepo.findByExternal(GmailConfig.ProviderName, externalId, owner).flatMap {
+        case Some(existing) if existing.triageStatus != TriageStatus.Pending =>
+          ZIO.succeed(0)
+        case existingOpt =>
           for {
             parsed <- GmailClient.getMessage(accessToken, externalId).flatMap {
                         case Some(p) => ZIO.succeed(p)
                         case None    => ZIO.fail(AgentError.DecodeFailed(s"Could not parse Gmail message $externalId"))
                       }
-            msg     = InboxMessage(
-                        id = InboxMessageId(newUuid),
-                        provider = GmailConfig.ProviderName,
-                        externalId = parsed.id,
-                        threadId = parsed.threadId,
-                        fromAddr = parsed.from,
-                        subject = parsed.subject,
-                        bodyText = truncateBody(parsed.bodyText),
-                        receivedAt = Instant.ofEpochMilli(parsed.internalDateMillis),
-                        ownerPersonId = owner,
-                        triageStatus = TriageStatus.Pending,
-                        triagedAt = None,
-                        sourceEventId = None,
-                        attachments = parsed.attachments.map(a =>
-                          InboxAttachment(a.attachmentId, a.filename, a.mimeType, a.sizeBytes)
-                        )
-                      )
-            _      <- inboxRepo.upsert(msg)
-          } yield 1
+            atts    = parsed.attachments.map(a => InboxAttachment(a.attachmentId, a.filename, a.mimeType, a.sizeBytes))
+            body    = truncateBody(parsed.bodyText)
+            inserted <- existingOpt match {
+                          case Some(existing) =>
+                            inboxRepo.updateContent(existing.id, parsed.subject, body, atts).as(0)
+                          case None =>
+                            inboxRepo.upsert(InboxMessage(
+                              id = InboxMessageId(newUuid),
+                              provider = GmailConfig.ProviderName,
+                              externalId = parsed.id,
+                              threadId = parsed.threadId,
+                              fromAddr = parsed.from,
+                              subject = parsed.subject,
+                              bodyText = body,
+                              receivedAt = Instant.ofEpochMilli(parsed.internalDateMillis),
+                              ownerPersonId = owner,
+                              triageStatus = TriageStatus.Pending,
+                              triagedAt = None,
+                              sourceEventId = None,
+                              attachments = atts
+                            )).as(1)
+                        }
+          } yield inserted
       }
 
     private def truncateBody(text: String, maxLen: Int = 16000): String =

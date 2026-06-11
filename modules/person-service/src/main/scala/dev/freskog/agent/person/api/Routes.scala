@@ -129,6 +129,9 @@ object Routes {
           status = queryParam(req, "status")
         ))
       },
+      Method.POST / "commitments" / string("id") / "status" -> handler { (id: String, req: Request) =>
+        handlePost[UpdateCommitmentStatusRequest, Commitment](req)(r => service.updateCommitmentStatus(CommitmentId(id), r.status, r.reason))
+      },
 
       // --- memory: literal sub-paths first, dynamic :id second ---
       Method.POST / "memory" / "propose" -> handler { (req: Request) =>

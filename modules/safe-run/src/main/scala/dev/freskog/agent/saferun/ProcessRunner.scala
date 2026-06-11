@@ -12,7 +12,11 @@ case class RunConfig(
   command: String,
   shell: Shell,
   cwd: Path,
-  timeoutSeconds: Int
+  timeoutSeconds: Int,
+  // Extra environment variables for the child process (merged over the inherited
+  // env). Used to pass per-turn context (e.g. the conversation channel) down to
+  // the `person` CLI without the agent having to thread it by hand.
+  env: Map[String, String] = Map.empty
 )
 
 object ProcessRunner {
@@ -65,6 +69,7 @@ object ProcessRunner {
       process   <- ZIO.attemptBlocking {
         val pb = new ProcessBuilder(cmd)
         pb.directory(config.cwd.toFile)
+        if (config.env.nonEmpty) pb.environment().putAll(config.env.asJava)
         pb.redirectOutput(stdoutFile.toFile)
         pb.redirectError(stderrFile.toFile)
         pb.start()

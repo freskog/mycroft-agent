@@ -107,6 +107,13 @@ object JsonCodecs {
   implicit val memoryKindDecoder: JsonDecoder[MemoryKind] =
     JsonDecoder.string.mapOrFail(MemoryKind.fromString)
 
+  // --- TrustLevel ---
+  implicit val trustLevelEncoder: JsonEncoder[TrustLevel] =
+    JsonEncoder.string.contramap(TrustLevel.asString)
+
+  implicit val trustLevelDecoder: JsonDecoder[TrustLevel] =
+    JsonDecoder.string.mapOrFail(TrustLevel.fromString)
+
   // --- ApprovalStatus ---
   implicit val approvalStatusEncoder: JsonEncoder[ApprovalStatus] =
     JsonEncoder.string.contramap {

@@ -12,7 +12,7 @@ import java.net.http.{HttpClient => JHttpClient, HttpRequest, HttpResponse}
 /** OpenAI-compatible client for LM Studio. Streaming completions are read with
  *  `BodyHandlers.ofLines()` on the blocking pool and demuxed by StreamParser. */
 trait LmStudioClient {
-  def chat(model: String, messages: List[ChatMessage], maxTokens: Int, toolsJson: Option[String], sampling: SamplingParams): ZStream[Any, AgentError, ChatChunk]
+  def chat(model: String, messages: List[ChatMessage], maxTokens: Int, toolsJson: Option[String], sampling: SamplingParams, enableThinking: Option[Boolean] = None): ZStream[Any, AgentError, ChatChunk]
   def listModels: IO[AgentError, List[String]]
 }
 
@@ -27,8 +27,8 @@ object LmStudioClient {
       .connectTimeout(java.time.Duration.ofSeconds(10))
       .build()
 
-    def chat(model: String, messages: List[ChatMessage], maxTokens: Int, toolsJson: Option[String], sampling: SamplingParams): ZStream[Any, AgentError, ChatChunk] = {
-      val body = ChatProtocol.encodeBody(model, messages, maxTokens, stream = true, toolsJson, sampling)
+    def chat(model: String, messages: List[ChatMessage], maxTokens: Int, toolsJson: Option[String], sampling: SamplingParams, enableThinking: Option[Boolean] = None): ZStream[Any, AgentError, ChatChunk] = {
+      val body = ChatProtocol.encodeBody(model, messages, maxTokens, stream = true, toolsJson, sampling, enableThinking)
       val request = HttpRequest.newBuilder()
         .uri(URI.create(s"$baseUrl/v1/chat/completions"))
         .POST(HttpRequest.BodyPublishers.ofString(body))

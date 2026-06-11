@@ -265,7 +265,20 @@ object Migrations {
       |)""".stripMargin,
 
     // V8: provenance of an approval request (surfaced to the human at decision time).
-    "ALTER TABLE approvals ADD COLUMN source TEXT"
+    "ALTER TABLE approvals ADD COLUMN source TEXT",
+
+    // V9: memory provenance (evidence ≠ belief ≠ authority). `trust` is the rung
+    // on the trust ladder (external_content = inferred from an email/web page,
+    // usable for reasoning but unverified); `sender` is who/what asserted it.
+    // `audit_events.source` is first-class event provenance so consolidation can
+    // classify the trust of any belief it derives. FTS mirrors index `text` only,
+    // so these columns need no FTS change.
+    "ALTER TABLE memory_items ADD COLUMN trust TEXT NOT NULL DEFAULT 'agent_inference'",
+    "ALTER TABLE memory_items ADD COLUMN sender TEXT",
+    "ALTER TABLE audit_events ADD COLUMN source TEXT",
+
+    // V10: optional target date on goals ("done by …"). Mutable (deadlines slip).
+    "ALTER TABLE goals ADD COLUMN due_at TEXT"
   )
 
   def migrate(db: Sqlite): IO[dev.freskog.agent.common.AgentError, Unit] =

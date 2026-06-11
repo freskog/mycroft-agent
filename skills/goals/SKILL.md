@@ -1,6 +1,6 @@
 ---
 name: goals
-description: Propose, track, and resolve durable goals — the user-controlled completion contract that survives replanning.
+description: Request, track, and resolve durable goals — the user-controlled completion contract that survives replanning. Goal creation is gated (request, never created directly).
 version: 1.0.0
 capabilities: [person-cli, safe-run]
 ---
@@ -29,7 +29,7 @@ Do **not** use a goal for one-shot questions, single-command tasks, or anything 
 | `evidence`      | Appended over the goal's life: file paths, commitment ids, audit refs                            |
 | `source`        | Provenance (email id, conversation, etc.)                                                        |
 
-The immutability of `outcome` and `evidence-rule` is by design: it prevents environmental text or replanning from quietly redefining the contract. If the user actually wants a different outcome, cancel the goal and propose a new one.
+The immutability of `outcome` and `evidence-rule` is by design: it prevents environmental text or replanning from quietly redefining the contract. If the user actually wants a different outcome, cancel the goal and request a new one (goal creation is gated).
 
 ## Commands
 
@@ -47,9 +47,20 @@ safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
     --title 'Approve Q3 report' \
     --outcome 'Q3 report committed to main branch and acknowledged by stakeholders' \
     --evidence-rule 'Git commit hash on main + stakeholder confirmation email' \
-    --source email:gmail-msg-456 \
-    --channel <this conversation's channel>"
+    --due 2026-06-30T17:00:00Z \
+    --source email:gmail-msg-456"
 ```
+
+You do **not** need `--channel` — it is set automatically to the current
+conversation so the approval result comes back to the right place.
+
+`--due` is **optional** — a target date for "done by …". It is a full **ISO-8601
+instant** (`2026-06-30T17:00:00Z`), like commitments' `--due`; resolve a phrase
+like "by Friday" against the clock line in your prompt (use a python3 snippet for
+the date math rather than guessing), and never invent other flags — `--owner`,
+`--title`, `--outcome`, `--evidence-rule`, `--due`, `--source`, `--required-person`,
+`--channel` are the only ones. Unlike `outcome`/`evidence-rule`, the due date is
+mutable (re-request to change it).
 
 This creates a `goal.create` approval (see the `approvals` skill). Tell the user
 you've requested the goal and **stop** — don't wait or poll. A human approves out
@@ -80,14 +91,26 @@ safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
 
 `kind` values: `file`, `commitment`, `note`, `audit`.
 
-### Update status
+### Change a goal's status / cancel it (these are the ONLY verbs — do not probe `--help`)
 
+To **cancel** a goal, use the `cancel` shortcut (preferred — simplest):
+```
+person goal cancel <goal-id> [--reason '...']
+```
+
+For any other transition, use `status --to <state>` (note: `--to`, and the id is a
+**positional argument** — `person goal status <goal-id> --to <state>`):
 ```
 person goal status <goal-id> --to blocked --reason 'waiting on stakeholder reply'
 person goal status <goal-id> --to open
 person goal status <goal-id> --to done
-person goal status <goal-id> --to cancelled
+person goal status <goal-id> --to cancelled    # same as `goal cancel`
 ```
+
+There is **no** `goal close`, `goal archive`, `goal abandon`, `goal reject`, or
+`goal update`, and the flag is `--to`, not `--status`. Valid states: `open`,
+`blocked`, `done`, `cancelled`. If you're unsure of a goal command, run
+`skill show goals` — don't spelunk through `--help`.
 
 ## Rules
 

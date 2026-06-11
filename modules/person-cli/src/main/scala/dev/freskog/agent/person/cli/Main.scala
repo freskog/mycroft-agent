@@ -24,17 +24,19 @@ object Main extends ZIOCliDefault {
     ) extends Cmd
     case object PersonList extends Cmd
 
-    final case class CommitmentPropose(
+    final case class CommitmentRecord(
       owner: String, text: String,
       source: String, evidence: String, due: Option[String]
     ) extends Cmd
     final case class CommitmentList(
       owner: Option[String], status: Option[String]
     ) extends Cmd
+    final case class CommitmentStatus(id: String, to: String, reason: Option[String]) extends Cmd
 
-    final case class MemoryPropose(
+    final case class MemoryRecord(
       person: String, kind: String, text: String, source: String,
-      confidence: Option[BigDecimal], validFrom: Option[String], validUntil: Option[String]
+      confidence: Option[BigDecimal], validFrom: Option[String], validUntil: Option[String],
+      trust: Option[String], sender: Option[String]
     ) extends Cmd
 
     final case class ApprovalRequest(
@@ -51,7 +53,7 @@ object Main extends ZIOCliDefault {
     final case class GoalRequest(
       owner: String, title: String, outcome: String,
       evidenceRule: String, constraintsJson: Option[String], source: Option[String],
-      requiredPerson: Option[String], channel: Option[String]
+      requiredPerson: Option[String], channel: Option[String], due: Option[String]
     ) extends Cmd
     final case class GoalList(
       owner: Option[String], status: Option[String]
@@ -87,7 +89,7 @@ object Main extends ZIOCliDefault {
 
     case object Household extends Cmd
 
-    final case class EventRecord(actor: Option[String], action: String, category: String, targetType: Option[String], targetId: Option[String], text: Option[String], payloadJson: Option[String]) extends Cmd
+    final case class EventRecord(actor: Option[String], action: String, category: String, targetType: Option[String], targetId: Option[String], text: Option[String], payloadJson: Option[String], source: Option[String]) extends Cmd
     final case class EventLog(category: Option[String], since: Option[String], until: Option[String], limit: Option[Int]) extends Cmd
     final case class EventSearch(query: String, category: Option[String], since: Option[String], limit: Option[Int]) extends Cmd
 
@@ -101,13 +103,13 @@ object Main extends ZIOCliDefault {
     final case class CalendarAgenda(owner: String, days: Option[Int], from: Option[String], to: Option[String]) extends Cmd
   }
 
-  // --- commitment ---
-  private val commitmentPropose = Command(
-    "propose",
+  // --- commitment (gateless: recorded live as `open`, reversible) ---
+  private val commitmentRecord = Command(
+    "record",
     Options.text("owner") ++ Options.text("text") ++
       Options.text("source") ++ Options.text("evidence") ++ Options.text("due").optional
   ).map { case (owner, text, source, evidence, due) =>
-    Cmd.CommitmentPropose(owner, text, source, evidence, due)
+    Cmd.CommitmentRecord(owner, text, source, evidence, due)
   }
 
   private val commitmentList = Command(
@@ -115,17 +117,29 @@ object Main extends ZIOCliDefault {
     Options.text("owner").optional ++ Options.text("status").optional
   ).map { case (owner, status) => Cmd.CommitmentList(owner, status) }
 
-  private val commitment = Command("commitment").subcommands(commitmentPropose, commitmentList)
+  // Lifecycle (reversal/resolution): done | ignore | cancel. Each soft-updates
+  // status and keeps the audit trail.
+  private val commitmentDone =
+    Command("done", Options.text("reason").optional, Args.text("id")).map { case (r, id) => Cmd.CommitmentStatus(id, "done", r) }
+  private val commitmentIgnore =
+    Command("ignore", Options.text("reason").optional, Args.text("id")).map { case (r, id) => Cmd.CommitmentStatus(id, "ignored", r) }
+  private val commitmentCancel =
+    Command("cancel", Options.text("reason").optional, Args.text("id")).map { case (r, id) => Cmd.CommitmentStatus(id, "cancelled", r) }
 
-  // --- memory ---
-  private val memoryPropose = Command(
-    "propose",
+  private val commitment = Command("commitment").subcommands(
+    commitmentRecord, commitmentList, commitmentDone, commitmentIgnore, commitmentCancel
+  )
+
+  // --- memory (gateless: recorded live, reversible) ---
+  private val memoryRecord = Command(
+    "record",
     Options.text("person") ++ Options.text("kind") ++
       Options.text("text") ++ Options.text("source") ++
       Options.decimal("confidence").optional ++
-      Options.text("valid-from").optional ++ Options.text("valid-until").optional
-  ).map { case (person, kind, text, source, confidence, validFrom, validUntil) =>
-    Cmd.MemoryPropose(person, kind, text, source, confidence, validFrom, validUntil)
+      Options.text("valid-from").optional ++ Options.text("valid-until").optional ++
+      Options.text("trust").optional ++ Options.text("sender").optional
+  ).map { case (person, kind, text, source, confidence, validFrom, validUntil, trust, sender) =>
+    Cmd.MemoryRecord(person, kind, text, source, confidence, validFrom, validUntil, trust, sender)
   }
 
   // --- approval ---
@@ -154,9 +168,10 @@ object Main extends ZIOCliDefault {
     Options.text("owner") ++ Options.text("title") ++
       Options.text("outcome") ++ Options.text("evidence-rule") ++
       Options.text("constraints-json").optional ++ Options.text("source").optional ++
-      Options.text("required-person").optional ++ Options.text("channel").optional
-  ).map { case (owner, title, outcome, evidenceRule, constraints, source, requiredPerson, channel) =>
-    Cmd.GoalRequest(owner, title, outcome, evidenceRule, constraints, source, requiredPerson, channel)
+      Options.text("required-person").optional ++ Options.text("channel").optional ++
+      Options.text("due").optional
+  ).map { case (owner, title, outcome, evidenceRule, constraints, source, requiredPerson, channel, due) =>
+    Cmd.GoalRequest(owner, title, outcome, evidenceRule, constraints, source, requiredPerson, channel, due)
   }
 
   private val goalList = Command(
@@ -229,13 +244,13 @@ object Main extends ZIOCliDefault {
   ).map { case (person, kind, status) => Cmd.MemoryList(person, kind, status) }
 
   private val memoryExt = Command("memory").subcommands(
-    memoryPropose, memoryReject, memoryArchive,
+    memoryRecord, memoryReject, memoryArchive,
     memorySupersede, memorySearch, memoryContext, memoryConflicts, memoryConsolidate, memoryProfile, memoryList
   )
 
-  // --- entity (household graph nodes) ---
-  private val entityPropose = Command(
-    "propose",
+  // --- entity (household graph nodes; gateless, reversible) ---
+  private val entityRecord = Command(
+    "record",
     Options.text("kind") ++ Options.text("name") ++
       Options.text("attributes-json").optional ++ Options.text("source") ++
       Options.decimal("confidence").optional
@@ -254,12 +269,12 @@ object Main extends ZIOCliDefault {
   ).map { case (nu, ol) => Cmd.EntitySupersede(nu, ol) }
 
   private val entity = Command("entity").subcommands(
-    entityPropose, entityList, entityResolve, entityReject, entitySupersede
+    entityRecord, entityList, entityResolve, entityReject, entitySupersede
   )
 
-  // --- relationship (household graph edges) ---
-  private val relationshipPropose = Command(
-    "propose",
+  // --- relationship (household graph edges; gateless, reversible) ---
+  private val relationshipRecord = Command(
+    "record",
     Options.text("from") ++ Options.text("from-kind") ++ Options.text("type") ++
       Options.text("to") ++ Options.text("to-kind") ++ Options.text("source") ++
       Options.decimal("confidence").optional ++ Options.text("note").optional ++
@@ -279,7 +294,7 @@ object Main extends ZIOCliDefault {
   ).map { case (nu, ol) => Cmd.RelationshipSupersede(nu, ol) }
 
   private val relationship = Command("relationship").subcommands(
-    relationshipPropose, relationshipList, relationshipReject, relationshipSupersede
+    relationshipRecord, relationshipList, relationshipReject, relationshipSupersede
   )
 
   // Combined household snapshot (accepted, currently-active graph).
@@ -291,9 +306,9 @@ object Main extends ZIOCliDefault {
     Options.text("actor").optional ++ Options.text("action") ++ Options.text("category") ++
       Options.text("target-type").optional ++
       Options.text("target-id").optional ++ Options.text("text").optional ++
-      Options.text("payload-json").optional
-  ).map { case (actor, action, category, ttype, tid, text, payload) =>
-    Cmd.EventRecord(actor, action, category, ttype, tid, text, payload)
+      Options.text("payload-json").optional ++ Options.text("source").optional
+  ).map { case (actor, action, category, ttype, tid, text, payload, source) =>
+    Cmd.EventRecord(actor, action, category, ttype, tid, text, payload, source)
   }
   private val eventLog = Command(
     "log",
@@ -420,7 +435,7 @@ object Main extends ZIOCliDefault {
     case Cmd.PersonList =>
       HttpClient.get("/persons").flatMap(out => Console.printLine(out).orDie)
 
-    case Cmd.CommitmentPropose(owner, text, source, evidence, due) =>
+    case Cmd.CommitmentRecord(owner, text, source, evidence, due) =>
       val body = jsonObj(
         "ownerPersonId" -> owner.toJson,
         "text"          -> text.toJson,
@@ -434,20 +449,31 @@ object Main extends ZIOCliDefault {
       HttpClient.get("/commitments", paramsMap("owner" -> owner, "status" -> status))
         .flatMap(out => Console.printLine(out).orDie)
 
-    case Cmd.MemoryPropose(person, kind, text, source, confidence, validFrom, validUntil) =>
+    case Cmd.CommitmentStatus(id, to, reason) =>
       for {
-        memKind <- parseMemoryKind(kind)
-        body     = jsonObj(
-                     "personId"   -> (Some(person): Option[String]).toJson,
-                     "kind"       -> memKind.toJson,
-                     "text"       -> text.toJson,
-                     "source"     -> source.toJson,
-                     "confidence" -> numOrNull(confidence),
-                     "validFrom"  -> validFrom.toJson,
-                     "validUntil" -> validUntil.toJson
-                   )
-        out     <- HttpClient.post("/memory/propose", body)
-        _       <- Console.printLine(out).orDie
+        status <- parseCommitmentStatus(to)
+        body    = jsonObj("status" -> status.toJson, "reason" -> reason.toJson)
+        out    <- HttpClient.post(s"/commitments/$id/status", body)
+        _      <- Console.printLine(out).orDie
+      } yield ()
+
+    case Cmd.MemoryRecord(person, kind, text, source, confidence, validFrom, validUntil, trust, sender) =>
+      for {
+        memKind   <- parseMemoryKind(kind)
+        trustOpt  <- ZIO.foreach(trust)(parseTrustLevel)
+        body       = jsonObj(
+                       "personId"   -> (Some(person): Option[String]).toJson,
+                       "kind"       -> memKind.toJson,
+                       "text"       -> text.toJson,
+                       "source"     -> source.toJson,
+                       "confidence" -> numOrNull(confidence),
+                       "validFrom"  -> validFrom.toJson,
+                       "validUntil" -> validUntil.toJson,
+                       "trust"      -> trustOpt.toJson,
+                       "sender"     -> sender.toJson
+                     )
+        out       <- HttpClient.post("/memory/propose", body)
+        _         <- Console.printLine(out).orDie
       } yield ()
 
     case Cmd.ApprovalRequest(actionType, payloadJson, requiredPerson, contSkill, contParams, channel, source) =>
@@ -458,7 +484,7 @@ object Main extends ZIOCliDefault {
         "payloadJson"        -> payloadJson.toJson,
         "continuationSkill"  -> contSkill.toJson,
         "continuationParams" -> contParams.toJson,
-        "channel"            -> channel.toJson,
+        "channel"            -> channel.orElse(envChannel).toJson,
         "source"             -> source.toJson
       )
       HttpClient.post("/approvals/request", body).flatMap(out => Console.printLine(out).orDie)
@@ -470,7 +496,7 @@ object Main extends ZIOCliDefault {
     case Cmd.ApprovalShow(id) =>
       HttpClient.get(s"/approvals/$id").flatMap(out => Console.printLine(out).orDie)
 
-    case Cmd.GoalRequest(owner, title, outcome, evidenceRule, constraints, source, requiredPerson, channel) =>
+    case Cmd.GoalRequest(owner, title, outcome, evidenceRule, constraints, source, requiredPerson, channel, due) =>
       // The goal fields become the approval's payload; person-service creates the
       // goal (via proposeGoal) only after a human approves the goal.create action.
       val goalJson = jsonObj(
@@ -479,14 +505,15 @@ object Main extends ZIOCliDefault {
         "outcome"         -> outcome.toJson,
         "evidenceRule"    -> evidenceRule.toJson,
         "constraintsJson" -> constraints.toJson,
-        "source"          -> source.toJson
+        "source"          -> source.toJson,
+        "dueAt"           -> due.toJson
       )
       val body = jsonObj(
         "requestedBy"      -> "\"agent\"",
         "requiredPersonId" -> requiredPerson.orElse(Some(owner)).toJson,
         "actionType"       -> "\"goal.create\"",
         "payloadJson"      -> goalJson.toJson,
-        "channel"          -> channel.toJson,
+        "channel"          -> channel.orElse(envChannel).toJson,
         "source"           -> source.toJson
       )
       HttpClient.post("/approvals/request", body).flatMap(out => Console.printLine(out).orDie)
@@ -627,7 +654,7 @@ object Main extends ZIOCliDefault {
       HttpClient.get("/memory", paramsMap("person" -> person, "kind" -> kind, "status" -> status))
         .flatMap(out => Console.printLine(out).orDie)
 
-    case Cmd.EventRecord(actor, action, category, ttype, tid, text, payload) =>
+    case Cmd.EventRecord(actor, action, category, ttype, tid, text, payload, source) =>
       val body = jsonObj(
         "actor"       -> actor.getOrElse("agent").toJson,
         "action"      -> action.toJson,
@@ -635,7 +662,8 @@ object Main extends ZIOCliDefault {
         "targetType"  -> ttype.toJson,
         "targetId"    -> tid.toJson,
         "text"        -> text.toJson,
-        "payloadJson" -> payload.toJson
+        "payloadJson" -> payload.toJson,
+        "source"      -> source.toJson
       )
       HttpClient.post("/events", body).flatMap(out => Console.printLine(out).orDie)
 
@@ -760,6 +788,12 @@ object Main extends ZIOCliDefault {
     else cleaned
   }
 
+  /** The conversation channel the agent is acting in, injected by mycroft into
+   *  the subprocess env. Used as the default `--channel` for approval/goal
+   *  requests so the post-approval continuation/notification reaches the right
+   *  client without the agent having to thread it. */
+  private val envChannel: Option[String] = sys.env.get("MYCROFT_CHANNEL").map(_.trim).filter(_.nonEmpty)
+
   private def jsonObj(fields: (String, String)*): String =
     fields.map { case (k, v) => s""""$k":$v""" }.mkString("{", ",", "}")
 
@@ -775,6 +809,12 @@ object Main extends ZIOCliDefault {
 
   private def parseGoalStatus(s: String): IO[AgentError, GoalStatus] =
     ZIO.fromEither(GoalStatus.fromString(s)).mapError(AgentError.Validation)
+
+  private def parseCommitmentStatus(s: String): IO[AgentError, CommitmentStatus] =
+    ZIO.fromEither(CommitmentStatus.fromString(s)).mapError(AgentError.Validation)
+
+  private def parseTrustLevel(s: String): IO[AgentError, TrustLevel] =
+    ZIO.fromEither(TrustLevel.fromString(s)).mapError(AgentError.Validation)
 
   private def extractJsonString(json: String, field: String): Option[String] =
     json.fromJson[Json].toOption.flatMap {

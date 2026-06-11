@@ -213,6 +213,44 @@ object ApprovalSpec extends ZIOSpecDefault {
           events.exists(e => e.kind == "executed" && e.approval.id == a.id)
         )
       }
+    },
+
+    test("listApprovals accepts 'pending' as an alias for 'requested'") {
+      withService() { svc =>
+        for {
+          a       <- svc.requestApproval(ping("""{"n":42}"""))
+          pending <- svc.listApprovals(Some("pending"))
+          reqd    <- svc.listApprovals(Some("requested"))
+        } yield assertTrue(
+          pending.exists(_.id == a.id),
+          pending.map(_.id.value) == reqd.map(_.id.value)
+        )
+      }
+    },
+
+    test("a repeated (deduped) request re-publishes 'requested' so it can re-surface") {
+      ZIO.scoped {
+        for {
+          db      <- Sqlite.live(":memory:").build.map(_.get[Sqlite])
+          _       <- Migrations.migrate(db)
+          _       <- SeedData.seed(db)
+          hub     <- Hub.sliding[ApprovalEvent](16)
+          svc      = PersonService.live(
+            Repos.sqlitePersonRepo(db), Repos.sqliteCommitmentRepo(db), Repos.sqliteMemoryRepo(db),
+            Repos.sqliteApprovalRepo(db), Repos.sqliteAuditRepo(db), Repos.sqliteGoalRepo(db),
+            Repos.sqliteGoalEvidenceRepo(db), Repos.sqliteEntityRepo(db), Repos.sqliteRelationshipRepo(db),
+            Repos.sqliteChannelRepo(db), Repos.sqliteChannelMemberRepo(db), Repos.sqliteMessageRepo(db),
+            Repos.sqliteCredentialRepo(db), Repos.sqliteInboxMessageRepo(db), hub
+          )
+          sub     <- hub.subscribe
+          a       <- svc.requestApproval(ping("""{"n":7}"""))
+          b       <- svc.requestApproval(ping("""{"n":7}"""))  // identical → deduped
+          events  <- sub.takeAll
+        } yield assertTrue(
+          a.id == b.id,
+          events.count(_.kind == "requested") == 2  // once on create, once on the repeat ask
+        )
+      }
     }
   )
 }

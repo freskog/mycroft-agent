@@ -171,6 +171,14 @@ object CommitmentStatus {
     case "cancelled" => Right(Cancelled)
     case _           => Left(s"Unknown commitment status: $s")
   }
+
+  def asString(s: CommitmentStatus): String = s match {
+    case Proposed  => "proposed"
+    case Open      => "open"
+    case Done      => "done"
+    case Ignored   => "ignored"
+    case Cancelled => "cancelled"
+  }
 }
 
 sealed trait MemoryStatus
@@ -216,6 +224,39 @@ object MemoryKind {
     case Fact          => "fact"
     case ProjectNote   => "project_note"
     case ProcedureNote => "procedure_note"
+  }
+}
+
+/** How much a belief may be trusted, by the provenance of the claim — the rung
+ *  on the *evidence → belief → authority* ladder. Orthogonal to `MemoryStatus`
+ *  (which is the reversibility lifecycle). The agent may infer freely and reason
+ *  with any of these, but `ExternalContent` (a claim derived from an email/web
+ *  page) is provenance-limited: it must never silently become an authoritative
+ *  profile fact, nor authorize a gated action on its own. */
+sealed trait TrustLevel
+object TrustLevel {
+  /** Asserted by the owner/user directly — authoritative. */
+  case object UserStated      extends TrustLevel
+  /** Corroborated by a tool/system (e.g. a calendar invite) — high confidence. */
+  case object ToolConfirmed   extends TrustLevel
+  /** Inferred from untrusted external content (email/web) — usable for reasoning, unverified. */
+  case object ExternalContent extends TrustLevel
+  /** The agent's own inference from the conversation — the default. */
+  case object AgentInference  extends TrustLevel
+
+  def fromString(s: String): Either[String, TrustLevel] = s.toLowerCase match {
+    case "user_stated"      | "user-stated"      => Right(UserStated)
+    case "tool_confirmed"   | "tool-confirmed"   => Right(ToolConfirmed)
+    case "external_content" | "external-content" => Right(ExternalContent)
+    case "agent_inference"  | "agent-inference"  => Right(AgentInference)
+    case _                                       => Left(s"Unknown trust level: $s")
+  }
+
+  def asString(t: TrustLevel): String = t match {
+    case UserStated      => "user_stated"
+    case ToolConfirmed   => "tool_confirmed"
+    case ExternalContent => "external_content"
+    case AgentInference  => "agent_inference"
   }
 }
 
@@ -325,7 +366,12 @@ case class MemoryItem(
   supersededById: Option[MemoryId] = None,
   validFrom: Option[Instant] = None,
   validUntil: Option[Instant] = None,
-  originEventId: Option[EventId] = None
+  originEventId: Option[EventId] = None,
+  // Provenance: how trusted this belief is, and who/what asserted it. `source`
+  // is the evidence pointer (e.g. `email:gmail-msg-X`, resolvable to the raw
+  // inbox message); `sender` is the human/system that asserted it ("Paula").
+  trust: TrustLevel = TrustLevel.AgentInference,
+  sender: Option[String] = None
 )
 
 case class Approval(
@@ -374,7 +420,10 @@ case class AuditEvent(
   targetId: Option[String],
   text: Option[String],
   payloadJson: String,
-  createdAt: Instant
+  createdAt: Instant,
+  // First-class provenance of the event (e.g. `email:gmail-msg-X`, `chat`). Lets
+  // consolidation classify the trust of any belief derived from it.
+  source: Option[String] = None
 )
 
 case class MemoryHit(item: MemoryItem, score: Double)
@@ -417,7 +466,10 @@ case class Goal(
   blockedReason: Option[String],
   source: Option[String],
   createdAt: Instant,
-  updatedAt: Instant
+  updatedAt: Instant,
+  // Optional target date ("done by …"). Unlike `outcome`/`evidenceRule` this is
+  // mutable — deadlines slip — so it can be refreshed on a re-request.
+  dueAt: Option[Instant] = None
 )
 
 case class GoalEvidence(

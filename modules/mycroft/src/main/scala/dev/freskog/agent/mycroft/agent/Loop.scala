@@ -4,6 +4,7 @@ import dev.freskog.agent.common._
 import dev.freskog.agent.mycroft.domain.{AgentEvent, MycroftConfig}
 import dev.freskog.agent.mycroft.llm._
 import dev.freskog.agent.mycroft.tools.{PersonClient, SkillProvider, ToolRegistry, ToolOutcome}
+import dev.freskog.agent.runtime.Skill
 
 import zio._
 import zio.json._
@@ -41,6 +42,11 @@ private[agent] final case class CallMetrics(
 /** A tool call the loop observed (any depth). For skill executions these are
  *  rolled up into the result contract's `actions` + `artifacts`. */
 private[agent] final case class ObservedAction(tool: String, ok: Boolean, summary: String, artifact: Option[String])
+
+/** Turn-level accumulation across every model call (top-level and inside nested
+ *  skills): the real cost of a turn, vs the per-call rates we already report. */
+private[agent] final case class TurnMetrics(calls: Int, genTokens: Int, genMs: Long)
+private[agent] object TurnMetrics { val empty: TurnMetrics = TurnMetrics(0, 0, 0L) }
 
 /** The outcome of one (possibly nested) loop run: the model's final text, the
  *  tool calls observed at this level, and whether the shared budget ran out. */
@@ -83,21 +89,23 @@ final class Loop(
       bundle  <- memory.recall(5, 3)
       profile <- memory.profile(50)
       graph   <- memory.household
+      goals   <- memory.openGoals
       model   <- resolveModel(channel)
       // Router (no dedicated LLM call): surface candidate skills into the main
       // loop's context; the model decides to run_skill or answer directly.
       cands   <- skills.search(content, 5).catchAll(_ => ZIO.succeed(Nil))
       now     <- Clock.instant
-      sys      = Prompt.system(senderId, bundle, profile, graph, now, zoneId, cands)
+      sys      = Prompt.system(senderId, bundle, profile, graph, goals, now, zoneId, cands)
       history <- historyWindow(channel, Prompt.estimateTokens(sys))
       msgs     = ChatMessage.system(sys) :: (if (stored != content) history.dropRight(1) :+ ChatMessage.user(content) else history)
       _       <- hub.publish(AgentEvent.Started(channel, turnId, externalId, model, Instant.now()))
       iters   <- Ref.make(config.maxToolIterations)
-      result  <- runLoop(channel, turnId, senderId, model, msgs, config.maxSkillDepth, iters, Set.empty)
+      tm      <- Ref.make(TurnMetrics.empty)
+      result  <- runLoop(channel, turnId, senderId, model, msgs, config.maxSkillDepth, iters, Set.empty, defaultProfile, tm)
       _       <- ZIO.when(result.hitCap)(
                    hub.publish(AgentEvent.Error(channel, turnId, "max_tool_iterations", s"stopped after ${config.maxToolIterations} tool iterations"))
                  )
-      _       <- finalize(channel, turnId, result.content, t0, result.metrics)
+      _       <- finalize(channel, turnId, result.content, t0, result.metrics, tm)
     } yield ()
 
     turn
@@ -120,6 +128,7 @@ final class Loop(
       model   <- resolveModel(channel)
       _       <- hub.publish(AgentEvent.Started(channel, turnId, None, model, Instant.now()))
       iters   <- Ref.make(config.maxToolIterations)
+      tm      <- Ref.make(TurnMetrics.empty)
       result  <- skills.find(skillName).flatMap {
                    case None =>
                      val msg = s"No skill named '$skillName'."
@@ -132,7 +141,7 @@ final class Loop(
                          now      <- Clock.instant
                          sys       = skillSystemPrompt(skill.name, skill.body, task, params, senderId, ctxBlock, now)
                          seed      = List(ChatMessage.system(sys), ChatMessage.user(skillSeed(task, params)))
-                         r        <- runLoop(channel, turnId, senderId, model, seed, config.maxSkillDepth - 1, iters, Set.empty)
+                         r        <- runLoop(channel, turnId, senderId, model, seed, config.maxSkillDepth - 1, iters, Set.empty, profileFor(skill), tm)
                          _        <- hub.publish(AgentEvent.ToolResult(channel, turnId, s"skill:$skillName", ok = !r.hitCap, contractLine(r)))
                          _        <- persistSkillResult(channel, skillName, r.content).ignore
                        } yield r
@@ -141,7 +150,7 @@ final class Loop(
       _       <- ZIO.when(result.hitCap)(
                    hub.publish(AgentEvent.Error(channel, turnId, "max_tool_iterations", s"stopped after ${config.maxToolIterations} tool iterations"))
                  )
-      _       <- finalize(channel, turnId, result.content, t0, result.metrics)
+      _       <- finalize(channel, turnId, result.content, t0, result.metrics, tm)
     } yield ()
 
     turn
@@ -159,24 +168,32 @@ final class Loop(
    *  contract). */
   private def runLoop(
     channel: String, turnId: String, sender: PersonId, model: String,
-    msgs: List[ChatMessage], depthLeft: Int, iters: Ref[Int], seen: Set[String]
+    msgs: List[ChatMessage], depthLeft: Int, iters: Ref[Int], seen: Set[String], profile: ReasoningProfile,
+    turnMetrics: Ref[TurnMetrics]
   ): IO[AgentError, LoopResult] =
     iters.get.flatMap { left =>
       if (left <= 0) ZIO.succeed(LoopResult(lastContent(msgs), Nil, hitCap = true))
-      else
+      else {
+        // Bound the working set before each model call: degrade the oldest tool
+        // outputs to their runlog pointer so a long tool loop never overflows the
+        // model's context mid-turn (the model can re-read via runlog if needed).
+        val fitted = Compaction.fit(msgs, config.innerTokenBudget, config.keepRecentTools)
         iters.update(_ - 1) *>
-          collect(channel, turnId, model, msgs).flatMap { acc =>
-            val ordered = acc.calls.toList.sortBy(_._1).map(_._2).filter(_.name.nonEmpty)
-            if (ordered.isEmpty) ZIO.succeed(LoopResult(finalReply(acc), Nil, hitCap = false, metrics = Some(metricsOf(acc))))
-            else {
-              val assistant = ChatMessage("assistant", Some(acc.content), toolCalls = ordered.map(c => ToolCallSpec(c.id, c.name, c.args)))
-              runCalls(channel, turnId, sender, model, ordered, depthLeft, iters, seen).flatMap {
-                case (results, seen2, acts) =>
-                  runLoop(channel, turnId, sender, model, msgs ++ (assistant :: results), depthLeft, iters, seen2)
-                    .map(rest => rest.copy(actions = acts ++ rest.actions))
+          collect(channel, turnId, model, fitted, profile).flatMap { acc =>
+            recordCall(turnMetrics, acc) *> {
+              val ordered = acc.calls.toList.sortBy(_._1).map(_._2).filter(_.name.nonEmpty)
+              if (ordered.isEmpty) ZIO.succeed(LoopResult(finalReply(acc), Nil, hitCap = false, metrics = Some(metricsOf(acc))))
+              else {
+                val assistant = ChatMessage("assistant", Some(acc.content), toolCalls = ordered.map(c => ToolCallSpec(c.id, c.name, c.args)))
+                runCalls(channel, turnId, sender, model, ordered, depthLeft, iters, seen, turnMetrics).flatMap {
+                  case (results, seen2, acts) =>
+                    runLoop(channel, turnId, sender, model, fitted ++ (assistant :: results), depthLeft, iters, seen2, profile, turnMetrics)
+                      .map(rest => rest.copy(actions = acts ++ rest.actions))
+                }
               }
             }
           }
+      }
     }
 
   /** Execute the ordered tool calls, threading the call-signature set so an
@@ -184,7 +201,7 @@ final class Loop(
    *  is short-circuited instead of re-run. */
   private def runCalls(
     channel: String, turnId: String, sender: PersonId, model: String,
-    calls: List[CallB], depthLeft: Int, iters: Ref[Int], seen: Set[String]
+    calls: List[CallB], depthLeft: Int, iters: Ref[Int], seen: Set[String], turnMetrics: Ref[TurnMetrics]
   ): IO[AgentError, (List[ChatMessage], Set[String], List[ObservedAction])] =
     calls match {
       case Nil => ZIO.succeed((Nil, seen, Nil))
@@ -192,20 +209,20 @@ final class Loop(
         val sig = s"${c.name}|${c.args}"
         val step: IO[AgentError, (ChatMessage, Option[ObservedAction])] =
           if (seen.contains(sig)) repeatedCall(channel, turnId, c).map((_, None))
-          else dispatchCall(channel, turnId, sender, model, c, depthLeft, iters)
+          else dispatchCall(channel, turnId, sender, model, c, depthLeft, iters, turnMetrics)
         for {
           res                     <- step
           (msg, act)               = res
-          more                    <- runCalls(channel, turnId, sender, model, rest, depthLeft, iters, seen + sig)
+          more                    <- runCalls(channel, turnId, sender, model, rest, depthLeft, iters, seen + sig, turnMetrics)
           (restMsgs, s2, restActs) = more
         } yield (msg :: restMsgs, s2, act.toList ++ restActs)
     }
 
   private def dispatchCall(
     channel: String, turnId: String, sender: PersonId, model: String,
-    c: CallB, depthLeft: Int, iters: Ref[Int]
+    c: CallB, depthLeft: Int, iters: Ref[Int], turnMetrics: Ref[TurnMetrics]
   ): IO[AgentError, (ChatMessage, Option[ObservedAction])] =
-    if (c.name == SkillTools.ToolName) executeSkill(channel, turnId, sender, model, c, depthLeft, iters)
+    if (c.name == SkillTools.ToolName) executeSkill(channel, turnId, sender, model, c, depthLeft, iters, turnMetrics)
     else runCall(channel, turnId, c)
 
   private def repeatedCall(channel: String, turnId: String, c: CallB): IO[AgentError, ChatMessage] = {
@@ -222,6 +239,14 @@ final class Loop(
   /** Stream one completion, publishing reasoning/content live and folding the
    *  tool-call argument fragments by index. The advertised tool set is OS tools
    *  (safe_run + runlog) plus the run_skill control-plane tool. */
+  /** Reasoning mode for the top-level conversational turn (config default). */
+  private val defaultProfile: ReasoningProfile =
+    ReasoningProfile.resolve(config.defaultReasoning, config.reasonMaxTokens, config.directMaxTokens)
+
+  /** A skill's reasoning mode: its `reasoning:` frontmatter, else the default. */
+  private def profileFor(skill: Skill): ReasoningProfile =
+    ReasoningProfile.resolve(skill.reasoning.getOrElse(config.defaultReasoning), config.reasonMaxTokens, config.directMaxTokens)
+
   private val sampling: SamplingParams =
     SamplingParams(config.temperature, config.topP, config.topK, config.minP, config.presencePenalty)
 
@@ -230,9 +255,9 @@ final class Loop(
   private val zoneId: ZoneId =
     scala.util.Try(ZoneId.of(config.timezone)).getOrElse(ZoneId.of("UTC"))
 
-  private def collect(channel: String, turnId: String, model: String, msgs: List[ChatMessage]): IO[AgentError, Accum] =
+  private def collect(channel: String, turnId: String, model: String, msgs: List[ChatMessage], profile: ReasoningProfile): IO[AgentError, Accum] =
     Clock.nanoTime.flatMap { start =>
-      llm.chat(model, msgs, config.maxOutputTokens, Some(SkillTools.allToolsJson), sampling)
+      llm.chat(model, msgs, profile.maxTokens, Some(SkillTools.allToolsJson), sampling, Some(profile.enableThinking))
         .runFoldZIO(Accum("", Map.empty, None, startNanos = start)) { (acc, chunk) =>
           val isToken = chunk.reasoningDelta.isDefined || chunk.contentDelta.isDefined
           for {
@@ -250,6 +275,15 @@ final class Loop(
           )
         }
     }
+
+  /** Fold one completed model call into the turn totals: +1 call, its generated
+   *  tokens (server count if present, else estimated from the text), and its
+   *  client-measured generation time (first→last token). */
+  private def recordCall(ref: Ref[TurnMetrics], acc: Accum): UIO[Unit] = {
+    val gen   = acc.usage.flatMap(_.completionTokens).getOrElse(Prompt.estimateTokens(acc.content))
+    val genMs = (for { f <- acc.firstTokenNanos; l <- acc.lastTokenNanos } yield (l - f) / 1_000_000L).getOrElse(0L)
+    ref.update(m => TurnMetrics(m.calls + 1, m.genTokens + gen, m.genMs + genMs))
+  }
 
   /** Derive throughput/latency from a completed call's accumulator. Prefers
    *  server-reported tok/s; otherwise computes from client-measured durations
@@ -292,7 +326,7 @@ final class Loop(
   private def runCall(channel: String, turnId: String, c: CallB): IO[AgentError, (ChatMessage, Option[ObservedAction])] =
     for {
       _       <- hub.publish(AgentEvent.ToolCall(channel, turnId, c.name, c.args))
-      outcome <- tools.dispatch(c.name, c.args).catchAll(e => ZIO.succeed(ToolOutcome(ok = false, e.message, s"Error: ${e.message}")))
+      outcome <- tools.dispatch(c.name, c.args, Map("MYCROFT_CHANNEL" -> channel)).catchAll(e => ZIO.succeed(ToolOutcome(ok = false, e.message, s"Error: ${e.message}")))
       _       <- hub.publish(AgentEvent.ToolResult(channel, turnId, c.name, outcome.ok, outcome.summary))
       _       <- logDecision(c, outcome).ignore
       action   = ObservedAction(c.name, outcome.ok, outcome.summary, extractRunlogRef(outcome.content))
@@ -308,7 +342,7 @@ final class Loop(
    *  parent's message list. */
   private def executeSkill(
     channel: String, turnId: String, sender: PersonId, model: String,
-    c: CallB, depthLeft: Int, iters: Ref[Int]
+    c: CallB, depthLeft: Int, iters: Ref[Int], turnMetrics: Ref[TurnMetrics]
   ): IO[AgentError, (ChatMessage, Option[ObservedAction])] = {
     val parsed = c.args.fromJson[Json].toOption
     val name   = parsed.flatMap(strField("name")).map(_.trim).filter(_.nonEmpty)
@@ -333,7 +367,7 @@ final class Loop(
                 now      <- Clock.instant
                 sys       = skillSystemPrompt(skill.name, skill.body, task, params, sender, ctxBlock, now)
                 seed      = List(ChatMessage.system(sys), ChatMessage.user(skillSeed(task, params)))
-                result   <- runLoop(channel, turnId, sender, model, seed, depthLeft - 1, iters, Set.empty)
+                result   <- runLoop(channel, turnId, sender, model, seed, depthLeft - 1, iters, Set.empty, profileFor(skill), turnMetrics)
                 contract  = buildContract(result)
                 line      = contractLine(result)
                 _        <- hub.publish(AgentEvent.ToolResult(channel, turnId, s"skill:$skillName", ok = !result.hitCap, line))
@@ -356,13 +390,15 @@ final class Loop(
       graph   <- memory.household
       bundle  <- memory.recall(5, 3)
       hits    <- memory.search(task, Some(sender), 5)
+      goals   <- memory.openGoals
     } yield {
       val profileFacts = profile.map(m => s"  - ${m.text}")
       val entityFacts  = graph.entities.map(e => s"  - ${e.name} (${EntityKind.asString(e.kind)})")
       val relFacts     = graph.relationships.map(r => s"  - ${r.fromId} —${r.relType}→ ${r.toId}")
-      val bundleFacts  = bundle.facts.map(h => s"  - ${h.item.text}")
-      val searchFacts  = hits.map(h => s"  - ${h.item.text}")
-      val merged       = (profileFacts ++ entityFacts ++ relFacts ++ bundleFacts ++ searchFacts).distinct
+      val bundleFacts  = bundle.facts.map(h => s"  - ${Prompt.renderFact(h.item)}")
+      val searchFacts  = hits.map(h => s"  - ${Prompt.renderFact(h.item)}")
+      val goalFacts    = goals.map(g => s"  - goal: ${g.title} → ${g.outcome}")
+      val merged       = (profileFacts ++ entityFacts ++ relFacts ++ bundleFacts ++ searchFacts ++ goalFacts).distinct
       if (merged.isEmpty) "  (no relevant memory)" else merged.mkString("\n")
     }).catchAll(_ => ZIO.succeed("  (memory unavailable)"))
 
@@ -421,9 +457,10 @@ final class Loop(
     if (summary.trim.isEmpty) ZIO.unit
     else person.logEvent("mycroft", s"skill.$skillName", EventCategory.SessionNote, Some(summary), None)
 
-  private def finalize(channel: String, turnId: String, reply: String, t0: Long, metrics: Option[CallMetrics]): IO[AgentError, Unit] =
+  private def finalize(channel: String, turnId: String, reply: String, t0: Long, metrics: Option[CallMetrics], turnMetrics: Ref[TurnMetrics]): IO[AgentError, Unit] =
     for {
       t1 <- Clock.nanoTime
+      tm <- turnMetrics.get
       _  <- person.appendMessage(ChannelId(channel), MessageRole.Assistant, None, reply, None, Some(turnId))
       tokensIn  = metrics.flatMap(_.promptTokens).getOrElse(0)
       tokensOut = metrics.flatMap(_.completionTokens).getOrElse(Prompt.estimateTokens(reply))
@@ -431,7 +468,10 @@ final class Loop(
               channel, turnId, "stop", tokensIn, tokensOut, (t1 - t0) / 1_000_000,
               ttftMs = metrics.flatMap(_.ttftMs),
               genTps = metrics.flatMap(_.genTps),
-              ppTps  = metrics.flatMap(_.ppTps)
+              ppTps  = metrics.flatMap(_.ppTps),
+              modelCalls = tm.calls,
+              turnGenTokens = tm.genTokens,
+              turnGenMs = tm.genMs
             ))
     } yield ()
 

@@ -84,31 +84,38 @@ sbt "safeRun/run --cwd /tmp --timeout 30 --shell bash -- echo hello"
 
 ```bash
 sbt "personCli/run health"
-sbt "personCli/run commitment list --owner fred"
+sbt 'personCli/run commitment record --owner fred --text "Send Graham the deck" --source email:gmail-msg-1 --evidence "by Friday"'  # gateless: live as `open`
+sbt "personCli/run commitment list --owner fred --status open"
+sbt "personCli/run commitment done <id>"   # done | ignore | cancel
 # Goal creation is hard-gated: `goal request` creates a goal.create approval; the
-# goal exists only after a human approves it. (There is no `goal propose`.)
+# goal exists only after a human approves it. (There is no `goal record`/`goal propose`.)
 sbt 'personCli/run goal request --owner fred --title "Approve Q3 report" --outcome "..." --evidence-rule "..." --channel fred'
 sbt "personCli/run goal list --owner fred --status open"
 sbt 'personCli/run memory search "morning meetings" --person fred'
 sbt "personCli/run memory context --person fred"
 sbt "personCli/run memory profile --limit 50"
-sbt 'personCli/run event record --action note.preference --category session_note --text "Fred mentioned morning meetings"'
+sbt 'personCli/run event record --action note.preference --category session_note --text "Fred mentioned morning meetings" --source chat'
 sbt "personCli/run memory consolidate"
 ```
 
 Durable state is one shared household store keyed by `person` and `entity` — there
-are no privacy scopes. **Writing knowledge is gateless** — memory, entities and
-relationships are `accepted` on write (reversible via `reject`/`archive`/`supersede`);
-there is no accept/pending/accept-all step. Build the household graph (persons,
+are no privacy scopes. **Two write modes by reversibility/risk:** durable knowledge
+and obligations are **`record`ed** (gateless, live, reversible); goals and
+outside-effect actions are **`request`ed** (gated). Memory/entities/relationships/
+commitments are written `accepted`/`open` on write (reversible via
+`reject`/`archive`/`supersede`/`commitment cancel`); there is no accept/pending step.
+Each recorded belief carries a **trust level** (`user-stated` / `tool-confirmed` /
+`external-content` / `agent-inference`) so a claim inferred from email is usable for
+reasoning but never silently authoritative. Build the household graph (persons,
 entities, typed relationships) with:
 
 ```bash
 sbt "personCli/run person list"
 sbt 'personCli/run person create --id liam --display-name "Liam" --timezone Europe/Dublin --locale en-IE'
-sbt 'personCli/run entity propose --kind organization --name "MegaCorp" --source onboarding:work'  # live immediately
+sbt 'personCli/run entity record --kind organization --name "MegaCorp" --source onboarding:work'  # live immediately
 sbt "personCli/run entity list --status accepted"
 sbt "personCli/run entity resolve megacorp"
-sbt 'personCli/run relationship propose --from fred --from-kind person --type employed_by --to <entity-id> --to-kind entity --source onboarding:work --valid-from 2024-01-01T00:00:00Z'
+sbt 'personCli/run relationship record --from fred --from-kind person --type employed_by --to <entity-id> --to-kind entity --source onboarding:work --valid-from 2024-01-01T00:00:00Z'
 sbt "personCli/run relationship list --from fred --type employed_by"
 sbt "personCli/run household"   # accepted, currently-active graph
 ```
@@ -252,7 +259,8 @@ sbt 'personCli/run calendar agenda --owner fred --from 2026-06-10T00:00:00Z --to
 ```
 
 Triage uses this to ground dated items ("already on the calendar" / conflicts).
-Writing events (propose → human approve) is planned but not yet implemented.
+Writing calendar events (a gated `calendar.create_event` approval → human approve)
+is planned but not yet implemented.
 
 ## Architecture
 
@@ -270,4 +278,4 @@ Agent-facing procedural docs in `skills/` (Agent Skills spec format — YAML fro
 - [plans](skills/plans/SKILL.md) — workspace planning conventions
 - [memory](skills/memory/SKILL.md) — semantic facts with supersession and point-in-time recall
 - [events](skills/events/SKILL.md) — episodic log + consolidation flow
-- [agent-protocol](skills/agent-protocol/SKILL.md) — how Mycroft uses `safe_run` + `runlog` + the trusted CLIs, and its propose-only authority
+- [agent-protocol](skills/agent-protocol/SKILL.md) — how Mycroft uses `safe_run` + `runlog` + the trusted CLIs, and its record/request authority model

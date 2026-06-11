@@ -40,13 +40,16 @@ object PromptSpec extends ZIOSpecDefault {
         bundle  = ContextBundle(Nil, Nil),
         profile = Nil,
         graph   = HouseholdGraph(Nil, Nil),
+        goals   = Nil,
         now     = now,
         zone    = zone
       )
       assertTrue(
         s.contains("Household / Owner profile:"),
         s.contains("offer to set this up via the onboarding skill"),
-        s.contains("Sender: fred")
+        s.contains("Sender: fred"),
+        s.contains("Open goals"),
+        s.contains("(none)")
       )
     },
 
@@ -60,6 +63,7 @@ object PromptSpec extends ZIOSpecDefault {
         bundle  = ContextBundle(Nil, Nil),
         profile = List(fact("Fred lives in London"), fact("Has two children")),
         graph   = graph,
+        goals   = Nil,
         now     = now,
         zone    = zone
       )
@@ -79,12 +83,30 @@ object PromptSpec extends ZIOSpecDefault {
         events = List(AuditEvent(EventId("ev1"), "agent", "obs.cal", EventCategory.Observation,
                                  "observation", None, Some("Calendar empty Friday"), "{}", now))
       )
-      val s = Prompt.system(PersonId("fred"), bundle, Nil, HouseholdGraph(Nil, Nil), now, zone)
+      val s = Prompt.system(PersonId("fred"), bundle, Nil, HouseholdGraph(Nil, Nil), Nil, now, zone)
       assertTrue(
         s.contains("Recent context:"),
         s.contains("Prefers morning standups"),
         s.contains("Calendar empty Friday"),
         s.contains("Current date & time:")
+      )
+    },
+
+    test("open goals render with title, outcome, due date and an overdue flag") {
+      val goals = List(
+        Goal(GoalId("g1"), PersonId("fred"), "Use CIS via extend", "CIS usable through extend",
+             "demonstrated working use", None, GoalStatus.Open, None, Some("chat"), now, now,
+             dueAt = Some(Instant.parse("2026-06-12T17:00:00Z"))),
+        Goal(GoalId("g2"), PersonId("fred"), "Old task", "something", "rule", None,
+             GoalStatus.Open, None, None, now, now,
+             dueAt = Some(Instant.parse("2026-06-01T00:00:00Z")))   // before `now` → overdue
+      )
+      val s = Prompt.system(PersonId("fred"), ContextBundle(Nil, Nil), Nil, HouseholdGraph(Nil, Nil), goals, now, zone)
+      assertTrue(
+        s.contains("Use CIS via extend → CIS usable through extend"),
+        s.contains("[due 2026-06-12]"),
+        s.contains("OVERDUE"),
+        !s.contains("(none)")
       )
     }
   )

@@ -13,7 +13,8 @@ Populate the **household graph** so every later turn (and skills like
 `inbox-triage`) has rich personal context: who the family members are, the
 organisations/schools/clubs/medical practices/vehicles they relate to, the typed
 relationships between them, and a handful of pinned profile facts. Everything you
-create is **proposed** — a human accepts before it becomes durable.
+record is written **live and is reversible** — there is no accept step. Onboarding
+facts come straight from the user, so record them with `--trust user-stated`.
 
 There are no privacy scopes; this is one shared household store keyed by `person`
 and `entity`. Read the `memory` and `person-service` skills for the underlying
@@ -72,10 +73,10 @@ Work in this order so ids exist before they're referenced — don't go exploring
    the wrong timezone/locale/name: `person person update <id> --timezone … --locale …`
    — do **not** `create` them again (duplicate id fails), and don't claim you
    updated them unless the command succeeded. Note each id (the slug, not the name).
-3. **Propose the entities** (`person entity propose`); note the returned ids.
-4. **Propose the relationships** (`person relationship propose`) wiring the
+3. **Record the entities** (`person entity record`); note the returned ids.
+4. **Record the relationships** (`person relationship record`) wiring the
    person/entity ids together (`spouse`, `parent_of`, `employed_by`, `attends`…).
-5. **Propose pinned facts** (`person memory propose --source onboarding:<topic>`),
+5. **Record pinned facts** (`person memory record --source onboarding:<topic> --trust user-stated`),
    each `--person <id>` referencing a person you created in step 2.
 6. Log a `session_note` event.
 7. Summarise what you recorded back to the user (writes are live immediately —
@@ -110,18 +111,25 @@ Reuse an existing id (e.g. seeded `fred`, `paula`) rather than creating a duplic
 told otherwise. There is no "person" entity kind; family members are person-nodes,
 not entities.
 
-Entities (employers, schools, clubs, GPs, vehicles, places — a **fixed** set of
-kinds: `organization` / `school` / `club` / `medical` / `vehicle` / `place` /
-`other`; do not invent others):
+**Pets are entities, not people.** Record a pet as `person entity record --kind
+other --name '<pet>'` and wire it with `person relationship record --type owns
+--from <owner-person-id> --from-kind person --to <pet-entity-id> --to-kind
+entity`. Do **not** `person person create` a pet — person-nodes are household
+*members* (they carry a timezone/locale and are treated as people); a cat is not
+one.
+
+Entities (employers, schools, clubs, GPs, vehicles, places, **pets** — a **fixed**
+set of kinds: `organization` / `school` / `club` / `medical` / `vehicle` /
+`place` / `other`; pets use `other`; do not invent others):
 ```
-person entity propose --kind school --name 'Oakwood Primary' \
+person entity record --kind school --name 'Oakwood Primary' \
   --attributes-json '{"phase":"primary"}' --source onboarding:children
-person entity resolve 'oakwood'       # before proposing, check for an existing node
+person entity resolve 'oakwood'       # before recording, check for an existing node
 ```
 
 Relationships (use the entity/person ids):
 ```
-person relationship propose \
+person relationship record \
   --from <child-person-id> --from-kind person \
   --type attends \
   --to <school-entity-id> --to-kind entity \
@@ -129,11 +137,19 @@ person relationship propose \
   --valid-from 2024-09-01T00:00:00Z
 ```
 
+A pet (entity of kind `other`) and its owner edge:
+```
+person entity record --kind other --name 'Coco' --attributes-json '{"species":"cat"}' --source onboarding:pets
+person relationship record \
+  --from fred --from-kind person --type owns \
+  --to <coco-entity-id> --to-kind entity --source onboarding:pets
+```
+
 Pinned profile facts:
 ```
-person memory propose --person fred --kind fact \
+person memory record --person fred --kind fact \
   --text 'Lives in London; default childcare is the maternal grandparents on Tuesdays' \
-  --source onboarding:household
+  --source onboarding:household --trust user-stated
 ```
 
 Log a session note so the interview itself is traceable / consolidatable:
@@ -160,11 +176,11 @@ A change is a **transition**, not an overwrite — preserve history so `--as-of`
 queries stay correct. For each change:
 
 1. **Resolve** the node first (`person entity resolve`, the injected graph). Reuse
-   the existing node; only propose a new one when it's genuinely new. Never
+   the existing node; only record a new one when it's genuinely new. Never
    auto-merge an ambiguous match — attach to the best and flag, or ask.
 2. **Find the prior edge** (`person relationship list --from <id> --type <t>`).
 3. **Close + open**: supersede/close the old edge with `--valid-until <cutover>`
-   and propose the new edge with `--valid-from <cutover>`. For a superseding node,
+   and record the new edge with `--valid-from <cutover>`. For a superseding node,
    `person entity supersede --new <new-id> --old <old-id>`.
 4. For profile facts, `person memory conflicts` then `supersede` rather than
    editing text.
@@ -185,5 +201,5 @@ queries stay correct. For each change:
    every turn without decay.
 6. Never store credentials, tokens, or sensitive data you wouldn't want
    re-injected as context.
-7. Keep it conversational and incremental. Capture what the user offers, propose
+7. Keep it conversational and incremental. Capture what the user offers, record
    it, and let them fill gaps over time — don't block on a complete profile.

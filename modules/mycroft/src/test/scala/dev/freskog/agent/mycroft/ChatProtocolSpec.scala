@@ -77,7 +77,20 @@ object ChatProtocolSpec extends ZIOSpecDefault {
         body.contains("\"tool_call_id\":\"c1\""),
         body.contains("\"role\":\"tool\""),
         body.contains("\"stream\":true"),
-        body.contains("\"include_usage\":true")
+        body.contains("\"include_usage\":true"),
+        !body.contains("chat_template_kwargs")          // omitted unless set
+      )
+    },
+
+    test("encodeBody emits enable_thinking only when set") {
+      val msgs = List(ChatMessage.user("hi"))
+      val off  = ChatProtocol.encodeBody("m", msgs, 64, stream = false, None, enableThinking = Some(false))
+      val on   = ChatProtocol.encodeBody("m", msgs, 64, stream = false, None, enableThinking = Some(true))
+      val none = ChatProtocol.encodeBody("m", msgs, 64, stream = false, None)
+      assertTrue(
+        off.contains("\"chat_template_kwargs\":{\"enable_thinking\":false}"),
+        on.contains("\"chat_template_kwargs\":{\"enable_thinking\":true}"),
+        !none.contains("chat_template_kwargs")
       )
     }
   )

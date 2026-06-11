@@ -33,7 +33,10 @@ object Sse {
           "elapsed_ms"  -> Json.Num(d.elapsedMs),
           "ttft_ms"     -> d.ttftMs.map(v => Json.Num(v)).getOrElse(Json.Null),
           "gen_tps"     -> d.genTps.map(v => Json.Num(v)).getOrElse(Json.Null),
-          "pp_tps"      -> d.ppTps.map(v => Json.Num(v)).getOrElse(Json.Null)
+          "pp_tps"      -> d.ppTps.map(v => Json.Num(v)).getOrElse(Json.Null),
+          "model_calls"     -> Json.Num(d.modelCalls),
+          "turn_gen_tokens" -> Json.Num(d.turnGenTokens),
+          "turn_gen_ms"     -> Json.Num(d.turnGenMs)
         )
       case e: AgentEvent.Error      => List("kind" -> Json.Str(e.kind), "message" -> Json.Str(e.message))
     }

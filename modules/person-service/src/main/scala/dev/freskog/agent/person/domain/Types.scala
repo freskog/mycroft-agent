@@ -20,6 +20,13 @@ object ProposeCommitmentRequest {
   implicit val codec: JsonCodec[ProposeCommitmentRequest] = DeriveJsonCodec.gen[ProposeCommitmentRequest]
 }
 
+/** Advance a commitment's lifecycle (done / ignored / cancelled). Gateless and
+ *  reversible — no human gate, mirroring goal status updates. */
+case class UpdateCommitmentStatusRequest(status: CommitmentStatus, reason: Option[String] = None)
+object UpdateCommitmentStatusRequest {
+  implicit val codec: JsonCodec[UpdateCommitmentStatusRequest] = DeriveJsonCodec.gen[UpdateCommitmentStatusRequest]
+}
+
 case class ProposeMemoryRequest(
   personId: Option[PersonId],
   kind: MemoryKind,
@@ -28,7 +35,9 @@ case class ProposeMemoryRequest(
   confidence: Option[Double],
   validFrom: Option[Instant] = None,
   validUntil: Option[Instant] = None,
-  originEventId: Option[EventId] = None
+  originEventId: Option[EventId] = None,
+  trust: Option[TrustLevel] = None,
+  sender: Option[String] = None
 )
 object ProposeMemoryRequest {
   implicit val codec: JsonCodec[ProposeMemoryRequest] = DeriveJsonCodec.gen[ProposeMemoryRequest]
@@ -93,7 +102,8 @@ case class ProposeGoalRequest(
   outcome: String,
   evidenceRule: String,
   constraintsJson: Option[String],
-  source: Option[String]
+  source: Option[String],
+  dueAt: Option[Instant] = None
 )
 object ProposeGoalRequest {
   implicit val codec: JsonCodec[ProposeGoalRequest] = DeriveJsonCodec.gen[ProposeGoalRequest]
@@ -172,7 +182,9 @@ case class LogEventRequest(
   targetType: Option[String],
   targetId: Option[String],
   text: Option[String],
-  payloadJson: Option[String]
+  payloadJson: Option[String],
+  // Provenance (e.g. `email:gmail-msg-X`, `chat`); feeds consolidation trust.
+  source: Option[String] = None
 )
 object LogEventRequest {
   implicit val codec: JsonCodec[LogEventRequest] = DeriveJsonCodec.gen[LogEventRequest]

@@ -29,6 +29,14 @@ object ProcessRunnerSpec extends ZIOSpecDefault {
   private val whenSetsid = if (hasSetsid) TestAspect.identity else TestAspect.ignore
 
   def spec = suite("ProcessRunnerSpec")(
+    test("injects extra environment variables into the child process") {
+      withTempDir { dir =>
+        val config = RunConfig("echo channel=$MYCROFT_CHANNEL", Shell.Bash, dir, 10, env = Map("MYCROFT_CHANNEL" -> "fred"))
+        for {
+          meta <- ProcessRunner.run(config)
+        } yield assertTrue(meta.exitCode.contains(0), meta.stdoutHead.contains("channel=fred"))
+      }
+    } @@ whenSetsid,
     test("small stdout") {
       withTempDir { dir =>
         val config = RunConfig("echo hello", Shell.Bash, dir, 10)

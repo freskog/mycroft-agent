@@ -110,11 +110,18 @@ object Main extends ZIOAppDefault {
                     r
                   }
       queue    <- Queue.unbounded[Ev]
-      _        <- ZIO.when(cfg.register)(registerChannel(cfg, terminal))
-      _        <- streamEvents(cfg, queue, rt).forkScoped
-      _        <- streamApprovals(cfg, terminal).forkScoped
-      _        <- printLine(terminal, s"Connected to ${cfg.mycroftUrl} on channel '${cfg.channel}' as '${cfg.as}'. Ctrl-D twice to quit.")
-      _        <- loop(cfg, terminal, reader, queue, lastWasEof = false)
+      asOk     <- validatePerson(cfg, terminal)
+      proceed  <- if (!asOk) ZIO.succeed(false)
+                  else if (cfg.register) registerChannel(cfg, terminal)
+                  else ZIO.succeed(true)
+      _        <- ZIO.when(proceed) {
+                    for {
+                      _ <- streamEvents(cfg, queue, rt).forkScoped
+                      _ <- streamApprovals(cfg, terminal).forkScoped
+                      _ <- printLine(terminal, s"Connected to ${cfg.mycroftUrl} on channel '${cfg.channel}' as '${cfg.as}'. Ctrl-D twice to quit.")
+                      _ <- loop(cfg, terminal, reader, queue, lastWasEof = false)
+                    } yield ()
+                  }
     } yield ()
 
   private def buildTerminal: Terminal =
@@ -330,16 +337,22 @@ object Main extends ZIOAppDefault {
         if (turnStart == 0L) 0L else (java.lang.System.nanoTime() - turnStart) / 1_000_000
       }
       val tokIn  = ev.json.flatMap(intField("tokens_in")).getOrElse(0)
-      val tokOut = ev.json.flatMap(intField("tokens_out")).getOrElse(0)
       val ttft   = ev.json.flatMap(longField("ttft_ms"))
       val genTps = ev.json.flatMap(doubleField("gen_tps"))
       val ppTps  = ev.json.flatMap(doubleField("pp_tps"))
+      // Turn-level totals across ALL model calls — the real cost of the turn.
+      val calls     = ev.json.flatMap(intField("model_calls")).getOrElse(0)
+      val turnGen   = ev.json.flatMap(intField("turn_gen_tokens")).getOrElse(0)
+      val turnGenMs = ev.json.flatMap(longField("turn_gen_ms")).getOrElse(0L)
 
-      val tokens =
-        if (tokIn > 0 || tokOut > 0) List(s"${tokIn} ctx → ${tokOut} gen tok") else Nil
+      val turnCost =
+        if (calls > 0) List(s"$calls call${if (calls == 1) "" else "s"}", s"$turnGen gen tok", f"${turnGenMs / 1000.0}%.1fs gen")
+        else Nil
+      val ctx = if (tokIn > 0) List(s"$tokIn ctx (last call)") else Nil
       val parts =
         List(s"${elapsed}ms") ++
-          tokens ++
+          turnCost ++
+          ctx ++
           ttft.map(t => s"TTFT ${t}ms").toList ++
           ppTps.map(t => s"PP ${fmtTps(t)} tok/s").toList ++
           genTps.map(t => s"TG ${fmtTps(t)} tok/s").toList
@@ -373,19 +386,46 @@ object Main extends ZIOAppDefault {
 
   // --- mycroft HTTP ---
 
-  private def registerChannel(cfg: Cfg, terminal: Terminal): Task[Unit] = {
+  /** Validate `--as` against real person ids before connecting. A display name
+   *  ("Fredrik") where a slug ("fred") was expected is fatal: it isn't just a
+   *  cosmetic mismatch — the approval stream is person-filtered, so an approval
+   *  targeted at `fred` would be silently dropped for a session subscribed as
+   *  `Fredrik`, and the human would never be notified. Runs regardless of whether
+   *  the channel is already registered. Best-effort: if person-service can't be
+   *  reached we don't block (the session won't work anyway, but for a clearer
+   *  reason). */
+  private def validatePerson(cfg: Cfg, terminal: Terminal): Task[Boolean] =
+    httpGet(cfg.personServiceUrl + "/persons").flatMap { raw =>
+      val ids = raw.fromJson[Json].toOption.collect {
+        case Json.Arr(elems) =>
+          elems.toList.collect { case Json.Obj(fs) => fs.collectFirst { case ("id", Json.Str(v)) => v } }.flatten
+      }.getOrElse(Nil)
+      if (ids.isEmpty || ids.contains(cfg.as)) ZIO.succeed(true)
+      else
+        printLine(
+          terminal,
+          s"'--as ${cfg.as}' is not a known person id. Pass a lowercase slug " +
+            s"(one of: ${ids.mkString(", ")}) — a display name like '${cfg.as}' won't work, " +
+            "because approvals and attribution key on the id, not the name."
+        ).as(false)
+    }.catchAll(_ => ZIO.succeed(true))
+
+  /** Returns whether to proceed with the session. An unknown `--as` person (a
+   *  display name passed where a slug was expected) is fatal: we abort before
+   *  connecting rather than run the whole session under a non-existent id. */
+  private def registerChannel(cfg: Cfg, terminal: Terminal): Task[Boolean] = {
     val body = Json.Obj(
       "id"           -> Json.Str(cfg.channel),
       "defaultModel" -> Json.Null,
       "members"      -> Json.Arr(Json.Str(cfg.as))
     ).toJson
     post(cfg.mycroftUrl + "/channels", body).unit
-      .flatMap(_ => printLine(terminal, s"Registered channel '${cfg.channel}' (member=${cfg.as})."))
+      .flatMap(_ => printLine(terminal, s"Registered channel '${cfg.channel}' (member=${cfg.as}).").as(true))
       .catchAll {
-        case t if isAlreadyExists(t)   => printLine(terminal, s"Channel '${cfg.channel}' already registered.")
+        case t if isAlreadyExists(t)   => printLine(terminal, s"Channel '${cfg.channel}' already registered.").as(true)
         case t if isUnknownPerson(t)   =>
-          printLine(terminal, s"Channel register failed: no person '${cfg.as}'. Pass --as <person-id> (a lowercase slug like 'fred', not a display name).")
-        case t                         => printLine(terminal, s"channel register skipped: ${describe(t)}")
+          printLine(terminal, s"Channel register failed: no person '${cfg.as}'. Pass --as <person-id> (a lowercase slug like 'fred', not a display name); create them first with `person person create`.").as(false)
+        case t                         => printLine(terminal, s"channel register skipped: ${describe(t)}").as(true)
       }
   }
 
@@ -534,13 +574,22 @@ object Main extends ZIOAppDefault {
                       "approve"   -> Json.Bool(approve),
                       "reason"    -> reason.map(Json.Str(_)).getOrElse(Json.Null)
                     ).toJson
-        _        <- post(cfg.personServicePrivateUrl + s"/approvals/$id/decide", body)
-      } yield ()
+        resp     <- post(cfg.personServicePrivateUrl + s"/approvals/$id/decide", body)
+      } yield resp
       flow.foldZIO(
         t => printLine(terminal, s"decision failed: ${describe(t)}"),
-        _ =>
-          if (approve) printLine(terminal, s"approved $id — running continuation…") *> renderNextTurn(cfg, terminal, queue)
-          else printLine(terminal, s"rejected $id")
+        resp => {
+          val appr       = resp.fromJson[Json].toOption
+          val executed   = appr.flatMap(strField("executedAt")).exists(_.trim.nonEmpty)
+          // mycroft only runs a continuation/notification turn when the approval
+          // carries a channel; without one, no turn will ever start, so don't block
+          // waiting for it (the decision already executed).
+          val hasChannel = appr.flatMap(strField("channel")).exists(_.trim.nonEmpty)
+          if (!approve) printLine(terminal, s"rejected $id")
+          else
+            printLine(terminal, s"approved $id${if (executed) " ✓ (executed)" else ""}") *>
+              ZIO.when(hasChannel)(renderNextTurn(cfg, terminal, queue)).unit
+        }
       )
     }
   }

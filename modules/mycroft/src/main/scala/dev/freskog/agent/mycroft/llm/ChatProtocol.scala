@@ -65,7 +65,8 @@ object ChatProtocol {
     maxTokens: Int,
     stream: Boolean,
     toolsJson: Option[String],
-    sampling: SamplingParams = SamplingParams()
+    sampling: SamplingParams = SamplingParams(),
+    enableThinking: Option[Boolean] = None
   ): String = {
     val msgArr = Json.Arr(Chunk.fromIterable(messages.map(encodeMessage)))
     val base = List(
@@ -84,9 +85,17 @@ object ChatProtocol {
     val withUsage =
       if (stream) base :+ ("stream_options" -> Json.Obj("include_usage" -> Json.Bool(true)))
       else base
+    // Qwen3 thinking control via the chat template. Sent only when set, so the
+    // default (server's template default) is unchanged when we don't pass it.
+    // `enable_thinking:false` skips reasoning entirely (faster, "direct" mode);
+    // `true` separates reasoning cleanly into `reasoning_content`.
+    val withThinking = enableThinking match {
+      case Some(b) => withUsage :+ ("chat_template_kwargs" -> Json.Obj("enable_thinking" -> Json.Bool(b)))
+      case None    => withUsage
+    }
     val withTools = toolsJson.flatMap(_.fromJson[Json].toOption) match {
-      case Some(arr) => withUsage :+ ("tools" -> arr)
-      case None      => withUsage
+      case Some(arr) => withThinking :+ ("tools" -> arr)
+      case None      => withThinking
     }
     Json.Obj(Chunk.fromIterable(withTools)).toJson
   }

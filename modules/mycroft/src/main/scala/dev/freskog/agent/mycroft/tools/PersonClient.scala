@@ -23,6 +23,9 @@ trait PersonClient {
   def searchMemory(query: String, personId: Option[PersonId], limit: Int): IO[AgentError, List[MemoryHit]]
   def profileFacts(limit: Int): IO[AgentError, List[MemoryItem]]
   def household: IO[AgentError, HouseholdGraph]
+  /** Open goals (the durable outcomes the household is working toward), injected
+   *  into the turn so the agent is aware of them. */
+  def openGoals: IO[AgentError, List[Goal]]
   def getChannel(id: ChannelId): IO[AgentError, Option[ChannelWithMembers]]
   def listChannels: IO[AgentError, List[Channel]]
   def createChannel(id: ChannelId, defaultModel: Option[String], members: List[PersonId]): IO[AgentError, ChannelWithMembers]
@@ -59,6 +62,9 @@ object PersonClient {
 
     def household: IO[AgentError, HouseholdGraph] =
       get("/household", Map.empty).flatMap(decode[HouseholdGraph])
+
+    def openGoals: IO[AgentError, List[Goal]] =
+      get("/goals", Map("status" -> "open")).flatMap(decode[List[Goal]])
 
     def getChannel(id: ChannelId): IO[AgentError, Option[ChannelWithMembers]] =
       get(s"/channels/${id.value}", Map.empty).flatMap(decode[ChannelWithMembers]).map(Some(_))

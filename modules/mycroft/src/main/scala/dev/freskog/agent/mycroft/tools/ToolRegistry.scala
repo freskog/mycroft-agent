@@ -18,7 +18,10 @@ import java.nio.file.{Path, Paths}
 final case class ToolOutcome(ok: Boolean, summary: String, content: String)
 
 trait ToolRegistry {
-  def dispatch(name: String, argsJson: String): IO[AgentError, ToolOutcome]
+  /** Run an OS tool. `env` carries per-turn context (e.g. `MYCROFT_CHANNEL`) into
+   *  the child process so commands like `person goal request` can default
+   *  `--channel` without the agent threading it. */
+  def dispatch(name: String, argsJson: String, env: Map[String, String] = Map.empty): IO[AgentError, ToolOutcome]
 }
 
 object ToolRegistry {
@@ -61,8 +64,8 @@ object ToolRegistry {
 
   def live(cwd: Path, defaultTimeout: Int): ToolRegistry = new ToolRegistry {
 
-    def dispatch(name: String, argsJson: String): IO[AgentError, ToolOutcome] = name match {
-      case "safe_run" => safeRun(argsJson)
+    def dispatch(name: String, argsJson: String, env: Map[String, String] = Map.empty): IO[AgentError, ToolOutcome] = name match {
+      case "safe_run" => safeRun(argsJson, env)
       case "runlog"   => runlogTool(argsJson)
       case other =>
         ZIO.succeed(ToolOutcome(
@@ -72,14 +75,14 @@ object ToolRegistry {
         ))
     }
 
-    private def safeRun(argsJson: String): IO[AgentError, ToolOutcome] = {
+    private def safeRun(argsJson: String, env: Map[String, String]): IO[AgentError, ToolOutcome] = {
       val parsed = argsJson.fromJson[Json].toOption
       val command = parsed.flatMap(strField("command"))
       val timeout = parsed.flatMap(intField("timeout_seconds")).getOrElse(defaultTimeout)
       command match {
         case None | Some("") =>
           ZIO.succeed(ToolOutcome(false, "missing command", "Error: safe_run requires a non-empty 'command' string argument."))
-        case Some(cmd) => runBounded(cmd, timeout)
+        case Some(cmd) => runBounded(cmd, timeout, env)
       }
     }
 
@@ -88,13 +91,13 @@ object ToolRegistry {
       args match {
         case None | Some("") =>
           ZIO.succeed(ToolOutcome(false, "missing args", "Error: runlog requires a non-empty 'args' string, e.g. 'show <run_id> --tail 100'."))
-        case Some(a) => runBounded(s"runlog $a", defaultTimeout)
+        case Some(a) => runBounded(s"runlog $a", defaultTimeout, Map.empty)
       }
     }
 
-    private def runBounded(cmd: String, timeout: Int): IO[AgentError, ToolOutcome] =
+    private def runBounded(cmd: String, timeout: Int, env: Map[String, String]): IO[AgentError, ToolOutcome] =
       ProcessRunner
-        .run(RunConfig(cmd, Shell.Bash, cwd, timeout))
+        .run(RunConfig(cmd, Shell.Bash, cwd, timeout, env))
         .mapError(translate)
         .map(meta => summarise(cmd, meta))
 

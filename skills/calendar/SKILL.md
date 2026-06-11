@@ -34,7 +34,7 @@ person calendar agenda --owner fred --days 7
 
 ## Rules
 
-1. Read-only. To *schedule* something, propose a commitment (with a `--due`) or
+1. Read-only. To *schedule* something, record a commitment (with a `--due`) or
    record an observation — do not claim you added a calendar event.
 2. Resolve relative dates against the current date/time in the system prompt.
 3. If the command reports that calendar access was not granted, tell the owner to

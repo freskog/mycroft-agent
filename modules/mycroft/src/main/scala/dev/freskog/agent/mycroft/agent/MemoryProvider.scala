@@ -22,6 +22,8 @@ trait MemoryProvider {
   def search(query: String, person: Option[PersonId], limit: Int): IO[AgentError, List[MemoryHit]]
   def profile(limit: Int): IO[AgentError, List[MemoryItem]]
   def household: IO[AgentError, HouseholdGraph]
+  /** Open goals to surface in the turn so the agent works toward them. */
+  def openGoals: IO[AgentError, List[Goal]]
 }
 
 object MemoryProvider {
@@ -44,5 +46,8 @@ object MemoryProvider {
 
     val household: IO[AgentError, HouseholdGraph] =
       person.household.catchAll(_ => ZIO.succeed(HouseholdGraph(Nil, Nil)))
+
+    val openGoals: IO[AgentError, List[Goal]] =
+      person.openGoals.catchAll(_ => ZIO.succeed(Nil))
   }
 }

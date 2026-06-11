@@ -43,7 +43,13 @@ object AgentEvent {
     elapsedMs: Long,
     ttftMs: Option[Long] = None,
     genTps: Option[Double] = None,
-    ppTps: Option[Double] = None
+    ppTps: Option[Double] = None,
+    // Turn-level totals across ALL model calls (not just the final one): how many
+    // model calls the turn made, total generated tokens, and total generation time.
+    // This is the real per-turn cost; the per-call rates above are the last call.
+    modelCalls: Int = 0,
+    turnGenTokens: Int = 0,
+    turnGenMs: Long = 0L
   ) extends AgentEvent
   final case class Error(channel: String, messageId: String, kind: String, message: String) extends AgentEvent
 }

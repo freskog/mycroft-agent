@@ -12,7 +12,10 @@ final case class Skill(
   version: Option[String],
   capabilities: List[String],
   path: String,
-  body: String
+  body: String,
+  // Optional reasoning mode for executing this skill: `direct` (thinking off,
+  // fast) or `reason` (thinking on). Absent → the harness default applies.
+  reasoning: Option[String] = None
 )
 
 sealed trait SkillError extends Product with Serializable
@@ -84,6 +87,7 @@ object SkillCatalog {
       description = description,
       version = fields.get("version").map(_.trim).filter(_.nonEmpty),
       capabilities = fields.get("capabilities").map(parseStringList).getOrElse(Nil),
+      reasoning = fields.get("reasoning").map(_.trim).filter(_.nonEmpty),
       path = file.toString,
       body = body
     )

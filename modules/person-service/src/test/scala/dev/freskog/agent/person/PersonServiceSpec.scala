@@ -8,7 +8,10 @@ import dev.freskog.agent.person.seed.SeedData.{FredId, PaulaId, SampleGoalId}
 import dev.freskog.agent.person.service.PersonService
 
 import zio._
+import zio.json._
 import zio.test._
+
+import java.time.Instant
 
 object PersonServiceSpec extends ZIOSpecDefault {
 
@@ -66,15 +69,31 @@ object PersonServiceSpec extends ZIOSpecDefault {
     test("update person changes given fields, leaves the rest, fails on unknown id") {
       withService { svc =>
         for {
-          updated <- svc.updatePerson(FredId, UpdatePersonRequest(timezone = Some("Europe/Dublin"), defaultLocale = Some("en-IE")))
+          // Update to a tz distinct from the seed so persistence is actually proven.
+          updated <- svc.updatePerson(FredId, UpdatePersonRequest(timezone = Some("America/New_York"), defaultLocale = Some("en-US")))
           fetched <- svc.listPersons.map(_.find(_.id == FredId))
           missing <- svc.updatePerson(PersonId("nope"), UpdatePersonRequest(timezone = Some("UTC"))).either
         } yield assertTrue(
-          updated.timezone == "Europe/Dublin",
-          updated.defaultLocale.contains("en-IE"),
+          updated.timezone == "America/New_York",
+          updated.defaultLocale.contains("en-US"),
           updated.displayName.nonEmpty,                       // untouched field preserved
-          fetched.exists(_.timezone == "Europe/Dublin"),
+          fetched.exists(_.timezone == "America/New_York"),
           missing.swap.toOption.exists(_.isInstanceOf[AgentError.NotFound])
+        )
+      }
+    },
+    test("update via the exact CLI JSON body (null displayName) decodes and persists") {
+      withService { svc =>
+        // The literal body `person person update fred --timezone … --locale …` posts.
+        val body = """{"displayName":null,"timezone":"America/New_York","defaultLocale":"en-US"}"""
+        for {
+          req     <- ZIO.fromEither(body.fromJson[UpdatePersonRequest]).mapError(AgentError.BadRequest(_))
+          _       <- svc.updatePerson(FredId, req)
+          fetched <- svc.listPersons.map(_.find(_.id == FredId))
+        } yield assertTrue(
+          fetched.exists(_.timezone == "America/New_York"),
+          fetched.exists(_.defaultLocale.contains("en-US")),
+          fetched.exists(_.displayName.nonEmpty)   // null displayName left the name untouched
         )
       }
     },
@@ -85,10 +104,27 @@ object PersonServiceSpec extends ZIOSpecDefault {
         )
       }
     },
+    test("goal --due round-trips through create and re-request updates it") {
+      withService { svc =>
+        val due1 = Instant.parse("2026-06-12T17:00:00Z")
+        val due2 = Instant.parse("2026-06-20T17:00:00Z")
+        for {
+          a       <- svc.proposeGoal(ProposeGoalRequest(FredId, "CIS via extend", "CIS usable", "demo", None, Some("chat:cis"), Some(due1)))
+          fetched <- svc.listGoals(Some(FredId), None).map(_.find(_.id == a.id))
+          // re-request by the same source updates the (mutable) due date
+          b       <- svc.proposeGoal(ProposeGoalRequest(FredId, "CIS via extend", "CIS usable", "demo", None, Some("chat:cis"), Some(due2)))
+          after   <- svc.listGoals(Some(FredId), None).map(_.find(_.id == a.id))
+        } yield assertTrue(
+          fetched.exists(_.dueAt.contains(due1)),
+          a.id == b.id,                       // deduped by source
+          after.exists(_.dueAt.contains(due2))
+        )
+      }
+    },
 
     // --- Commitments ---
 
-    test("propose commitment creates with proposed status") {
+    test("record commitment creates with open status (gateless)") {
       withService { svc =>
         svc.proposeCommitment(ProposeCommitmentRequest(
           ownerPersonId = FredId,
@@ -98,10 +134,22 @@ object PersonServiceSpec extends ZIOSpecDefault {
           dueAt = None
         )).map(c =>
           assertTrue(
-            c.status == CommitmentStatus.Proposed,
+            c.status == CommitmentStatus.Open,
             c.ownerPersonId == FredId,
             c.id.value.nonEmpty
           )
+        )
+      }
+    },
+    test("commitment lifecycle: cancel reverses an open commitment") {
+      withService { svc =>
+        for {
+          c       <- svc.proposeCommitment(ProposeCommitmentRequest(FredId, "task", "chat", "ev", None))
+          done    <- svc.updateCommitmentStatus(c.id, CommitmentStatus.Cancelled, Some("no longer relevant"))
+          open    <- svc.listCommitments(Some(FredId), Some("open"))
+        } yield assertTrue(
+          done.status == CommitmentStatus.Cancelled,
+          open.isEmpty
         )
       }
     },
@@ -121,9 +169,9 @@ object PersonServiceSpec extends ZIOSpecDefault {
       withService { svc =>
         for {
           _        <- svc.proposeCommitment(ProposeCommitmentRequest(FredId, "task1", "src", "ev", None))
-          proposed <- svc.listCommitments(None, Some("proposed"))
           open     <- svc.listCommitments(None, Some("open"))
-        } yield assertTrue(proposed.length == 1, open.isEmpty)
+          proposed <- svc.listCommitments(None, Some("proposed"))
+        } yield assertTrue(open.length == 1, proposed.isEmpty)
       }
     },
     test("re-proposing a commitment by external source updates in place (idempotent)") {
@@ -354,6 +402,36 @@ object PersonServiceSpec extends ZIOSpecDefault {
           first.flatMap(_.originEventId).toSet == Set(e1.id, e2.id),
           second.isEmpty
         )
+      }
+    },
+    test("consolidate classifies email-sourced events as external_content; chat as agent_inference") {
+      withService { svc =>
+        for {
+          eMail   <- svc.logEvent(LogEventRequest("agent", "obs.school", "observation", None, None,
+                       Some("Liam swimming moved to Thursday 17:30"), None, Some("email:gmail-msg-7|Paula")))
+          eChat   <- svc.logEvent(LogEventRequest("agent", "note.pref", "session_note", None, None,
+                       Some("Fred likes morning meetings"), None, Some("chat")))
+          items   <- svc.consolidateMemory(None)
+          mailItem = items.find(_.originEventId.contains(eMail.id)).get
+          chatItem = items.find(_.originEventId.contains(eChat.id)).get
+          profile <- svc.profileFacts(50)
+          bundle  <- svc.contextBundle(None, 20, 20)
+        } yield assertTrue(
+          mailItem.trust == TrustLevel.ExternalContent,
+          mailItem.sender.contains("Paula"),
+          chatItem.trust == TrustLevel.AgentInference,
+          // email-derived belief is recall-visible but NOT in the authoritative profile
+          bundle.facts.exists(_.item.id == mailItem.id),
+          !profile.exists(_.id == mailItem.id)
+        )
+      }
+    },
+    test("event source round-trips onto AuditEvent.source") {
+      withService { svc =>
+        for {
+          _   <- svc.logEvent(LogEventRequest("agent", "obs.x", "observation", None, None, Some("x"), None, Some("email:gmail-msg-9")))
+          all <- svc.listEvents(Some("observation"), None, None, 50)
+        } yield assertTrue(all.exists(_.source.contains("email:gmail-msg-9")))
       }
     },
     test("event log + searchEvents round-trip") {

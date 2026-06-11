@@ -51,29 +51,32 @@ The agent sandbox must not have direct access to:
 | Runs in | Agent sandbox | Host / trusted zone |
 | Has credentials | No | Yes |
 | Has DB access | No | Yes |
-| Can propose state | Yes | N/A (it owns state) |
-| Can finalize state | No | Yes (via admin) |
+| Can record state (gateless) | Yes | N/A (it owns state) |
+| Can request gated actions | Yes (request only) | N/A |
+| Can decide/execute gated actions | No | Yes |
 
 ### Why Authoritative State Lives Outside the Sandbox
 
 If the agent could directly write to the database, a compromised or confused agent could:
 - Delete commitments
-- Accept its own proposals
-- Overwrite memory
+- Create or approve its own goals/actions (bypass the gate)
+- Overwrite memory in place (destroy history)
 - Corrupt family data
 
 All writes go through the sidecar's API, but the gate strength is matched to risk (see "Human-in-the-Loop" below): reversible internal knowledge is written directly; durable contracts and outside-effect actions require a human decision the agent structurally cannot forge.
 
 ### Human-in-the-Loop: gateless writes, gated actions & goals
 
-Not everything needs the same gate. We grade by risk:
+Not everything needs the same gate. We grade by risk, and the agent's command surface mirrors it with **two verbs**: `record` (gateless) and `request` (gated).
 
-- **Gateless (memory, entities, relationships):** written **live** (`accepted` on write). These are internal and reversible, so the safety net is provenance + reversibility, not a sign-off: `text`/`outcome` fields are immutable (you supersede, never edit), every item carries `origin_event_id`/`source` and a `confidence`, and a human (or the agent, on realising it erred) can `reject`/`archive`/`supersede` after the fact. Requiring human acceptance of every learned fact was friction that fought continuous learning; we dropped it. There is no `accept`/`pending`/`accept-all`.
-- **Hard-gated (goals, and any outside-effect action):** these go through the **approval mechanism**. A goal is a durable, immutable contract (a wrongly-inferred one is costly); an action (send mail, create a calendar event) is irreversible and outward. The agent can only **request** — it never approves or executes.
+- **Gateless — `record` (memory, entities, relationships, commitments):** written **live** (`accepted`, or `open` for commitments). These are internal and reversible, so the safety net is provenance + reversibility, not a sign-off: `text`/`outcome` fields are immutable (you supersede, never edit), every item carries `origin_event_id`/`source`, a `confidence`, and a **trust level**, and a human (or the agent, on realising it erred) can `reject`/`archive`/`supersede`/`commitment cancel` after the fact. Requiring human acceptance of every learned fact was friction that fought continuous learning; we dropped it. There is no `accept`/`pending`/`accept-all`. A commitment's `open` means *tracked*, not *agreed*.
+- **Hard-gated — `request` (goals, and any outside-effect action):** these go through the **approval mechanism**. A goal is a durable, immutable contract (a wrongly-inferred one is costly); an action (send mail, create a calendar event) is irreversible and outward. The agent can only **request** — it never approves or executes.
+
+**Evidence ≠ belief ≠ authority.** A recorded belief carries a `trust` level — `user_stated`, `tool_confirmed`, `external_content`, or `agent_inference`. The agent may infer freely from email/web and reason with those inferences, but an `external_content` belief is *provenance-limited*: it never enters the authoritative profile (which is onboarding-sourced), is surfaced flagged "⚠ unverified", and can never authorize a `request`/action on its own. Memory policy is permissive; action policy is strict — the two are independent. Consolidation derives the trust of a belief from the originating event's `source` (an `email:`/`web:` source ⇒ `external_content`), so background ingestion cannot silently promote untrusted content to authoritative state.
 
 The approval lifecycle, deliberately with **no suspended fibers** (so it survives restarts and overnight async waits):
 
-1. **Propose** — the agent creates an `Approval` (`requested`). Non-blocking; the turn ends. `person goal request` is sugar that creates a `goal.create` approval; `person approval request` covers other action types.
+1. **Request** — the agent creates an `Approval` (`requested`). Non-blocking; the turn ends. `person goal request` is sugar that creates a `goal.create` approval; `person approval request` covers other action types.
 2. **Surface** — clients subscribe to person-service's `GET /approvals/stream` and render `requested` events. mycroft *also* subscribes, but only for `executed` (to run continuations). The agent can *see* approvals; it cannot decide them.
 3. **Decide** — a human approves/rejects. This is gated two ways: the decision endpoint is served **only on a private network interface** the agent's plane (`agentnet`) cannot route to; and it requires a **one-time decision code** that person-service issues and delivers only to the human (over the private code endpoint, or a client push), hashed at rest and **never present on any agent-readable surface**. So even reaching the endpoint, the agent has no code. Codes are single-use, id-bound, and have a generous (default 48h) TTL so an overnight approval still works.
 4. **Execute** — on approve, person-service runs the action server-side (it holds the credentials), records the result, and emits `executed`.
@@ -165,7 +168,7 @@ Both tables are indexed with persistent SQLite FTS5 virtual tables kept in sync 
 The flow between them:
 1. Agent logs raw experience as events (cheap, high-volume)
 2. `person memory consolidate` walks recent `observation` + `session_note` events and records one `memory_item` per event with `origin_event_id` set
-3. Facts are written `accepted` (gateless — see Human-in-the-Loop); a human can later `reject`/`supersede` a wrong one
+3. Facts are written `accepted` (gateless — see Human-in-the-Loop), with `trust` derived from the originating event's `source` (an `email:`/`web:` source ⇒ `external_content`, surfaced flagged); a human can later `reject`/`supersede` a wrong one
 4. Accepted facts feed the **context bundle** (`person memory context`) — top-k ranked by `confidence × recency` plus recent relevant events — for harness injection
 5. Active recall (`person memory search`, `person event search`) is FTS5-ranked and supports point-in-time `--as-of` queries that respect supersession and `valid_from`/`valid_until`
 6. Provenance: from any accepted fact, follow `origin_event_id` to the event that produced it; from there, the audit trail explains the rest
@@ -220,7 +223,7 @@ follow-ups:
   the per-turn context bundle, so the agent always knows the schedule without a
   tool call.
 - **Phase 2 — write via approval**: a `calendar.events` scope where the agent
-  *proposes* an event (an `Approval` of type `calendar.create_event`); a human
+  *requests* an event (an `Approval` of type `calendar.create_event`); a human
   approves and `person-service` creates it, linking it back to the commitment or
   goal it projects.
 
@@ -360,7 +363,7 @@ return reasoning in a dedicated `reasoning_content` field, not inline
   summary. It composes skills; it does not touch the OS, so the OS surface stays
   `safe_run` + `runlog`.
 
-Everything else — `person memory propose`, `person goal list`, the `skill`
+Everything else — `person memory record`, `person goal list`, the `skill`
 catalogue, unix utilities — is invoked through `safe_run`. Command vocabulary
 lives in skills; the system prompt mentions only the entry points. This is
 progressive disclosure of tools, mirroring the substrate's progressive
@@ -407,9 +410,20 @@ Intra-turn `tool` and assistant-tool_call messages are kept in-memory for the
 turn only — never persisted as part of the conversation history that re-enters
 the window on the next turn, which avoids malformed tool sequences on reload.
 
+- **Intra-turn working set**: a long agentic turn appends an assistant+tool pair
+  every iteration (up to `MYCROFT_MAX_TOOL_ITERATIONS`, each tool preview up to
+  4 KB), which would grow unbounded and overflow the model mid-turn. Before each
+  model call `Compaction.fit` bounds the message list to `MYCROFT_INNER_TOKEN_BUDGET`
+  by **progressively degrading the oldest tool outputs to just their `runlog`
+  pointer** (keeping the most recent `MYCROFT_KEEP_RECENT_TOOLS` verbatim and never
+  touching the system message, user turns, or assistant→tool pairing). This is
+  lossless w.r.t. evidence: the full output stays on disk and the model can
+  re-read it via `runlog <id>`. The cross-turn budget above is applied once at
+  turn start; this is the per-call bound inside the loop.
+
 Auto-summarize-on-drop (rolling-out messages become `session_note` events that
 later consolidate into memory items) is deferred to v1.1; for now, important
-context must be promoted explicitly via `person memory propose`.
+context must be promoted explicitly via `person memory record`.
 
 ## GraalVM Native-Image Notes
 

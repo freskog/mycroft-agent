@@ -39,7 +39,7 @@ safe-run --cwd /tmp/workspace --timeout 10 --shell bash -- \
     --payload-json '{\"messageId\":\"gmail-msg-456\"}'"
 ```
 
-`--actor` defaults to `agent`. `--action` is a free-form snake-case label for the event type; pick something stable so later queries can filter.
+`--actor` defaults to `agent`. `--action` is a free-form snake-case label for the event type; pick something stable so later queries can filter. Set `--source` to where the event came from (e.g. `email:gmail-msg-<id>`, `chat`) — it is first-class provenance and decides the trust of any belief consolidation derives from this event (an `email:`/`web:` source ⇒ unverified `external-content`).
 
 ### List recent events
 
@@ -67,10 +67,14 @@ FTS5 over `text` and `payload_json`. Useful for "where did the user say X" timel
 ## Provenance flow
 
 ```
-event (observation / session_note)
+event (observation / session_note, with --source)
    └── memory consolidate
-        └── memory_item (proposed, with originEventId)
-             └── human accept → context bundle
+        └── memory_item (accepted live, with originEventId + trust derived from --source)
+             └── context bundle (email/web-sourced items are flagged "⚠ unverified")
 ```
 
-When the agent later wonders *why do I believe this*, it follows `originEventId` from the memory item back to the originating event.
+Consolidation is gateless — there is no human accept step. An event's `--source`
+sets the resulting belief's trust: an `email:`/`web:` source makes it
+`external-content` (usable for reasoning, surfaced flagged); anything else is
+`agent-inference`. When the agent later wonders *why do I believe this*, it follows
+`originEventId` from the memory item back to the originating event.

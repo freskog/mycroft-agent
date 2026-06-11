@@ -77,4 +77,4 @@ Files cited in evidence (commit logs, screenshots, transcripts) live under `evid
 2. Snapshot **before** rewriting, not after. The intent of versioning is to recover the path-you-tried-first.
 3. Keep `PLANS.md` short — a working document, not a journal. Move detailed notes into `evidence/` if they matter.
 4. Never store credentials, tokens, or PII in the plan or evidence directory. The workspace is sandbox-internal but not encrypted.
-5. If the plan diverges far enough from the goal that the original outcome no longer applies, cancel the goal and propose a new one — don't try to bend the plan to a different finish line.
+5. If the plan diverges far enough from the goal that the original outcome no longer applies, cancel the goal and request a new one (goal creation is gated) — don't try to bend the plan to a different finish line.

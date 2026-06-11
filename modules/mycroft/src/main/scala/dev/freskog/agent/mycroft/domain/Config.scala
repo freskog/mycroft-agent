@@ -11,8 +11,13 @@ final case class MycroftConfig(
   maxSkillDepth: Int,
   maxTurnSeconds: Int,
   maxOutputTokens: Int,
+  defaultReasoning: String,
+  reasonMaxTokens: Int,
+  directMaxTokens: Int,
   contextWindowMsgs: Int,
   contextTokenBudget: Int,
+  innerTokenBudget: Int,
+  keepRecentTools: Int,
   temperature: Double,
   topP: Double,
   topK: Int,
@@ -43,8 +48,24 @@ object MycroftConfig {
       maxSkillDepth      = envInt("MYCROFT_MAX_SKILL_DEPTH", 3),
       maxTurnSeconds     = envInt("MYCROFT_MAX_TURN_SECONDS", 600),
       maxOutputTokens    = envInt("MYCROFT_MAX_OUTPUT_TOKENS", 2048),
+      // Reasoning mode for the top-level conversational turn. `reason` (default)
+      // keeps thinking on with the existing 2048-token budget — i.e. no change to
+      // current behaviour, just made explicit. `direct` turns thinking off with a
+      // tighter budget: the opt-in speed lever (flip the env, or set per-skill via
+      // `reasoning:` frontmatter). Budgets are env-tunable; 2048 stays the reason
+      // default deliberately (a larger budget lets the model spin longer on the
+      // rare no-answer loops the presence penalty guards against).
+      defaultReasoning   = env("MYCROFT_DEFAULT_REASONING", "reason"),
+      reasonMaxTokens    = envInt("MYCROFT_REASON_MAX_TOKENS", 2048),
+      directMaxTokens    = envInt("MYCROFT_DIRECT_MAX_TOKENS", 1024),
       contextWindowMsgs  = envInt("MYCROFT_CONTEXT_WINDOW_MSGS", 20),
       contextTokenBudget = envInt("MYCROFT_CONTEXT_TOKEN_BUDGET", 8000),
+      // The intra-turn working-set budget: the agentic loop appends a tool result
+      // (up to 4 KB) per iteration, so without a cap a long turn overflows the
+      // model. `fit` degrades the oldest tool outputs to their runlog pointer to
+      // stay under this; the most recent `keepRecentTools` results stay verbatim.
+      innerTokenBudget   = envInt("MYCROFT_INNER_TOKEN_BUDGET", 16000),
+      keepRecentTools    = envInt("MYCROFT_KEEP_RECENT_TOOLS", 3),
       // Qwen3 thinking-mode sampling + a presence penalty to break reasoning
       // repetition loops (the model otherwise spins until max_tokens with no
       // answer). Tune via env if a different model is loaded.

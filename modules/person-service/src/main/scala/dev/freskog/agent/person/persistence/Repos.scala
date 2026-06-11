@@ -20,7 +20,9 @@ trait CommitmentRepo {
   def create(commitment: Commitment): IO[AgentError, Unit]
   def findAll(ownerPersonId: Option[PersonId], status: Option[String]): IO[AgentError, List[Commitment]]
   def findBySource(ownerPersonId: PersonId, source: String): IO[AgentError, Option[Commitment]]
+  def findById(id: CommitmentId): IO[AgentError, Option[Commitment]]
   def updateContent(id: CommitmentId, text: String, evidence: String, dueAt: Option[Instant], updatedAt: Instant): IO[AgentError, Unit]
+  def updateStatus(id: CommitmentId, status: CommitmentStatus, updatedAt: Instant): IO[AgentError, Unit]
 }
 
 trait MemoryRepo {
@@ -69,7 +71,7 @@ trait GoalRepo {
   def findById(id: GoalId): IO[AgentError, Option[Goal]]
   def findBySource(ownerPersonId: PersonId, source: String): IO[AgentError, Option[Goal]]
   def updateStatus(id: GoalId, status: GoalStatus, blockedReason: Option[String], updatedAt: Instant): IO[AgentError, Unit]
-  def updateContent(id: GoalId, title: String, constraintsJson: Option[String], updatedAt: Instant): IO[AgentError, Unit]
+  def updateContent(id: GoalId, title: String, constraintsJson: Option[String], dueAt: Option[Instant], updatedAt: Instant): IO[AgentError, Unit]
 }
 
 trait EntityRepo {
@@ -118,8 +120,12 @@ trait CredentialRepo {
 trait InboxMessageRepo {
   def upsert(message: InboxMessage): IO[AgentError, Unit]
   def findById(id: InboxMessageId): IO[AgentError, Option[InboxMessage]]
+  def findByExternal(provider: String, externalId: String, ownerPersonId: PersonId): IO[AgentError, Option[InboxMessage]]
   def findAll(ownerPersonId: Option[PersonId], status: Option[String], limit: Int, oldestFirst: Boolean = false): IO[AgentError, List[InboxMessage]]
   def existsExternal(provider: String, externalId: String, ownerPersonId: PersonId): IO[AgentError, Boolean]
+  /** Refresh the parsed content of an existing row (used to re-parse a pending
+   *  message after a parser improvement). Does not touch triage state. */
+  def updateContent(id: InboxMessageId, subject: String, bodyText: String, attachments: List[InboxAttachment]): IO[AgentError, Unit]
   def updateStatus(id: InboxMessageId, status: TriageStatus, triagedAt: Instant, sourceEventId: Option[EventId]): IO[AgentError, Unit]
   def countPending(ownerPersonId: PersonId): IO[AgentError, Int]
 }
@@ -173,7 +179,9 @@ object Repos {
       supersededById = opt(rs, "superseded_by_id").map(MemoryId),
       validFrom = optInstant(rs, "valid_from"),
       validUntil = optInstant(rs, "valid_until"),
-      originEventId = opt(rs, "origin_event_id").map(EventId)
+      originEventId = opt(rs, "origin_event_id").map(EventId),
+      trust = TrustLevel.fromString(col(rs, "trust")).getOrElse(TrustLevel.AgentInference),
+      sender = opt(rs, "sender")
     )
 
   private def extractApproval(rs: ResultSet): Approval =
@@ -205,7 +213,8 @@ object Repos {
       targetId = opt(rs, "target_id"),
       text = opt(rs, "text"),
       payloadJson = col(rs, "payload_json"),
-      createdAt = instant(rs, "created_at")
+      createdAt = instant(rs, "created_at"),
+      source = opt(rs, "source")
     )
 
   private def extractGoal(rs: ResultSet): Goal =
@@ -220,7 +229,8 @@ object Repos {
       blockedReason = opt(rs, "blocked_reason"),
       source = opt(rs, "source"),
       createdAt = instant(rs, "created_at"),
-      updatedAt = instant(rs, "updated_at")
+      updatedAt = instant(rs, "updated_at"),
+      dueAt = optInstant(rs, "due_at")
     )
 
   private def extractGoalEvidence(rs: ResultSet): GoalEvidence =
@@ -393,20 +403,30 @@ object Repos {
         ownerPersonId, source
       )(extractCommitment)
 
+    def findById(id: CommitmentId): IO[AgentError, Option[Commitment]] =
+      db.queryOne("SELECT * FROM commitments WHERE id = ?", id)(extractCommitment)
+
     def updateContent(id: CommitmentId, text: String, evidence: String, dueAt: Option[Instant], updatedAt: Instant): IO[AgentError, Unit] =
       db.execute(
         "UPDATE commitments SET text = ?, evidence = ?, due_at = ?, updated_at = ? WHERE id = ?",
         text, evidence, dueAt, updatedAt, id
+      )
+
+    def updateStatus(id: CommitmentId, status: CommitmentStatus, updatedAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE commitments SET status = ?, updated_at = ? WHERE id = ?",
+        statusStr(status), updatedAt, id
       )
   }
 
   def sqliteMemoryRepo(db: Sqlite): MemoryRepo = new MemoryRepo {
     def create(m: MemoryItem): IO[AgentError, Unit] =
       db.execute(
-        "INSERT INTO memory_items (id, person_id, status, kind, text, source, confidence, created_at, updated_at, superseded_by_id, valid_from, valid_until, origin_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO memory_items (id, person_id, status, kind, text, source, confidence, created_at, updated_at, superseded_by_id, valid_from, valid_until, origin_event_id, trust, sender) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         m.id, m.personId, MemoryStatus.asString(m.status), MemoryKind.asString(m.kind),
         m.text, m.source, m.confidence, m.createdAt, m.updatedAt,
-        m.supersededById, m.validFrom, m.validUntil, m.originEventId
+        m.supersededById, m.validFrom, m.validUntil, m.originEventId,
+        TrustLevel.asString(m.trust), m.sender
       )
 
     def findAll(personId: Option[PersonId], status: Option[String], kind: Option[String]): IO[AgentError, List[MemoryItem]] = {
@@ -571,9 +591,9 @@ object Repos {
   def sqliteAuditRepo(db: Sqlite): AuditRepo = new AuditRepo {
     def create(e: AuditEvent): IO[AgentError, Unit] =
       db.execute(
-        "INSERT INTO audit_events (id, actor, action, category, target_type, target_id, text, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audit_events (id, actor, action, category, target_type, target_id, text, payload_json, created_at, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         e.id, e.actor, e.action, e.category, e.targetType, e.targetId,
-        e.text, e.payloadJson, e.createdAt
+        e.text, e.payloadJson, e.createdAt, e.source
       )
 
     def list(category: Option[String], since: Option[Instant], until: Option[Instant], limit: Int): IO[AgentError, List[AuditEvent]] = {
@@ -603,10 +623,10 @@ object Repos {
   def sqliteGoalRepo(db: Sqlite): GoalRepo = new GoalRepo {
     def create(g: Goal): IO[AgentError, Unit] =
       db.execute(
-        "INSERT INTO goals (id, owner_person_id, title, outcome, evidence_rule, constraints_json, status, blocked_reason, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO goals (id, owner_person_id, title, outcome, evidence_rule, constraints_json, status, blocked_reason, source, created_at, updated_at, due_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         g.id, g.ownerPersonId, g.title, g.outcome, g.evidenceRule,
         g.constraintsJson, GoalStatus.asString(g.status), g.blockedReason,
-        g.source, g.createdAt, g.updatedAt
+        g.source, g.createdAt, g.updatedAt, g.dueAt
       )
 
     def findAll(ownerPersonId: Option[PersonId], status: Option[String]): IO[AgentError, List[Goal]] = {
@@ -635,10 +655,10 @@ object Repos {
 
     /** Re-propose-by-source updates only mutable display fields; `outcome` and
      *  `evidence_rule` are immutable by design and are deliberately left alone. */
-    def updateContent(id: GoalId, title: String, constraintsJson: Option[String], updatedAt: Instant): IO[AgentError, Unit] =
+    def updateContent(id: GoalId, title: String, constraintsJson: Option[String], dueAt: Option[Instant], updatedAt: Instant): IO[AgentError, Unit] =
       db.execute(
-        "UPDATE goals SET title = ?, constraints_json = ?, updated_at = ? WHERE id = ?",
-        title, constraintsJson, updatedAt, id
+        "UPDATE goals SET title = ?, constraints_json = ?, due_at = ?, updated_at = ? WHERE id = ?",
+        title, constraintsJson, dueAt, updatedAt, id
       )
   }
 
@@ -824,6 +844,18 @@ object Repos {
 
     def findById(id: InboxMessageId): IO[AgentError, Option[InboxMessage]] =
       db.queryOne("SELECT * FROM inbox_messages WHERE id = ?", id)(extractInboxMessage)
+
+    def findByExternal(provider: String, externalId: String, ownerPersonId: PersonId): IO[AgentError, Option[InboxMessage]] =
+      db.queryOne(
+        "SELECT * FROM inbox_messages WHERE provider = ? AND external_id = ? AND owner_person_id = ?",
+        provider, externalId, ownerPersonId
+      )(extractInboxMessage)
+
+    def updateContent(id: InboxMessageId, subject: String, bodyText: String, attachments: List[InboxAttachment]): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE inbox_messages SET subject = ?, body_text = ?, attachments_json = ? WHERE id = ?",
+        subject, bodyText, attachments.toJson, id
+      )
 
     def findAll(ownerPersonId: Option[PersonId], status: Option[String], limit: Int, oldestFirst: Boolean = false): IO[AgentError, List[InboxMessage]] = {
       val clauses = List(
