@@ -29,3 +29,6 @@ modules/person-service/src/main/resources/client-secret.json
 .env
 client-secret*.json
 *-credentials.json
+
+# Regenerable output of scripts/verify-omlx.sh
+scripts/verify-omlx-report.json
