@@ -278,7 +278,11 @@ object Migrations {
     "ALTER TABLE audit_events ADD COLUMN source TEXT",
 
     // V10: optional target date on goals ("done by …"). Mutable (deadlines slip).
-    "ALTER TABLE goals ADD COLUMN due_at TEXT"
+    "ALTER TABLE goals ADD COLUMN due_at TEXT",
+
+    // V11: parameterized-HITL decision menu (trusted-core authored). The chosen
+    // option's params merge into the payload at approval.
+    "ALTER TABLE approvals ADD COLUMN options_json TEXT"
   )
 
   def migrate(db: Sqlite): IO[dev.freskog.agent.common.AgentError, Unit] =

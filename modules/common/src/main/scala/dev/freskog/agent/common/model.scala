@@ -400,7 +400,13 @@ case class Approval(
   // Provenance of the request (e.g. `email:gmail-msg-X`, `chat`). Surfaced to the
   // human at decision time so a request that originated in untrusted content (an
   // email/web page) can be judged accordingly.
-  source: Option[String] = None
+  source: Option[String] = None,
+  // Optional decision menu the human chooses from (e.g. which calendar). JSON
+  // `[{"id","label","params":{…}}]`. AUTHORED BY THE TRUSTED CORE, never the agent
+  // — the chosen option's `params` are merged into `payloadJson` at approval, which
+  // is the only way a value enters the payload after the request is frozen. Keeps
+  // a compromised agent from making the displayed label diverge from what executes.
+  optionsJson: Option[String] = None
 )
 
 /** An approval-lifecycle event streamed by person-service. Edges subscribe to

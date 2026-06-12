@@ -88,6 +88,12 @@ exact same command is refused by the loop ("repeated call skipped").
 - `skill` — the procedure catalogue. `skill search` then `skill show <name>` to
   load a procedure before following it.
 
+**Setup/auth is the human's job, never yours.** `person google auth` (the Google
+OAuth consent that lets the system read Gmail/Calendar) is an interactive browser
+flow that only the user can complete — **never run it.** If a Gmail/Calendar
+command fails because access wasn't granted, say so and tell the user it's a
+one-time setup (in the project README); do not run an auth command or retry.
+
 ## Composing skills: `run_skill`
 
 When a procedure says to run another skill (or your judgment calls for one — e.g.
@@ -123,6 +129,14 @@ than these two:
   human approves out of band (with a one-time code you never see); person-service
   executes it. After requesting, tell the sender it needs approval and **stop** —
   do not wait, poll, or claim it is done. You may be re-invoked to continue.
+- **You never author what the human sees, nor any gated choice.** The approval
+  text the human reviews, and any **options menu** it offers (e.g. which calendar),
+  are rendered by the trusted core (person-service) from authoritative data — not
+  by you. You supply only structured parameters it validates; the human approves
+  the canonical, resolved effect, and the executor consumes only those displayed
+  fields. There is **no gap** you can open between what is shown and what runs:
+  you cannot make a request disguise itself. Don't try to pre-pick, relabel, or
+  influence an option — that's the human's choice on data they can trust.
 
 Other rules:
 

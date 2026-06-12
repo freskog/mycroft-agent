@@ -50,6 +50,45 @@ object ApprovalSpec extends ZIOSpecDefault {
   private def decide(svc: PersonService, id: ApprovalId, approve: Boolean = true, by: Option[PersonId] = None, reason: Option[String] = None): IO[AgentError, Approval] =
     svc.issueDecisionCode(id).flatMap(code => svc.decideApproval(id, DecideApprovalRequest(code, by, approve, reason)))
 
+  private def decideWithChoice(svc: PersonService, id: ApprovalId, chosen: Option[String]): IO[AgentError, Approval] =
+    svc.issueDecisionCode(id).flatMap(code =>
+      svc.decideApproval(id, DecideApprovalRequest(code, approve = true, chosenOptionId = chosen))
+    )
+
+  /** Like `withService`, but also exposes the approval repo so a test can insert an
+   *  approval that already carries a (trusted-core-authored) options menu — options
+   *  are never set via `requestApproval` for `approval.ping`, so we seed them here. */
+  private def withRepo(f: (PersonService, ApprovalRepo) => ZIO[Any, AgentError, TestResult]): ZIO[Any, AgentError, TestResult] =
+    ZIO.scoped {
+      for {
+        db      <- Sqlite.live(":memory:").build.map(_.get[Sqlite])
+        _       <- Migrations.migrate(db)
+        _       <- SeedData.seed(db)
+        hub     <- Hub.sliding[ApprovalEvent](16)
+        approvalRepo = Repos.sqliteApprovalRepo(db)
+        service  = PersonService.live(
+          Repos.sqlitePersonRepo(db), Repos.sqliteCommitmentRepo(db), Repos.sqliteMemoryRepo(db),
+          approvalRepo, Repos.sqliteAuditRepo(db), Repos.sqliteGoalRepo(db),
+          Repos.sqliteGoalEvidenceRepo(db), Repos.sqliteEntityRepo(db), Repos.sqliteRelationshipRepo(db),
+          Repos.sqliteChannelRepo(db), Repos.sqliteChannelMemberRepo(db), Repos.sqliteMessageRepo(db),
+          Repos.sqliteCredentialRepo(db), Repos.sqliteInboxMessageRepo(db), hub
+        )
+        result  <- f(service, approvalRepo)
+      } yield result
+    }
+
+  /** Insert a `requested` approval carrying an options menu. */
+  private def seedWithOptions(repo: ApprovalRepo, payload: String, options: String): IO[AgentError, Approval] =
+    for {
+      now <- Clock.instant
+      a    = Approval(
+               ApprovalId(java.util.UUID.randomUUID().toString), "agent", None,
+               "approval.ping", payload, ApprovalStatus.Requested, now, None,
+               channel = Some("fred"), optionsJson = Some(options)
+             )
+      _   <- repo.create(a)
+    } yield a
+
   def spec: Spec[Any, AgentError] = suite("ApprovalSpec")(
 
     test("propose creates a requested approval") {
@@ -226,6 +265,65 @@ object ApprovalSpec extends ZIOSpecDefault {
           pending.map(_.id.value) == reqd.map(_.id.value)
         )
       }
+    },
+
+    test("a chosen option's params merge into the payload before execution") {
+      withRepo { (svc, repo) =>
+        val options = """[{"id":"a","label":"A","params":{"x":1}},{"id":"b","label":"B","params":{"x":2}}]"""
+        for {
+          a <- seedWithOptions(repo, """{"base":true}""", options)
+          d <- decideWithChoice(svc, a.id, Some("a"))
+        } yield assertTrue(
+          d.executedAt.isDefined,
+          // The echoed payload (approval.ping echoes it) carries the base field and
+          // the merged option param — proof the chosen option entered the payload.
+          d.resultJson.exists(_.contains("\"base\":true")),
+          d.resultJson.exists(_.contains("\"x\":1")),
+          !d.resultJson.exists(_.contains("\"x\":2"))
+        )
+      }
+    },
+
+    test("approving a multi-option approval without a valid choice is rejected") {
+      withRepo { (svc, repo) =>
+        val options = """[{"id":"a","label":"A","params":{"x":1}},{"id":"b","label":"B","params":{"x":2}}]"""
+        for {
+          a       <- seedWithOptions(repo, """{"base":true}""", options)
+          noChoice <- decideWithChoice(svc, a.id, None).either
+          b       <- seedWithOptions(repo, """{"base":true}""", options)
+          badChoice <- decideWithChoice(svc, b.id, Some("zzz")).either
+          still   <- svc.getApproval(a.id)
+        } yield assertTrue(
+          noChoice.isLeft, badChoice.isLeft,
+          // The action did not execute when the choice was missing/invalid.
+          still.exists(_.executedAt.isEmpty)
+        )
+      }
+    },
+
+    test("a single-option approval needs no explicit choice (auto-picked)") {
+      withRepo { (svc, repo) =>
+        val options = """[{"id":"only","label":"Only","params":{"x":9}}]"""
+        for {
+          a <- seedWithOptions(repo, """{"base":true}""", options)
+          d <- decideWithChoice(svc, a.id, None)
+        } yield assertTrue(d.executedAt.isDefined, d.resultJson.exists(_.contains("\"x\":9")))
+      }
+    },
+
+    test("optionsJson round-trips on the approval") {
+      withRepo { (svc, repo) =>
+        val options = """[{"id":"a","label":"A","params":{"x":1}}]"""
+        for {
+          a <- seedWithOptions(repo, """{"base":true}""", options)
+          g <- svc.getApproval(a.id)
+        } yield assertTrue(g.flatMap(_.optionsJson).contains(options))
+      }
+    },
+
+    test("DecideApprovalRequest codec round-trips chosenOptionId") {
+      val req = DecideApprovalRequest("the-code", Some(FredId), approve = true, reason = Some("ok"), chosenOptionId = Some("a"))
+      assertTrue(req.toJson.fromJson[DecideApprovalRequest] == Right(req))
     },
 
     test("a repeated (deduped) request re-publishes 'requested' so it can re-surface") {

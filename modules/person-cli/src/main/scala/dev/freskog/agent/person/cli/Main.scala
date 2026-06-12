@@ -93,7 +93,7 @@ object Main extends ZIOCliDefault {
     final case class EventLog(category: Option[String], since: Option[String], until: Option[String], limit: Option[Int]) extends Cmd
     final case class EventSearch(query: String, category: Option[String], since: Option[String], limit: Option[Int]) extends Cmd
 
-    final case class GmailAuth(owner: String) extends Cmd
+    final case class GoogleAuth(owner: String) extends Cmd
     final case class GmailSync(owner: String, since: Option[String]) extends Cmd
     final case class InboxList(owner: String, status: Option[String], limit: Option[Int], order: Option[String]) extends Cmd
     final case class InboxShow(id: String) extends Cmd
@@ -101,6 +101,13 @@ object Main extends ZIOCliDefault {
     final case class InboxSkip(id: String) extends Cmd
     final case class InboxMarkTriaged(id: String, sourceEventId: Option[String]) extends Cmd
     final case class CalendarAgenda(owner: String, days: Option[Int], from: Option[String], to: Option[String]) extends Cmd
+    final case class CalendarList(owner: String) extends Cmd
+    // Gated: requests a calendar.create_event approval (a human approves, then
+    // person-service writes the event). start/end are ISO-8601 instants.
+    final case class CalendarCreate(
+      owner: String, summary: String, start: String, end: String, allDay: Boolean,
+      location: Option[String], description: Option[String], channel: Option[String]
+    ) extends Cmd
   }
 
   // --- commitment (gateless: recorded live as `open`, reversible) ---
@@ -328,18 +335,24 @@ object Main extends ZIOCliDefault {
   }
   private val event = Command("event").subcommands(eventRecord, eventLog, eventSearch)
 
-  // --- gmail ---
-  private val gmailAuth = Command(
+  // --- google (account-level auth) ---
+  // ONE Google consent grants the Gmail + Calendar scopes together, so auth is an
+  // account concern, not a per-service one. The services live under `gmail` and
+  // `calendar`; auth lives here.
+  private val googleAuth = Command(
     "auth",
     Options.text("owner")
-  ).map(owner => Cmd.GmailAuth(owner))
+  ).map(owner => Cmd.GoogleAuth(owner))
 
+  private val google = Command("google").subcommands(googleAuth)
+
+  // --- gmail (email service) ---
   private val gmailSync = Command(
     "sync",
     Options.text("owner") ++ Options.text("since").optional
   ).map { case (owner, since) => Cmd.GmailSync(owner, since) }
 
-  private val gmail = Command("gmail").subcommands(gmailAuth, gmailSync)
+  private val gmail = Command("gmail").subcommands(gmailSync)
 
   // --- inbox ---
   private val inboxList = Command(
@@ -374,7 +387,26 @@ object Main extends ZIOCliDefault {
     Options.text("owner") ++ Options.integer("days").optional ++ Options.text("from").optional ++ Options.text("to").optional
   ).map { case (owner, days, from, to) => Cmd.CalendarAgenda(owner, days.map(_.toInt), from, to) }
 
-  private val calendar = Command("calendar").subcommands(calendarAgenda)
+  // Gated event creation: builds a calendar.create_event approval. --start/--end
+  // are full ISO-8601 instants (UTC); resolve local times first. --all-day flag
+  // switches to a date-based event. --channel defaults from MYCROFT_CHANNEL.
+  private val calendarCreate = Command(
+    "create",
+    Options.text("owner") ++ Options.text("summary") ++ Options.text("start") ++ Options.text("end") ++
+      Options.boolean("all-day") ++ Options.text("location").optional ++ Options.text("description").optional ++
+      Options.text("channel").optional
+  ).map { case (owner, summary, start, end, allDay, location, description, channel) =>
+    Cmd.CalendarCreate(owner, summary, start, end, allDay, location, description, channel)
+  }
+
+  // List the owner's calendars (read-only). The agent can see them to answer
+  // questions, but cannot choose one when creating — the human picks at the gate.
+  private val calendarList = Command(
+    "list",
+    Options.text("owner")
+  ).map(owner => Cmd.CalendarList(owner))
+
+  private val calendar = Command("calendar").subcommands(calendarAgenda, calendarCreate, calendarList)
 
   // --- person (household members / graph person-nodes) ---
   private val personCreate = Command(
@@ -399,7 +431,7 @@ object Main extends ZIOCliDefault {
 
   private val personCommand = Command("person").subcommands(
     health, personSub, commitment, memoryExt, approval, goal, entity, relationship, household,
-    event, gmail, inbox, calendar
+    event, google, gmail, inbox, calendar
   )
 
   val cliApp = CliApp.make(
@@ -685,7 +717,7 @@ object Main extends ZIOCliDefault {
       )
       HttpClient.get("/events/search", params).flatMap(out => Console.printLine(out).orDie)
 
-    case Cmd.GmailAuth(owner) =>
+    case Cmd.GoogleAuth(owner) =>
       for {
         raw     <- HttpClient.get("/gmail/auth-url", Map("owner" -> owner))
         url      = extractJsonString(raw, "url").getOrElse("")
@@ -754,6 +786,32 @@ object Main extends ZIOCliDefault {
         "from"  -> from,
         "to"    -> to
       )).flatMap(out => Console.printLine(out).orDie)
+
+    case Cmd.CalendarList(owner) =>
+      HttpClient.get("/calendar/calendars", paramsMap("owner" -> Some(owner)))
+        .flatMap(out => Console.printLine(out).orDie)
+
+    case Cmd.CalendarCreate(owner, summary, start, end, allDay, location, description, channel) =>
+      // The event fields become the approval's payload; person-service writes the
+      // event (via createCalendarEvent) only after a human approves.
+      val payload = jsonObj(
+        "ownerPersonId" -> owner.toJson,
+        "summary"       -> summary.toJson,
+        "start"         -> start.toJson,
+        "end"           -> end.toJson,
+        "allDay"        -> allDay.toJson,
+        "location"      -> location.toJson,
+        "description"   -> description.toJson
+      )
+      val body = jsonObj(
+        "requestedBy"      -> "\"agent\"",
+        "requiredPersonId" -> owner.toJson,
+        "actionType"       -> "\"calendar.create_event\"",
+        "payloadJson"      -> payload.toJson,
+        "channel"          -> channel.orElse(envChannel).toJson,
+        "source"           -> (None: Option[String]).toJson
+      )
+      HttpClient.post("/approvals/request", body).flatMap(out => Console.printLine(out).orDie)
   }
 
   /** Fetch one attachment's bytes (base64 in JSON) and write them under `outDir`,

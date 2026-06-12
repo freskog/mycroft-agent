@@ -9,6 +9,27 @@ import java.time.Instant
 
 // --- Request payloads ---
 
+/** Payload of a `calendar.create_event` approval — the agent proposes it; on
+ *  approval, person-service writes it to the owner's primary Google Calendar.
+ *  `start`/`end` are UTC instants (the agent resolves local times against the
+ *  owner's timezone) so Google renders them correctly. `allDay` switches the
+ *  Google shape from `dateTime` to `date`. */
+case class CalendarCreateEventRequest(
+  ownerPersonId: PersonId,
+  summary: String,
+  start: Instant,
+  end: Instant,
+  allDay: Boolean = false,
+  location: Option[String] = None,
+  description: Option[String] = None,
+  // Target calendar. The AGENT leaves this unset — it cannot pick a calendar; the
+  // human's chosen HITL option injects it at approval time. Unset → "primary".
+  calendarId: Option[String] = None
+)
+object CalendarCreateEventRequest {
+  implicit val codec: JsonCodec[CalendarCreateEventRequest] = DeriveJsonCodec.gen[CalendarCreateEventRequest]
+}
+
 case class ProposeCommitmentRequest(
   ownerPersonId: PersonId,
   text: String,
@@ -69,7 +90,11 @@ case class DecideApprovalRequest(
   code: String,
   decidedBy: Option[PersonId] = None,
   approve: Boolean,
-  reason: Option[String] = None
+  reason: Option[String] = None,
+  // When the approval carries an options menu, the human's chosen option id. Its
+  // params are merged into the payload before execution; must be a member of the
+  // approval's (trusted-core-authored) options.
+  chosenOptionId: Option[String] = None
 )
 object DecideApprovalRequest {
   implicit val codec: JsonCodec[DecideApprovalRequest] = DeriveJsonCodec.gen[DecideApprovalRequest]
@@ -188,6 +213,14 @@ case class LogEventRequest(
 )
 object LogEventRequest {
   implicit val codec: JsonCodec[LogEventRequest] = DeriveJsonCodec.gen[LogEventRequest]
+}
+
+/** One of the owner's Google calendars (read-only listing). The agent can SEE
+ *  these (to answer "what calendars do I have?") but never picks one when creating
+ *  an event — the human does that at the HITL gate. */
+case class CalendarSummary(id: String, summary: String)
+object CalendarSummary {
+  implicit val codec: JsonCodec[CalendarSummary] = DeriveJsonCodec.gen[CalendarSummary]
 }
 
 case class ConsolidateRequest(since: Option[Instant])

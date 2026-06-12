@@ -9,6 +9,7 @@ import dev.freskog.agent.person.calendar._
 
 import zio._
 import zio.json._
+import zio.json.ast.Json
 
 import java.security.{MessageDigest, SecureRandom}
 import java.time.{Duration, Instant}
@@ -99,6 +100,7 @@ trait PersonService {
 
   // Calendar (read-only)
   def calendarAgenda(ownerPersonId: PersonId, timeMin: Instant, timeMax: Instant): IO[AgentError, List[CalendarEvent]]
+  def listCalendars(ownerPersonId: PersonId): IO[AgentError, List[CalendarSummary]]
 }
 
 object PersonService {
@@ -405,15 +407,19 @@ object PersonService {
         case Some(existing) => approvalHub.publish(ApprovalEvent("requested", existing)).as(existing)
         case None =>
           for {
-            now <- Clock.instant
-            a    = Approval(
-                     ApprovalId(newUuid), req.requestedBy, req.requiredPersonId,
-                     req.actionType, req.payloadJson, ApprovalStatus.Requested, now, None,
-                     continuationSkill = req.continuationSkill,
-                     continuationParams = req.continuationParams,
-                     channel = req.channel,
-                     source = req.source
-                   )
+            now     <- Clock.instant
+            // Authored by the trusted core ONLY (never the agent's request) so a
+            // compromised agent can't forge a menu whose label diverges from its value.
+            options <- optionsFor(req.actionType, req.payloadJson)
+            a        = Approval(
+                         ApprovalId(newUuid), req.requestedBy, req.requiredPersonId,
+                         req.actionType, req.payloadJson, ApprovalStatus.Requested, now, None,
+                         continuationSkill = req.continuationSkill,
+                         continuationParams = req.continuationParams,
+                         channel = req.channel,
+                         source = req.source,
+                         optionsJson = options
+                       )
             _   <- approvalRepo.create(a)
             _   <- auditPayloadRaw(
                      actor = req.requestedBy, action = "approval.request",
@@ -462,8 +468,12 @@ object PersonService {
             updated <-
               if (req.approve)
                 for {
+                  // Merge the human's chosen option (if any) into the payload — the
+                  // only post-request change to what executes, and it comes from the
+                  // trusted-core options, not the agent.
+                  effective <- resolveChosenOption(a, req.chosenOptionId)
                   _      <- approvalRepo.decide(id, ApprovalStatus.Approved, req.decidedBy, now)
-                  result <- performApproved(a)
+                  result <- performApproved(effective)
                   doneAt <- Clock.instant
                   _      <- approvalRepo.markExecuted(id, result, doneAt)
                   _      <- auditPayload("approval.approved", "approval", Some(id.value), now, StatusChangePayload(req.reason))
@@ -521,8 +531,69 @@ object PersonService {
             .mapError(e => AgentError.BadRequest(s"goal.create payload: $e"))
             .flatMap(proposeGoal)
             .map(_.toJson)
+        case "calendar.create_event" =>
+          ZIO.fromEither(a.payloadJson.fromJson[CalendarCreateEventRequest])
+            .mapError(e => AgentError.BadRequest(s"calendar.create_event payload: $e"))
+            .flatMap(createCalendarEvent)
+            .map(_.toJson)
         case other =>
           ZIO.fail(AgentError.BadRequest(s"no executor registered for action_type '$other'"))
+      }
+
+    /** The trusted-core decision menu for an action, or None. Authored ONLY here —
+     *  never from the agent's request — so a compromised agent can't forge a label
+     *  that diverges from the value it carries. (calendar.create_event is wired in
+     *  `optionsForCalendar`; other actions have no menu.) */
+    private def optionsFor(actionType: String, payloadJson: String): IO[AgentError, Option[String]] =
+      actionType match {
+        case "calendar.create_event" => optionsForCalendar(payloadJson)
+        case _                       => ZIO.succeed(None)
+      }
+
+    /** Resolve the human's chosen option into the payload: validate it's a member
+     *  of the (trusted) menu, then merge its params over the frozen payload. This
+     *  is the ONLY way a value enters the payload after the request is frozen. */
+    private def resolveChosenOption(a: Approval, chosenOptionId: Option[String]): IO[AgentError, Approval] =
+      a.optionsJson match {
+        case None => ZIO.succeed(a)
+        case Some(raw) =>
+          parseOptions(raw) match {
+            case Nil  => ZIO.succeed(a)
+            case opts =>
+              val pick = chosenOptionId.flatMap(cid => opts.find(_._1 == cid))
+                .orElse(if (opts.sizeIs == 1) opts.headOption else None)
+              pick match {
+                case Some((_, params)) =>
+                  ZIO.fromEither(mergePayload(a.payloadJson, params))
+                    .mapError(AgentError.BadRequest).map(p => a.copy(payloadJson = p))
+                case None =>
+                  ZIO.fail(AgentError.Validation(
+                    s"approval ${a.id.value} needs a chosen option (one of: ${opts.map(_._1).mkString(", ")})"))
+              }
+          }
+      }
+
+    /** Parse the options menu to `(id, params)` pairs (params default to `{}`). */
+    private def parseOptions(raw: String): List[(String, Json)] =
+      raw.fromJson[Json].toOption match {
+        case Some(Json.Arr(items)) =>
+          items.toList.flatMap {
+            case Json.Obj(fs) =>
+              val m = fs.toMap
+              m.get("id").collect { case Json.Str(id) => id }
+                .map(id => id -> m.getOrElse("params", Json.Obj()))
+            case _ => None
+          }
+        case _ => Nil
+      }
+
+    /** Merge an option's `params` object over the payload object (params win). */
+    private def mergePayload(payloadJson: String, params: Json): Either[String, String] =
+      payloadJson.fromJson[Json].left.map(e => s"payload not JSON: $e").map { base =>
+        (base, params) match {
+          case (Json.Obj(b), Json.Obj(p)) => Json.Obj(Chunk.fromIterable((b.toMap ++ p.toMap).toList)).toJson
+          case _                          => payloadJson
+        }
       }
 
     private def requireApproval(id: ApprovalId): IO[AgentError, Approval] =
@@ -809,9 +880,10 @@ object PersonService {
 
     // --- Calendar (read-only) ---
 
-    /** Live agenda from the owner's primary Google Calendar. Reuses the single
-     *  `gmail` Google credential (the consent now also grants calendar.readonly).
-     *  Phase 1 is on-demand only — no local cache. */
+    /** Live agenda across ALL the owner's Google calendars (so conflict checks see
+     *  every calendar, not just primary). Lists calendars, fans out `listEvents`,
+     *  merges and sorts by start. Reuses the single `gmail` Google credential.
+     *  On-demand only — no local cache. */
     def calendarAgenda(ownerPersonId: PersonId, timeMin: Instant, timeMax: Instant): IO[AgentError, List[CalendarEvent]] =
       for {
         _        <- requirePerson(ownerPersonId)
@@ -819,15 +891,80 @@ object PersonService {
         cred     <- credentialRepo.findByOwner(GmailConfig.ProviderName, ownerPersonId)
                       .someOrFail(AgentError.NotFound("google credential", ownerPersonId.value))
         access   <- ensureAccessToken(settings, cred)
-        events   <- CalendarClient.listEvents(access, "primary", timeMin, timeMax, maxResults = 100)
-                      .mapError(scopeHint)
+        cals     <- CalendarClient.listCalendars(access).mapError(scopeHint)
+        // Fall back to primary if the calendar list is empty/unavailable.
+        ids       = if (cals.isEmpty) List("primary") else cals.map(_._1)
+        nested   <- ZIO.foreachPar(ids)(id =>
+                      CalendarClient.listEvents(access, id, timeMin, timeMax, maxResults = 100).mapError(scopeHint)
+                    )
+        events    = nested.flatten.sortBy(_.start)
       } yield events
 
-    /** Google returns 403 when the granted token lacks calendar.readonly (i.e. the
-     *  owner authed before calendar was added). Turn that into actionable advice. */
+    /** The owner's Google calendars (read-only). Lets the agent answer "what
+     *  calendars do I have?" — it can see them but never selects one for a create
+     *  (that's the human's HITL choice). */
+    def listCalendars(ownerPersonId: PersonId): IO[AgentError, List[CalendarSummary]] =
+      for {
+        _        <- requirePerson(ownerPersonId)
+        settings <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
+        cred     <- credentialRepo.findByOwner(GmailConfig.ProviderName, ownerPersonId)
+                      .someOrFail(AgentError.NotFound("google credential", ownerPersonId.value))
+        access   <- ensureAccessToken(settings, cred)
+        cals     <- CalendarClient.listCalendars(access).mapError(scopeHint)
+      } yield cals.map { case (id, summary) => CalendarSummary(id, summary) }
+
+    /** Create an event on the owner's primary calendar (the `calendar.create_event`
+     *  executor). Same token path as the agenda read; needs the calendar.events
+     *  write scope, so a token minted before the scope bump will 403 → scopeHint. */
+    private def createCalendarEvent(req: CalendarCreateEventRequest): IO[AgentError, CalendarEvent] =
+      for {
+        _        <- requirePerson(req.ownerPersonId)
+        settings <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
+        cred     <- credentialRepo.findByOwner(GmailConfig.ProviderName, req.ownerPersonId)
+                      .someOrFail(AgentError.NotFound("google credential", req.ownerPersonId.value))
+        access   <- ensureAccessToken(settings, cred)
+        target    = req.calendarId.getOrElse("primary")
+        event    <- CalendarClient.createEvent(access, target, req).mapError(scopeHint)
+        now      <- Clock.instant
+        _        <- audit("calendar.event.created", "calendar_event", Some(event.externalId), now)
+      } yield event
+
+    /** Build the HITL calendar menu from the owner's real Google calendars.
+     *  Best-effort: if the owner has 0–1 writable calendars (or listing fails),
+     *  return None and execution defaults to "primary" — no choice is forced.
+     *  Labels are the calendars' own summaries — authored here, never by the agent. */
+    private def optionsForCalendar(payloadJson: String): IO[AgentError, Option[String]] =
+      ZIO.fromEither(payloadJson.fromJson[CalendarCreateEventRequest])
+        .mapError(e => AgentError.BadRequest(s"calendar.create_event payload: $e"))
+        .flatMap { req =>
+          (for {
+            settings <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
+            cred     <- credentialRepo.findByOwner(GmailConfig.ProviderName, req.ownerPersonId)
+                          .someOrFail(AgentError.NotFound("google credential", req.ownerPersonId.value))
+            access   <- ensureAccessToken(settings, cred)
+            cals     <- CalendarClient.listCalendars(access).mapError(scopeHint)
+          } yield cals match {
+            case cals if cals.sizeIs <= 1 => None
+            case cals =>
+              val menu = cals.map { case (id, summary) =>
+                Json.Obj(
+                  "id"     -> Json.Str(id),
+                  "label"  -> Json.Str(summary),
+                  "params" -> Json.Obj("calendarId" -> Json.Str(id))
+                )
+              }
+              Some(Json.Arr(Chunk.fromIterable(menu)).toJson)
+          })
+          // If anything goes wrong sourcing the menu, fall back to no options
+          // (single-calendar behaviour) rather than blocking the request.
+          .catchAll(_ => ZIO.succeed(None))
+        }
+
+    /** Google returns 403 when the granted token lacks the needed calendar scope
+     *  (e.g. the owner authed before calendar write was added). Actionable advice. */
     private def scopeHint(e: AgentError): AgentError = e match {
       case AgentError.HttpFailed(m, _) if m.contains("403") || m.toLowerCase.contains("insufficient") =>
-        AgentError.Validation("Calendar access not granted for this Google account. Re-run `person gmail auth --owner <owner>` to grant calendar.readonly.")
+        AgentError.Validation("Calendar access not granted for this Google account. Re-run `person google auth --owner <owner>` to grant calendar access (calendar.events).")
       case other => other
     }
 

@@ -348,6 +348,14 @@ object Routes {
                 }
             }
         }
+      },
+
+      // List the owner's calendars (read-only; the agent can see, not pick).
+      Method.GET / "calendar" / "calendars" -> handler { (req: Request) =>
+        queryParam(req, "owner") match {
+          case None    => ZIO.succeed(errorToResponse(AgentError.BadRequest("owner is required")))
+          case Some(o) => handleGet(service.listCalendars(PersonId(o)))
+        }
       }
     )
 

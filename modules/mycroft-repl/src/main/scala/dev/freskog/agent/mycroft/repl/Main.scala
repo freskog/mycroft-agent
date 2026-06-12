@@ -542,8 +542,17 @@ object Main extends ZIOAppDefault {
             val msg = ev.kind match {
               case "requested" =>
                 val prov = a.source.map(s => s"  (from $s)").getOrElse("")
-                Some(s"\n⚖  Approval needed [${a.id.value}]: ${a.actionType}$prov  ${a.payloadJson}\n" +
-                  s"   /approve ${a.id.value}   |   /reject ${a.id.value} [reason]")
+                // Options (if any) are authored + labelled by the trusted core, never
+                // the agent. Render them as a numbered menu the human picks from.
+                val opts = a.optionsJson.toList.flatMap(parseOptionLabels)
+                val menu =
+                  if (opts.isEmpty) ""
+                  else "\n   choose: " + opts.zipWithIndex
+                    .map { case ((_, label), i) => s"[${i + 1}] $label" }.mkString("   ")
+                val approveHint =
+                  if (opts.nonEmpty) s"/approve ${a.id.value} <n>" else s"/approve ${a.id.value}"
+                Some(s"\n⚖  Approval needed [${a.id.value}]: ${a.actionType}$prov  ${a.payloadJson}$menu\n" +
+                  s"   $approveHint   |   /reject ${a.id.value} [reason]")
               case "rejected" => Some(s"\n✗  Approval ${a.id.value} rejected.")
               case _          => None // `executed` shows up as a continuation turn
             }
@@ -560,19 +569,29 @@ object Main extends ZIOAppDefault {
   private def decideApproval(cfg: Cfg, terminal: Terminal, queue: Queue[Ev], rest: String, approve: Boolean): Task[Unit] = {
     val parts  = rest.split("\\s+", 2)
     val id     = parts.headOption.getOrElse("")
-    val reason = if (parts.length > 1 && parts(1).trim.nonEmpty) Some(parts(1).trim) else None
-    if (id.isEmpty) printLine(terminal, "usage: /approve <id>  |  /reject <id> [reason]")
+    // The token after the id means a choice on /approve (a menu number or option
+    // id) and a reason on /reject.
+    val arg    = if (parts.length > 1 && parts(1).trim.nonEmpty) Some(parts(1).trim) else None
+    val reason = if (approve) None else arg
+    if (id.isEmpty) printLine(terminal, "usage: /approve <id> [n]  |  /reject <id> [reason]")
     else {
       // Fetch the one-time code over the private interface (the agent can't reach
       // this), then echo it back on decide. The human just types /approve <id>.
       val flow = for {
+        // Read the approval (public) so we can map a typed choice → the trusted
+        // option id, and refuse to approve a multi-option action with no choice.
+        apprJson <- httpGet(cfg.personServiceUrl + s"/approvals/$id")
+        options   = apprJson.fromJson[Json].toOption.flatMap(strField("optionsJson"))
+                      .toList.flatMap(parseOptionLabels)
+        chosen   <- if (!approve) ZIO.none else resolveChoice(options, arg)
         codeResp <- httpGet(cfg.personServicePrivateUrl + s"/approvals/$id/code")
         code      = codeResp.fromJson[Json].toOption.flatMap(strField("code")).getOrElse("")
         body      = Json.Obj(
-                      "code"      -> Json.Str(code),
-                      "decidedBy" -> Json.Str(cfg.as),
-                      "approve"   -> Json.Bool(approve),
-                      "reason"    -> reason.map(Json.Str(_)).getOrElse(Json.Null)
+                      "code"           -> Json.Str(code),
+                      "decidedBy"      -> Json.Str(cfg.as),
+                      "approve"        -> Json.Bool(approve),
+                      "reason"         -> reason.map(Json.Str(_)).getOrElse(Json.Null),
+                      "chosenOptionId" -> chosen.map(Json.Str(_)).getOrElse(Json.Null)
                     ).toJson
         resp     <- post(cfg.personServicePrivateUrl + s"/approvals/$id/decide", body)
       } yield resp
@@ -647,6 +666,38 @@ object Main extends ZIOAppDefault {
     case Json.Obj(fields) => fields.collectFirst { case (k, Json.Str(s)) if k == name => s }
     case _                => None
   }
+
+  /** Parse the trusted-core options menu (`[{"id","label",…}]`) into `(id, label)`
+   *  pairs for display + choice mapping. Labels come from person-service only. */
+  private def parseOptionLabels(raw: String): List[(String, String)] =
+    raw.fromJson[Json].toOption match {
+      case Some(Json.Arr(items)) =>
+        items.toList.flatMap {
+          case obj @ Json.Obj(_) =>
+            strField("id")(obj).map(id => id -> strField("label")(obj).getOrElse(id))
+          case _ => None
+        }
+      case _ => Nil
+    }
+
+  /** Map the human's typed choice (a 1-based menu number or a literal option id)
+   *  to the option id. With 0–1 options no choice is needed (None). With several,
+   *  a missing/invalid choice fails with a reprompt rather than approving blindly. */
+  private def resolveChoice(options: List[(String, String)], arg: Option[String]): Task[Option[String]] =
+    if (options.sizeIs <= 1) ZIO.succeed(options.headOption.map(_._1))
+    else {
+      val menu = options.zipWithIndex.map { case ((_, label), i) => s"[${i + 1}] $label" }.mkString("  ")
+      arg match {
+        case None =>
+          ZIO.fail(new RuntimeException(s"this approval needs a choice — /approve <id> <n>:  $menu"))
+        case Some(tok) =>
+          tok.toIntOption.filter(n => n >= 1 && n <= options.size).map(n => options(n - 1)._1)
+            .orElse(options.collectFirst { case (id, _) if id == tok => id }) match {
+            case Some(id) => ZIO.succeed(Some(id))
+            case None     => ZIO.fail(new RuntimeException(s"'$tok' is not a valid choice — pick one of:  $menu"))
+          }
+      }
+    }
 
   private def boolField(name: String)(json: Json): Option[Boolean] = json match {
     case Json.Obj(fields) => fields.collectFirst { case (k, Json.Bool(b)) if k == name => b }

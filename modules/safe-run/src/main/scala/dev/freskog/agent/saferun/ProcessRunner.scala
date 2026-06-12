@@ -120,16 +120,21 @@ object ProcessRunner {
   )
 
   private def awaitWithTimeout(process: Process, timeoutSeconds: Int): ZIO[Any, SafeRunError, ExitResult] = {
-    val await: ZIO[Any, SafeRunError, ExitResult] = ZIO.attemptBlocking {
-      val code = process.waitFor()
-      ExitResult(Some(code), timedOut = false, termination = None)
-    }.mapError(e => SafeRunError.IoError(e.getMessage))
+    // Deterministic timeout. Fork the blocking wait and bound its *join* — joining
+    // is interruptible, so the timeout fires promptly even though `waitFor` itself
+    // isn't interruptible. If the process exits first we report its code; otherwise
+    // only the timeout branch kills the group and reports `timedOut` (exit code
+    // None). (A `race` against the wait is wrong here: once the kill lands, the wait
+    // unblocks with the SIGTERM exit code and can win the race, masking the timeout.)
+    val await: ZIO[Any, SafeRunError, Int] =
+      ZIO.attemptBlocking(process.waitFor()).mapError(e => SafeRunError.IoError(e.getMessage))
 
-    val timeout: ZIO[Any, SafeRunError, ExitResult] =
-      ZIO.sleep(Duration.fromSeconds(timeoutSeconds.toLong)) *>
-        gracefulKill(process).as(ExitResult(None, timedOut = true, termination = Some("timeout")))
-
-    await.race(timeout)
+    await.fork.flatMap { fiber =>
+      fiber.join.timeout(Duration.fromSeconds(timeoutSeconds.toLong)).flatMap {
+        case Some(code) => ZIO.succeed(ExitResult(Some(code), timedOut = false, termination = None))
+        case None       => gracefulKill(process).as(ExitResult(None, timedOut = true, termination = Some("timeout")))
+      }
+    }
   }
 
   private def gracefulKill(process: Process): ZIO[Any, Nothing, Unit] = {

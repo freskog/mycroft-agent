@@ -91,7 +91,7 @@ context, not a substitute for durable state. See the `calendar` skill for detail
 | Signal in the item | Action |
 |-----------------------|--------|
 | An action the owner must take, with a deadline ("return the slip by Friday", "pay fees by the 30th") | `person commitment record` (quote the ask as `--evidence`, infer `--due`, `--source email:…`) |
-| A dated event to attend / be aware of (parents' evening, exam, sports day, school closure) | `person event record --action <label> --category observation --text '…' --source email:…` with the date in the text (or a commitment if the owner must actively prepare/respond) |
+| A dated event to attend / be aware of (parents' evening, exam, sports day, school closure) | `person event record --action <label> --category observation --text '…' --source email:…` with the date in the text. If it's something the owner should **attend** at a specific time, also offer to add it to the calendar with `person calendar create …` (gated — see the `calendar` skill); don't do this for every dated mention, only clear attend-events. |
 | Multi-step durable outcome ("prepare and approve the Q3 report") | `person goal request` (gated — a human approves) with an observable `--outcome` + testable `--evidence-rule` |
 | A durable household fact the email reveals (new employer, child's new school, changed address) | `person memory record --trust external-content --sender <who> --source email:…` (follow the belief-revision rules; never overwrite a `user-stated` fact) |
 | Preference / context worth remembering long-term | `person event record --action <label> --category observation --text '…' --source email:…` |

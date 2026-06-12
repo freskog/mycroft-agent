@@ -207,9 +207,9 @@ curl -X POST localhost:8090/inbound \
 (`gmail.readonly` **and** `calendar.readonly` — one consent covers both) and must be
 allowed on your OAuth consent screen in Google Cloud. Adding scopes in the Cloud
 Console after creating the client is fine — no secret edit needed. If you authed
-before calendar was added, re-run `person gmail auth` to grant the calendar scope.
+before calendar was added, re-run `person google auth` to grant the calendar scope.
 
-**Redirect URI:** `person gmail auth` uses `http://localhost:8765/oauth/callback` by default.
+**Redirect URI:** `person google auth` uses `http://localhost:8765/oauth/callback` by default.
 Add that exact URI under your OAuth client's authorized redirect URIs (desktop apps support this).
 
 One-time OAuth:
@@ -217,7 +217,7 @@ One-time OAuth:
 ```bash
 sbt "personService/run"   # terminal 1
 
-sbt 'personCli/run gmail auth --owner fred'   # terminal 2 — opens browser
+sbt 'personCli/run google auth --owner fred'   # terminal 2 — opens browser
 sbt 'personCli/run gmail sync --owner fred'
 sbt 'personCli/run inbox list --owner fred --status pending'
 sbt 'personCli/run inbox show <inbox-id>'     # body + headers + attachment metadata
@@ -249,7 +249,7 @@ docker compose --profile inbox-sync up inbox-sync
 ### Calendar (read-only)
 
 The same Google authorization also grants `calendar.readonly`, so once you've run
-`person gmail auth` you can read the owner's primary calendar. It's on-demand
+`person google auth` you can read the owner's primary calendar. It's on-demand
 (no sync/cache in Phase 1):
 
 ```bash
@@ -259,8 +259,14 @@ sbt 'personCli/run calendar agenda --owner fred --from 2026-06-10T00:00:00Z --to
 ```
 
 Triage uses this to ground dated items ("already on the calendar" / conflicts).
-Writing calendar events (a gated `calendar.create_event` approval → human approve)
-is planned but not yet implemented.
+
+**Writing events** is the agent's first outside-effect action, gated by HITL:
+```bash
+# proposes a calendar.create_event approval; a human approves, then it's written.
+sbt 'personCli/run calendar create --owner fred --summary "Parents evening" --start 2026-06-20T17:00:00Z --end 2026-06-20T18:00:00Z'
+```
+This needs the `calendar.events` scope, so re-run `person google auth --owner fred`
+once (the consent now covers calendar write) after upgrading.
 
 ## Architecture
 

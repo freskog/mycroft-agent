@@ -11,17 +11,26 @@ object GmailConfig {
   val ProviderName = "gmail"
   val ReadonlyScope = "https://www.googleapis.com/auth/gmail.readonly"
   val CalendarReadonlyScope = "https://www.googleapis.com/auth/calendar.readonly"
+  // Read AND write to calendar events (supersedes calendar.readonly for our use —
+  // events.list works under this scope too).
+  val CalendarEventsScope = "https://www.googleapis.com/auth/calendar.events"
+  // Read/compose/send Gmail (supersedes gmail.readonly). Requested now so a single
+  // consent also covers future *gated* email actions; nothing in the code can send
+  // yet (no send executor), and the token lives only in the trusted core.
+  val ModifyScope = "https://www.googleapis.com/auth/gmail.modify"
 
   /** Scopes requested in one Google consent. A single grant yields one
-   *  access/refresh token that works against both the Gmail and Calendar APIs,
-   *  so we keep a single `gmail` credential row rather than a second OAuth flow. */
-  val RequestedScopes = s"$ReadonlyScope $CalendarReadonlyScope"
+   *  access/refresh token that works against the Gmail and Calendar APIs, so we
+   *  keep a single credential row rather than a second OAuth flow. Changing this
+   *  set requires a one-time re-consent (`person google auth`): tokens minted under
+   *  the old scopes won't carry new permissions (e.g. calendar write 403s). */
+  val RequestedScopes = s"$ModifyScope $CalendarEventsScope"
 
   val AuthEndpoint  = "https://accounts.google.com/o/oauth2/v2/auth"
   val TokenEndpoint = "https://oauth2.googleapis.com/token"
   val ApiBase       = "https://gmail.googleapis.com/gmail/v1"
 
-  /** Loopback callback used by `person gmail auth` (must match Google Cloud redirect URIs). */
+  /** Loopback callback used by `person google auth` (must match Google Cloud redirect URIs). */
   val DefaultRedirectUri = "http://localhost:8765/oauth/callback"
 
   final case class Settings(

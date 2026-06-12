@@ -84,6 +84,8 @@ The approval lifecycle, deliberately with **no suspended fibers** (so it survive
 
 This keeps a *compromised* agent unable to bypass the gate — it can neither route to the decision endpoint nor produce a valid code — while the gateless path keeps everyday learning autonomous.
 
+**Parameterized decisions (trusted-core options).** A decision can carry a *choice* — e.g. *which* calendar an event lands on — without weakening the property that makes the gate safe: **a compromised agent must never be able to disguise what it's actually doing.** That property holds because the human reviews the **literal payload that executes** and executors read only known fields from that frozen payload — no gap between shown and run. The naïve risk a menu would add is **label↔value divergence**: an agent-authored option "Family calendar" whose value pointed elsewhere could lie. So the load-bearing invariant: **the agent never authors what the human sees, nor the gated choice values.** An `Approval.optionsJson` menu (`[{id,label,params}]`) is sourced and rendered by the **trusted core** (`PersonService.optionsFor`, e.g. from the owner's real Google calendar list) — never from the agent's request. On approve, the chosen option's `params` are merged into the frozen `payloadJson` (`resolveChosenOption`); that merge is the *only* way a value enters the payload after request, and it comes from the trusted option set. With 0–1 options no choice is forced (execution defaults, e.g. `primary`); with several, approving without a valid `chosenOptionId` is a `Validation` error. The agent supplies only structured params the core validates (for calendar create it has **no** calendar flag at all); the human approves the resolved, canonical effect.
+
 ### Untrusted content & prompt injection
 
 The agent reads attacker-controllable content — email bodies, attachments, and (in future) web pages. Prompt injection is **not reliably solvable at the model layer**, so we assume the model can be fooled and defend in layers, strongest first:
@@ -181,7 +183,7 @@ The flow between them:
 tokens live only in the sidecar (in the `credentials` table); the agent never
 holds them.
 
-- `person gmail auth` runs a one-time OAuth loopback flow; `person gmail sync`
+- `person google auth` runs a one-time OAuth loopback flow; `person gmail sync`
   pulls recent message **metadata + plain-text body** into the `inbox_messages`
   table and refreshes the access token as needed.
 - Each inbox row carries triage state (`pending` / `triaged` / `skipped`) so the
@@ -206,13 +208,17 @@ Calendar reuses the **same Google OAuth grant** as Gmail: the consent requests
 is no separate calendar login.
 
 Phase 1 is **on-demand and uncached**: `person calendar agenda --owner <p>
-[--days N | --from --to]` live-queries the owner's primary Google Calendar
+[--days N | --from --to]` live-queries the owner's Google calendars
 (`events.list`, single-events expanded, ordered by start) and returns a JSON array
-of events. The agent pulls the agenda when it needs scheduling context — answering
-"what's on this week", or, during triage, grounding a date found in an email
-("already on the calendar" / "conflicts with X"). This keeps calendar consistent
-with the substrate's tool-on-demand philosophy rather than always injecting a
-schedule into the prompt.
+of events. It fans out across **all** the owner's calendars (`calendarList.list` →
+per-calendar `events.list`, merged + sorted), so a conflict check sees every
+calendar, not just `primary`. `person calendar list --owner <p>` returns the
+owner's calendars (`{id, summary}`) so the agent can *answer* "what calendars do I
+have?" — it can see them but never selects one for a write. The agent pulls the
+agenda when it needs scheduling context — answering "what's on this week", or,
+during triage, grounding a date found in an email ("already on the calendar" /
+"conflicts with X"). This keeps calendar consistent with the substrate's
+tool-on-demand philosophy rather than always injecting a schedule into the prompt.
 
 This preserves the existing boundary: **calendar events are projections, not
 authoritative state**, and the agent still cannot write them. Two deliberate
@@ -222,10 +228,19 @@ follow-ups:
   `calendar_events` table (like `inbox_messages`) and fold upcoming events into
   the per-turn context bundle, so the agent always knows the schedule without a
   tool call.
-- **Phase 2 — write via approval**: a `calendar.events` scope where the agent
-  *requests* an event (an `Approval` of type `calendar.create_event`); a human
-  approves and `person-service` creates it, linking it back to the commitment or
-  goal it projects.
+
+**Write — done (the agent's first real outside-effect action).** The agent
+*requests* an event (`person calendar create` → an `Approval` of type
+`calendar.create_event`); a human approves with the one-time code; `performApproved`
+calls `CalendarClient.createEvent`. This needs the `calendar.events` scope (the
+`RequestedScopes` were bumped from `calendar.readonly`), so the owner must re-run
+`person google auth` once to re-consent. **The target calendar is the human's
+choice, not the agent's:** `person calendar create` has no calendar flag; when the
+owner has more than one calendar, person-service attaches a trusted-core options
+menu (their real calendar names) to the approval, and the chosen option's
+`calendarId` is merged into the payload at decision time (see *Parameterized
+decisions* above). A single-calendar owner needs no pick (defaults to `primary`).
+Linking the event back to its source commitment/goal is a later refinement.
 
 ## Execution Model
 

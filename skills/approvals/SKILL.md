@@ -35,8 +35,11 @@ use it for reads, for recording memory / entities / relationships / commitments
 (those are gateless — record them directly, they're reversible), or for anything
 you can just answer.
 
-Registered action types today: `calendar.create_event`, `goal.create` (and
-`approval.ping`, a test no-op). The executor for each lives in person-service.
+Registered action types today: `calendar.create_event` (writes a Google Calendar
+event — prefer the `person calendar create` sugar, see the `calendar` skill) and
+`goal.create` (prefer `person goal request`), plus `approval.ping` (a test no-op).
+The executor for each lives in person-service. Prefer the sugar verbs over a raw
+`approval request` so you don't hand-build the payload JSON.
 
 ## The decision is gated by a one-time code you never see
 
@@ -69,6 +72,16 @@ person approval request \
 
 After requesting, **tell the user you've requested their approval and stop.** Never
 claim the action is done — it is only requested.
+
+## Some approvals offer the human a choice (you don't make it)
+
+An approval may carry a small menu of **options** (e.g. *which* calendar an event
+goes on). Those options are **authored and labelled by person-service from real,
+authoritative data** — never by you. You do **not** supply, pre-select, or
+influence them: your request carries only the structured parameters, and the human
+picks an option when they approve. This is deliberate: it guarantees that what the
+human sees and chooses is the canonical effect, with no way for a request to
+disguise itself. Don't try to set, hint at, or assume which option will be chosen.
 
 Re-requesting the same action (same type + payload) is idempotent: it returns the
 existing pending approval rather than creating a duplicate.
