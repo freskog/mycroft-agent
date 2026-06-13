@@ -119,7 +119,7 @@ date, not a calendar event.
 
 | Signal in the item | Action |
 |-----------------------|--------|
-| Someone must **be present at a specific time** — attend / show up / block the slot (parents' evening, exam the child sits, appointment, meeting, sports day, flight) | `person calendar create … --source email:gmail-msg-<id>#<slug>` (**direct, [M]-marked, idempotent** — see the `calendar` skill). Anchored to a date+time (or all-day date). If there's prep ("bring the form"), **also** record a commitment for the prep. |
+| Someone must **be present at a specific time** — attend / show up / block the slot (parents' evening, exam the child sits, appointment, meeting, sports day, flight) | `person calendar create … --source email:gmail-msg-<id>#<slug> --visibility <v>` (**direct, [M]-marked, idempotent** — see the `calendar` skill). Classify `--visibility`: kids'/school/family logistics/trips → `family`; the owner's own personal appointment (medical, work 1:1) → `private-busy` (default). Anchored to a date+time (or all-day date). If there's prep ("bring the form"), **also** record a commitment for the prep. |
 | An **action to complete** with a deadline ("return the slip by Friday", "pay fees by the 30th") | `person commitment record` with `--due` (quote the ask as `--evidence`, `--source email:…`). A deadline is a todo, **not** a calendar event. |
 | An **action to complete** with no date ("renew the passport", "look into swimming lessons") | `person commitment record` (no `--due`) — a dateless todo. |
 | A **multi-step** thing the owner must get done ("prepare and approve the Q3 report") | `person commitment record` (one todo; the owner sequences the steps). **Do not** request a goal — goals are parked (autonomous-task construct, not user tracking). |
@@ -151,11 +151,13 @@ Calendar event (attend-at-a-time — direct, `[M]`-marked, idempotent):
 person calendar create --owner <owner> \
   --summary "Parents' evening (St Kilians)" \
   --start 2026-06-20T17:00:00Z --end 2026-06-20T18:00:00Z \
-  --location 'St Kilians' --source email:gmail-msg-789#parents-evening
+  --location 'St Kilians' --source email:gmail-msg-789#parents-evening \
+  --visibility family
 ```
-Written straight to the calendar as `[M] Parents' evening (St Kilians)`. The
-`--source` makes it idempotent — re-triaging the same email won't duplicate it. See
-the `calendar` skill.
+A kids'/school event → `--visibility family` (shared Family calendar). A personal
+appointment (e.g. a dentist booking confirmation) → `--visibility private-busy`
+(full on the owner's calendar + a redacted `[M] Busy` on Family). `--source` makes
+it idempotent. See the `calendar` skill.
 
 Observation (a dated event or durable fact — **events are not owner-scoped**: use
 `--action`/`--category`/`--text`, there is no `--owner`):

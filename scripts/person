@@ -151,7 +151,7 @@ documented in the skills — run `skill show <name>` (e.g. `skill show commitmen
   person commitment done|ignore|cancel <id> [--reason "..."]
   person calendar agenda --owner fred [--days 14 | --from <iso> --to <iso>]
   person calendar list --owner fred
-  person calendar create --owner fred --summary "..." --start <iso> --end <iso> --source <stable-key> [--all-day] [--location "..."]
+  person calendar create --owner fred --summary "..." --start <iso> --end <iso> --source <stable-key> --visibility private-busy|family|private [--all-day] [--location "..."]
   person inbox list --owner fred --status pending --order asc
   person inbox show <id>   |   person inbox mark-triaged <id>   |   person inbox skip <id>
   person inbox download <id> --out /workspace/attachments
@@ -392,9 +392,11 @@ case "$group" in
         body="$(jq -cn \
           --arg owner "$(req_opt owner)" --arg summary "$(req_opt summary)" --arg start "$(req_opt start)" \
           --arg endAt "$(req_opt end)" --arg allday "$(opt all-day false)" \
-          --arg location "$(opt location)" --arg description "$(opt description)" --arg source "$(opt source)" \
+          --arg location "$(opt location)" --arg description "$(opt description)" \
+          --arg source "$(opt source)" --arg visibility "$(opt visibility)" \
           '{ownerPersonId:$owner, summary:$summary, start:$start, "end":$endAt, allDay:($allday=="true"),
-            location:($location|'"$J_OPT"'), description:($description|'"$J_OPT"'), source:($source|'"$J_OPT"')}')"
+            location:($location|'"$J_OPT"'), description:($description|'"$J_OPT"'), source:($source|'"$J_OPT"'),
+            visibility:($visibility|'"$J_OPT"')}')"
         api_post "/calendar/events" "$body" ;;
       *) err_json "validation" "unknown: calendar $sub" ;;
     esac ;;

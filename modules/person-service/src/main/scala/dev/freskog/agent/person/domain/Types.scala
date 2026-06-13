@@ -27,7 +27,12 @@ case class CalendarCreateEventRequest(
   // Idempotency key (e.g. `email:gmail-msg-X#dentist`). Creation is direct (no
   // approval), so a stable source lets a retrying agent re-create the same event
   // without duplicating — person-service dedups on (owner, source).
-  source: Option[String] = None
+  source: Option[String] = None,
+  // Routing intent (the agent classifies; person-service maps to calendar(s) — the
+  // agent never names a calendar id). `family` → shared Family calendar (full);
+  // `private` → owner's private calendar only; `private-busy` (default) → private
+  // calendar (full) + a redacted "[M] Busy" block on Family.
+  visibility: Option[String] = None
 )
 object CalendarCreateEventRequest {
   implicit val codec: JsonCodec[CalendarCreateEventRequest] = DeriveJsonCodec.gen[CalendarCreateEventRequest]

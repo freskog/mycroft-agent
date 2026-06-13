@@ -52,7 +52,7 @@ trait CalendarEventRepo {
   /** Dedup lookups for direct create: by the agent's `source` key, or by a
    *  (summary, start) signature when no source was supplied. Non-cancelled only. */
   def findBySource(ownerPersonId: PersonId, source: String): IO[AgentError, Option[CalendarEvent]]
-  def findBySignature(ownerPersonId: PersonId, summary: String, startAt: Instant): IO[AgentError, Option[CalendarEvent]]
+  def findBySignature(ownerPersonId: PersonId, calendarId: String, summary: String, startAt: Instant): IO[AgentError, Option[CalendarEvent]]
   def findWindow(ownerPersonId: PersonId, timeMin: Instant, timeMax: Instant): IO[AgentError, List[CalendarEvent]]
   def countForOwner(ownerPersonId: PersonId): IO[AgentError, Int]
   /** Mark in-window mirrored events not refreshed by the latest sync as cancelled
@@ -1021,10 +1021,10 @@ object Repos {
         ownerPersonId, source
       )(extractCalendarEvent)
 
-    def findBySignature(ownerPersonId: PersonId, summary: String, startAt: Instant): IO[AgentError, Option[CalendarEvent]] =
+    def findBySignature(ownerPersonId: PersonId, calendarId: String, summary: String, startAt: Instant): IO[AgentError, Option[CalendarEvent]] =
       db.queryOne(
-        "SELECT * FROM calendar_events WHERE owner_person_id = ? AND summary = ? AND start_at = ? AND status != 'cancelled' LIMIT 1",
-        ownerPersonId, summary, startAt
+        "SELECT * FROM calendar_events WHERE owner_person_id = ? AND calendar_id = ? AND summary = ? AND start_at = ? AND status != 'cancelled' LIMIT 1",
+        ownerPersonId, calendarId, summary, startAt
       )(extractCalendarEvent)
 
     def findWindow(ownerPersonId: PersonId, timeMin: Instant, timeMax: Instant): IO[AgentError, List[CalendarEvent]] =

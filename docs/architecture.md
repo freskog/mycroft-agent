@@ -268,10 +268,30 @@ poller is guaranteed-on.)
 immediately (no gate) and write-throughs to the mirror. person-service prepends
 `[M] ` to the summary so the entry is visibly MyCroft's; the user manages it in
 Google. Creation is **idempotent**: the agent passes a stable `--source`, and
-person-service dedups on `(owner, source)` (else on `(owner, summary, start)`), so a
-retry or re-triage never duplicates. Events go to `primary`. This needs the
-`calendar.events` scope (re-consent if the token predates it). The safety here is
-the marker + reversibility + dedup, not a gate (see the parked HITL note above).
+person-service dedups per target on `source` (else `(owner, calendarId, summary,
+start)`), so a retry or re-triage never duplicates. Needs the `calendar.events`
+scope. Safety here is the marker + reversibility + dedup + the routing below — not a
+gate (see the parked HITL note above).
+
+**Visibility routing (the agent classifies; the trusted core places).** The agent
+never names a calendar id — it passes `--visibility ∈ {family, private-busy,
+private}` and person-service maps that to the actual calendar(s) from config. This
+keeps the privacy-sensitive *where* decision in the trusted core: a mis-firing model
+can at worst pick the wrong intent, and the default biases to safety.
+- `family` → full event on the shared **Family** calendar (kids' events, trips,
+  shared logistics).
+- `private-busy` (**default**) → full event on the owner's **private** calendar **+**
+  a redacted `[M] Busy` block on Family (same time, no detail) — for the owner's
+  personal appointments: the household sees they're unavailable without the details.
+- `private` → owner's private calendar only.
+The Family calendar id is config (`FAMILY_CALENDAR_ID`, else a name match on
+`FAMILY_CALENDAR_NAME`); if it can't be resolved, `family`/`private-busy` **degrade
+to private-only** rather than writing the wrong place. Each target is idempotent on
+its own `source` (the busy-block uses a `#fam-busy` suffix). **Bounded by topology:**
+only the owner's personal Google account is connected, so the writable calendars are
+his primary (private) + Family — work calendars and other accounts aren't reachable,
+so multi-account routing (e.g. a trip on both family and work, Paula's calendars) is
+deferred until those connect.
 
 ### Commitments ↔ Google Tasks
 

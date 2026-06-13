@@ -63,9 +63,24 @@ fees by the 30th") — is a **todo, not an event**: record it as a `person commi
 ```
 person calendar create --owner <owner> --summary '...' \
   --start <ISO-8601 instant> --end <ISO-8601 instant> --source <stable-key> \
+  --visibility private-busy|family|private \
   [--all-day] [--location '...'] [--description '...']
 ```
 
+- **`--visibility` is how you route the event — you classify, the system places it.**
+  You never choose a calendar (no calendar flag exists). Pick:
+  - **`family`** — household-relevant, shareable: kids' school events, family
+    logistics, trips, anything others need the *details* of → goes on the shared
+    **Family** calendar.
+  - **`private-busy`** (the **default** — use it when unsure) — the owner's own
+    appointment (medical, dentist, a 1:1): full details on their **private** calendar
+    **plus** a redacted `[M] Busy` block on Family, so the household sees they're
+    unavailable without seeing what it is.
+  - **`private`** — fully private; only the owner's calendar, nothing on Family. Use
+    only when the household needn't even know the time is taken.
+  When in doubt, prefer `private-busy` over `family` — under-sharing is safe,
+  leaking a private detail onto the shared calendar is not. Anything medical /
+  health / financial / personal → never `family`.
 - The event is written **directly** to the calendar (no approval). person-service
   prepends **`[M] `** to the title so the user can see it's MyCroft's and manage it
   in Google. You never claim a *different* state — once the command succeeds (exit 0),

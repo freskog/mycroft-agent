@@ -49,6 +49,10 @@ services:
       # Local hour (in each owner's own timezone, DST-correct) to send the daily
       # briefing. person-service owns this schedule; the poller just checks in.
       BRIEFING_HOUR: "7"
+      # Shared Family calendar id, for visibility routing (family / private-busy).
+      # If unset, person-service matches a calendar named FAMILY_CALENDAR_NAME
+      # ("Family"); if neither resolves, those visibilities degrade to private-only.
+      FAMILY_CALENDAR_ID: "family08668864218578125069@group.calendar.google.com"
     volumes:
       - person-state:/state
       - ./modules/person-service/src/main/resources/client-secret.json:/run/client-secret.json:ro

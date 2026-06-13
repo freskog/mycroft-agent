@@ -978,33 +978,78 @@ object PersonService {
         cals     <- CalendarClient.listCalendars(access).mapError(scopeHint)
       } yield cals.map { case (id, summary) => CalendarSummary(id, summary) }
 
-    def createCalendarEventDirect(req: CalendarCreateEventRequest): IO[AgentError, CalendarEvent] = {
-      // `[M] ` marks it as MyCroft-created (visible + bulk-removable in Google).
-      val marked = if (req.summary.startsWith("[M] ")) req.summary else s"[M] ${req.summary}"
+    /** One calendar target: where to write, whether to redact to a busy-block, and
+     *  the source-suffix that keeps its idempotency key distinct. */
+    private case class CalTarget(calendarId: String, redacted: Boolean, sourceSuffix: String)
+
+    def createCalendarEventDirect(req: CalendarCreateEventRequest): IO[AgentError, CalendarEvent] =
       for {
         _        <- requirePerson(req.ownerPersonId)
-        // Idempotent: a retrying agent re-creating the same event is a no-op.
-        existing <- req.source match {
+        settings <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
+        cred     <- credentialRepo.findByOwner(GmailConfig.ProviderName, req.ownerPersonId)
+                      .someOrFail(AgentError.NotFound("google credential", req.ownerPersonId.value))
+        access   <- ensureAccessToken(settings, cred)
+        vis       = req.visibility.map(_.trim.toLowerCase).getOrElse("private-busy")
+        // Family calendar is needed for `family`/`private-busy`. If it can't be
+        // resolved we degrade to private-only — never write the wrong place.
+        family   <- if (vis == "private") ZIO.none else familyCalendarId(access).catchAll(_ => ZIO.none)
+        targets   = computeTargets(vis, family)
+        events   <- ZIO.foreach(targets)(t => createOneTarget(req, access, t))
+        // The owner-facing event is the first target (full event on the owner's or
+        // the family calendar); the busy-block, if any, follows.
+        head     <- ZIO.fromOption(events.headOption).orElseFail(AgentError.BadRequest("no calendar target resolved"))
+      } yield head
+
+    /** Map visibility → ordered targets (the owner-facing full event first). */
+    private def computeTargets(visibility: String, family: Option[String]): List[CalTarget] = {
+      val privateFull = CalTarget("primary", redacted = false, sourceSuffix = "")
+      visibility match {
+        case "family"  => family.map(f => CalTarget(f, redacted = false, "")).toList match {
+                            case Nil => List(privateFull) // no family calendar → keep it private (don't drop it)
+                            case ts  => ts
+                          }
+        case "private" => List(privateFull)
+        case _ /* private-busy (default) */ =>
+          privateFull :: family.map(f => CalTarget(f, redacted = true, "#fam-busy")).toList
+      }
+    }
+
+    /** Create (or no-op if already present) one target, [M]-marked, mirrored. */
+    private def createOneTarget(req: CalendarCreateEventRequest, access: String, t: CalTarget): IO[AgentError, CalendarEvent] = {
+      val summary = if (t.redacted) "[M] Busy"
+                    else if (req.summary.startsWith("[M] ")) req.summary
+                    else s"[M] ${req.summary}"
+      val toCreate = if (t.redacted) req.copy(summary = summary, location = None, description = None)
+                     else req.copy(summary = summary)
+      val srcKey   = req.source.map(_ + t.sourceSuffix)
+      for {
+        existing <- srcKey match {
                       case Some(s) => calendarEventRepo.findBySource(req.ownerPersonId, s)
-                      case None    => calendarEventRepo.findBySignature(req.ownerPersonId, marked, req.start)
+                      case None    => calendarEventRepo.findBySignature(req.ownerPersonId, t.calendarId, summary, req.start)
                     }
-        result   <- existing match {
+        event    <- existing match {
                       case Some(e) => ZIO.succeed(e)
                       case None =>
                         for {
-                          settings <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
-                          cred     <- credentialRepo.findByOwner(GmailConfig.ProviderName, req.ownerPersonId)
-                                        .someOrFail(AgentError.NotFound("google credential", req.ownerPersonId.value))
-                          access   <- ensureAccessToken(settings, cred)
-                          target    = req.calendarId.getOrElse("primary")
-                          event    <- CalendarClient.createEvent(access, target, req.copy(summary = marked)).mapError(scopeHint)
-                          now      <- Clock.instant
-                          _        <- audit("calendar.event.created", "calendar_event", Some(event.externalId), now)
-                          _        <- calendarEventRepo.upsert(req.ownerPersonId, event, now, req.source)
-                        } yield event
+                          created <- CalendarClient.createEvent(access, t.calendarId, toCreate).mapError(scopeHint)
+                          now     <- Clock.instant
+                          _       <- audit("calendar.event.created", "calendar_event", Some(created.externalId), now)
+                          _       <- calendarEventRepo.upsert(req.ownerPersonId, created, now, srcKey)
+                        } yield created
                     }
-      } yield result
+      } yield event
     }
+
+    /** The owner's Family (shared) calendar id: `FAMILY_CALENDAR_ID` env, else the
+     *  calendar whose summary matches `FAMILY_CALENDAR_NAME` (default "Family"). */
+    private def familyCalendarId(access: String): IO[AgentError, Option[String]] =
+      sys.env.get("FAMILY_CALENDAR_ID").map(_.trim).filter(_.nonEmpty) match {
+        case Some(id) => ZIO.some(id)
+        case None =>
+          val name = sys.env.get("FAMILY_CALENDAR_NAME").map(_.trim).filter(_.nonEmpty).getOrElse("Family")
+          CalendarClient.listCalendars(access).mapError(scopeHint)
+            .map(_.collectFirst { case (id, summary) if summary.equalsIgnoreCase(name) => id })
+      }
 
     // --- Google Tasks projection (commitments are SoT; Tasks is the view) ---
 
