@@ -8,12 +8,34 @@ import dev.freskog.agent.person.seed.SeedData.{FredId, PaulaId, SampleGoalId}
 import dev.freskog.agent.person.service.PersonService
 
 import zio._
+import zio.http.{Request, Response, Status, URL}
 import zio.json._
 import zio.test._
 
 import java.time.Instant
 
 object PersonServiceSpec extends ZIOSpecDefault {
+
+  private def mkService(db: Sqlite, hub: Hub[ApprovalEvent]): PersonService =
+    PersonService.live(
+      Repos.sqlitePersonRepo(db),
+      Repos.sqliteCommitmentRepo(db),
+      Repos.sqliteMemoryRepo(db),
+      Repos.sqliteApprovalRepo(db),
+      Repos.sqliteAuditRepo(db),
+      Repos.sqliteGoalRepo(db),
+      Repos.sqliteGoalEvidenceRepo(db),
+      Repos.sqliteEntityRepo(db),
+      Repos.sqliteRelationshipRepo(db),
+      Repos.sqliteChannelRepo(db),
+      Repos.sqliteChannelMemberRepo(db),
+      Repos.sqliteMessageRepo(db),
+      Repos.sqliteCredentialRepo(db),
+      Repos.sqliteInboxMessageRepo(db),
+      Repos.sqliteCalendarEventRepo(db),
+      Repos.sqliteBriefingRepo(db),
+      hub
+    )
 
   private def withService(f: PersonService => ZIO[Any, AgentError, TestResult]): ZIO[Any, AgentError, TestResult] =
     ZIO.scoped {
@@ -22,26 +44,27 @@ object PersonServiceSpec extends ZIOSpecDefault {
         _       <- Migrations.migrate(db)
         _       <- SeedData.seed(db)
         hub     <- Hub.sliding[ApprovalEvent](16)
-        service  = PersonService.live(
-          Repos.sqlitePersonRepo(db),
-          Repos.sqliteCommitmentRepo(db),
-          Repos.sqliteMemoryRepo(db),
-          Repos.sqliteApprovalRepo(db),
-          Repos.sqliteAuditRepo(db),
-          Repos.sqliteGoalRepo(db),
-          Repos.sqliteGoalEvidenceRepo(db),
-          Repos.sqliteEntityRepo(db),
-          Repos.sqliteRelationshipRepo(db),
-          Repos.sqliteChannelRepo(db),
-          Repos.sqliteChannelMemberRepo(db),
-          Repos.sqliteMessageRepo(db),
-          Repos.sqliteCredentialRepo(db),
-          Repos.sqliteInboxMessageRepo(db),
-          hub
-        )
+        service  = mkService(db, hub)
         result  <- f(service)
       } yield result
     }
+
+  // Like `withService` but hands the HTTP routes to the test, for exercising
+  // route-level wiring (status codes, content types) end to end.
+  private def withRoutes(f: zio.http.Routes[Any, Response] => ZIO[Any, AgentError, TestResult]): ZIO[Any, AgentError, TestResult] =
+    ZIO.scoped {
+      for {
+        db      <- Sqlite.live(":memory:").build.map(_.get[Sqlite])
+        _       <- Migrations.migrate(db)
+        _       <- SeedData.seed(db)
+        hub     <- Hub.sliding[ApprovalEvent](16)
+        routes   = dev.freskog.agent.person.api.Routes.make(mkService(db, hub), hub)
+        result  <- f(routes)
+      } yield result
+    }
+
+  private def httpGet(routes: zio.http.Routes[Any, Response], path: String): ZIO[Any, AgentError, Response] =
+    ZIO.fromEither(URL.decode(path)).orDie.flatMap(url => ZIO.scoped(routes.runZIO(Request.get(url))))
 
   // Memory is gateless: a propose is immediately accepted, so these helpers just
   // write the fact.
@@ -588,6 +611,53 @@ object PersonServiceSpec extends ZIOSpecDefault {
           h1.exists(_.item.id == b.id)
         )
       }
-    }
+    },
+
+    // --- daily briefing ---
+
+    test("submitBriefing stores the briefing; delivery failure keeps it pending + retryable") {
+      withService { svc =>
+        for {
+          // No Google credential is seeded, so email delivery fails — gracefully.
+          b      <- svc.submitBriefing(SubmitBriefingRequest(FredId, "Your day", "Today: nothing on."))
+          // Stays pending (not lost, not hard-failed) with the error recorded, so
+          // deliverPending will retry it on the next tick.
+          retry  <- svc.deliverPending(FredId)
+        } yield assertTrue(
+          b.subject == "Your day",
+          b.status == "pending",
+          b.error.isDefined,
+          retry == 0 // still couldn't deliver (no creds), but it remained retryable
+        )
+      }
+    },
+
+    // --- HTTP route wiring (server-side OAuth completion + raw attachments) ---
+
+    suite("HTTP routes")(
+      test("gmail oauth callback returns 400 + html when Google reports an error") {
+        withRoutes { routes =>
+          for {
+            resp <- httpGet(routes, "/gmail/oauth/callback?error=access_denied&state=fred")
+            body <- resp.body.asString.orDie
+          } yield assertTrue(
+            resp.status == Status.BadRequest,
+            body.contains("Gmail authorization failed"),
+            body.contains("<html")
+          )
+        }
+      },
+      test("gmail oauth callback returns 400 when code or state is missing") {
+        withRoutes { routes =>
+          httpGet(routes, "/gmail/oauth/callback").map(resp => assertTrue(resp.status == Status.BadRequest))
+        }
+      },
+      test("raw attachment endpoint 404s for an unknown inbox message") {
+        withRoutes { routes =>
+          httpGet(routes, "/inbox/does-not-exist/attachments/a1/raw")
+            .map(resp => assertTrue(resp.status == Status.NotFound))
+        }
+      }
+    )
   )
 }

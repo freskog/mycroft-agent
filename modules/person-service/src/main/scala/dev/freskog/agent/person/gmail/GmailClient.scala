@@ -53,6 +53,42 @@ object GmailClient {
     java.util.Base64.getUrlDecoder.decode(padded)
   }
 
+  /** Send a plain-text email via Gmail (`messages.send`, needs the gmail.modify
+   *  scope). Subject + body are MIME base64-encoded so UTF-8 (names, emoji) is
+   *  safe. Used only by person-service delivery — never exposed to the agent. */
+  def sendMessage(
+    accessToken: String,
+    from: String,
+    to: String,
+    subject: String,
+    body: String,
+    contentType: String = "text/plain; charset=UTF-8"
+  ): IO[AgentError, Unit] = {
+    val b64    = (s: String) => java.util.Base64.getEncoder.encodeToString(s.getBytes(StandardCharsets.UTF_8))
+    val mime   =
+      s"From: $from\r\nTo: $to\r\n" +
+        s"Subject: =?UTF-8?B?${b64(subject)}?=\r\n" +
+        s"MIME-Version: 1.0\r\nContent-Type: $contentType\r\nContent-Transfer-Encoding: base64\r\n\r\n" +
+        b64(body)
+    val raw    = java.util.Base64.getUrlEncoder.withoutPadding.encodeToString(mime.getBytes(StandardCharsets.UTF_8))
+    postJson(accessToken, "/users/me/messages/send", Json.Obj("raw" -> Json.Str(raw)).toJson).unit
+  }
+
+  private def postJson(accessToken: String, path: String, body: String): IO[AgentError, Json] =
+    ZIO.attemptBlocking {
+      val req = HttpRequest.newBuilder()
+        .uri(java.net.URI.create(GmailConfig.ApiBase + path))
+        .header("Authorization", s"Bearer $accessToken")
+        .header("Content-Type", "application/json")
+        .POST(HttpRequest.BodyPublishers.ofString(body))
+        .build()
+      val resp = client.send(req, HttpResponse.BodyHandlers.ofString())
+      if (resp.statusCode() >= 400)
+        throw new RuntimeException(s"Gmail API ${resp.statusCode()}: ${resp.body()}")
+      resp.body()
+    }.mapError(t => AgentError.HttpFailed(s"Gmail: ${Option(t.getMessage).getOrElse("error")}", Some(t)))
+      .flatMap(b => ZIO.fromEither(b.fromJson[Json]).mapError(msg => AgentError.DecodeFailed(msg)))
+
   private def getJson(accessToken: String, path: String): IO[AgentError, Json] =
     ZIO.attemptBlocking {
       val req = HttpRequest.newBuilder()

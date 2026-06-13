@@ -6,6 +6,8 @@ import dev.freskog.agent.person.domain._
 import dev.freskog.agent.person.persistence._
 import dev.freskog.agent.person.gmail._
 import dev.freskog.agent.person.calendar._
+import dev.freskog.agent.person.tasks._
+import dev.freskog.agent.person.delivery._
 
 import zio._
 import zio.json._
@@ -91,6 +93,11 @@ trait PersonService {
   // Gmail / inbox ingestion
   def gmailAuthUrl(ownerPersonId: PersonId): IO[AgentError, GmailAuthUrlResponse]
   def gmailOAuthExchange(req: GmailOAuthExchangeRequest): IO[AgentError, GmailCredentialSummary]
+  /** Consent URL for the dedicated send-only sender account (briefings for this
+   *  owner are sent as it, not the owner). Operator runs this once, signing in as
+   *  that account. Keyed per owner so the credentials FK stays valid. */
+  def senderAuthUrl(ownerPersonId: PersonId): IO[AgentError, GmailAuthUrlResponse]
+  def senderOAuthExchange(ownerPersonId: PersonId, code: String): IO[AgentError, GmailCredentialSummary]
   def gmailSync(ownerPersonId: PersonId, since: Option[Instant]): IO[AgentError, GmailSyncResult]
   def listInbox(ownerPersonId: PersonId, status: Option[String], limit: Int, oldestFirst: Boolean = false): IO[AgentError, List[InboxSummary]]
   def getInbox(id: InboxMessageId): IO[AgentError, Option[InboxMessage]]
@@ -98,9 +105,31 @@ trait PersonService {
   def skipInbox(id: InboxMessageId): IO[AgentError, InboxMessage]
   def markInboxTriaged(id: InboxMessageId, sourceEventId: Option[EventId]): IO[AgentError, InboxMessage]
 
-  // Calendar (read-only)
+  // Calendar
   def calendarAgenda(ownerPersonId: PersonId, timeMin: Instant, timeMax: Instant): IO[AgentError, List[CalendarEvent]]
   def listCalendars(ownerPersonId: PersonId): IO[AgentError, List[CalendarSummary]]
+  /** Create a calendar event directly (no approval): `[M]`-marked and idempotent
+   *  (dedup on the agent's `source` key, else on summary+start). Reversible in
+   *  Google; made safe by the marker + dedup, not a gate. */
+  def createCalendarEventDirect(req: CalendarCreateEventRequest): IO[AgentError, CalendarEvent]
+
+  /** Reconcile the owner's commitments with Google Tasks (projection + bounded
+   *  sync-back). Infrastructure (poller-driven), not a gated action. */
+  def syncTasks(ownerPersonId: PersonId): IO[AgentError, TaskSyncResult]
+
+  /** Mirror the owner's Google Calendar into the local event store (upsert live
+   *  events, mark vanished ones cancelled) so a Google-side change reaches the
+   *  substrate. Poller-driven infrastructure. */
+  def syncCalendar(ownerPersonId: PersonId): IO[AgentError, CalendarSyncResult]
+
+  // Daily briefing (agent composes via submit; person-service delivers — no agent egress)
+  /** Store the agent-composed briefing and deliver it on the owner's channel. */
+  def submitBriefing(req: SubmitBriefingRequest): IO[AgentError, Briefing]
+  /** Re-attempt delivery of any still-`pending` briefings for the owner. */
+  def deliverPending(ownerPersonId: PersonId): IO[AgentError, Int]
+  /** The daily run: sync calendar+tasks (fresh data), then trigger the agent to
+   *  compose (once/day). Idempotent per owner per day. */
+  def runDailyBriefing(ownerPersonId: PersonId): IO[AgentError, Unit]
 }
 
 object PersonService {
@@ -124,6 +153,8 @@ object PersonService {
     messageRepo: MessageRepo,
     credentialRepo: CredentialRepo,
     inboxRepo: InboxMessageRepo,
+    calendarEventRepo: CalendarEventRepo,
+    briefingRepo: BriefingRepo,
     approvalHub: Hub[ApprovalEvent],
     decisionCodeTtl: Duration = Duration.ofHours(48)
   ): PersonService = new PersonService {
@@ -830,6 +861,40 @@ object PersonService {
         _        <- audit("gmail.oauth", "credential", Some(cred.id.value), now)
       } yield GmailCredentialSummary(cred.provider, cred.accountEmail, cred.ownerPersonId, cred.scopes)
 
+    def senderAuthUrl(ownerPersonId: PersonId): IO[AgentError, GmailAuthUrlResponse] =
+      for {
+        _        <- requirePerson(ownerPersonId)
+        settings <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
+      } yield GmailAuthUrlResponse(
+        url = GmailOAuth.authUrl(settings, GmailConfig.SenderStatePrefix + ownerPersonId.value, GmailConfig.SenderScopes),
+        redirectUri = settings.redirectUri
+      )
+
+    def senderOAuthExchange(ownerPersonId: PersonId, code: String): IO[AgentError, GmailCredentialSummary] =
+      for {
+        _         <- requirePerson(ownerPersonId)
+        settings  <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
+        token     <- GmailOAuth.exchangeCode(settings, code)
+        email     <- GmailOAuth.fetchAccountEmail(token.accessToken)
+        now       <- Clock.instant
+        existing  <- credentialRepo.findByOwner(GmailConfig.SenderProvider, ownerPersonId)
+        refresh    = token.refreshToken.orElse(existing.map(_.refreshToken))
+        refreshTok <- ZIO.fromOption(refresh).orElseFail(AgentError.Validation("No refresh token returned; re-run sender auth with prompt=consent"))
+        cred       = Credential(
+                       id = existing.map(_.id).getOrElse(CredentialId(newUuid)),
+                       provider = GmailConfig.SenderProvider,
+                       accountEmail = email.email,
+                       ownerPersonId = ownerPersonId,
+                       accessToken = token.accessToken,
+                       refreshToken = refreshTok,
+                       expiresAt = GmailOAuth.expiresAtFrom(token, now),
+                       scopes = token.scope,
+                       updatedAt = now
+                     )
+        _         <- credentialRepo.upsert(cred)
+        _         <- audit("gmail.sender.oauth", "credential", Some(cred.id.value), now)
+      } yield GmailCredentialSummary(cred.provider, cred.accountEmail, cred.ownerPersonId, cred.scopes)
+
     def gmailSync(ownerPersonId: PersonId, since: Option[Instant]): IO[AgentError, GmailSyncResult] =
       for {
         _        <- requirePerson(ownerPersonId)
@@ -913,6 +978,276 @@ object PersonService {
         cals     <- CalendarClient.listCalendars(access).mapError(scopeHint)
       } yield cals.map { case (id, summary) => CalendarSummary(id, summary) }
 
+    def createCalendarEventDirect(req: CalendarCreateEventRequest): IO[AgentError, CalendarEvent] = {
+      // `[M] ` marks it as MyCroft-created (visible + bulk-removable in Google).
+      val marked = if (req.summary.startsWith("[M] ")) req.summary else s"[M] ${req.summary}"
+      for {
+        _        <- requirePerson(req.ownerPersonId)
+        // Idempotent: a retrying agent re-creating the same event is a no-op.
+        existing <- req.source match {
+                      case Some(s) => calendarEventRepo.findBySource(req.ownerPersonId, s)
+                      case None    => calendarEventRepo.findBySignature(req.ownerPersonId, marked, req.start)
+                    }
+        result   <- existing match {
+                      case Some(e) => ZIO.succeed(e)
+                      case None =>
+                        for {
+                          settings <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
+                          cred     <- credentialRepo.findByOwner(GmailConfig.ProviderName, req.ownerPersonId)
+                                        .someOrFail(AgentError.NotFound("google credential", req.ownerPersonId.value))
+                          access   <- ensureAccessToken(settings, cred)
+                          target    = req.calendarId.getOrElse("primary")
+                          event    <- CalendarClient.createEvent(access, target, req.copy(summary = marked)).mapError(scopeHint)
+                          now      <- Clock.instant
+                          _        <- audit("calendar.event.created", "calendar_event", Some(event.externalId), now)
+                          _        <- calendarEventRepo.upsert(req.ownerPersonId, event, now, req.source)
+                        } yield event
+                    }
+      } yield result
+    }
+
+    // --- Google Tasks projection (commitments are SoT; Tasks is the view) ---
+
+    def syncTasks(ownerPersonId: PersonId): IO[AgentError, TaskSyncResult] =
+      for {
+        _        <- requirePerson(ownerPersonId)
+        settings <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
+        cred     <- credentialRepo.findByOwner(GmailConfig.ProviderName, ownerPersonId)
+                      .someOrFail(AgentError.NotFound("google credential", ownerPersonId.value))
+        access   <- ensureAccessToken(settings, cred)
+        lists    <- TasksClient.listTaskLists(access).mapError(tasksScopeHint)
+        listId   <- ZIO.fromOption(lists.headOption.map(_._1))
+                      .orElseFail(AgentError.Validation("no Google Tasks list found for this account"))
+        pushed   <- pushCommitments(ownerPersonId, access, listId)
+        pulled   <- pullTasks(ownerPersonId, access, listId)
+      } yield TaskSyncResult(pushed = pushed, pulled = pulled._1, imported = pulled._2)
+
+    /** Push commitments to Tasks: insert new open ones, patch changed open ones,
+     *  complete/delete resolved ones. Per-item best-effort — a failure on one
+     *  doesn't abort the batch. Returns the count successfully pushed. */
+    private def pushCommitments(owner: PersonId, access: String, listId: String): IO[AgentError, Int] =
+      commitmentRepo.findForTaskSync(owner).flatMap { syncs =>
+        ZIO.foldLeft(syncs)(0) { (n, s) =>
+          val c = s.commitment
+          // `[M] ` marks the Task as MyCroft-created (visible vs the user's own todos).
+          val title = if (c.text.startsWith("[M] ")) c.text else s"[M] ${c.text}"
+          val notes = Some(s"[mycroft] source=${c.source}")
+          val action: IO[AgentError, Unit] = (s.googleTaskId, c.status) match {
+            case (None, CommitmentStatus.Open) =>
+              for {
+                t   <- TasksClient.insertTask(access, listId, title, notes, c.dueAt)
+                now <- Clock.instant
+                _   <- commitmentRepo.setTaskMapping(c.id, listId, t.id, now)
+              } yield ()
+            case (None, _) =>
+              ZIO.unit // resolved and never projected — nothing to push
+            case (Some(taskId), CommitmentStatus.Open) =>
+              val lst = s.googleTaskListId.getOrElse(listId)
+              for {
+                _   <- TasksClient.patchTask(access, lst, taskId, title = Some(title), due = c.dueAt, status = Some("needsAction"))
+                now <- Clock.instant
+                _   <- commitmentRepo.markProjected(c.id, now)
+              } yield ()
+            case (Some(taskId), CommitmentStatus.Done) =>
+              completeAndMark(access, s.googleTaskListId.getOrElse(listId), taskId, c.id, complete = true)
+            case (Some(taskId), _) => // Ignored / Cancelled / Proposed → remove from the list
+              completeAndMark(access, s.googleTaskListId.getOrElse(listId), taskId, c.id, complete = false)
+          }
+          action.foldZIO(_ => ZIO.succeed(n), _ => ZIO.succeed(n + 1))
+        }
+      }
+
+    private def completeAndMark(access: String, listId: String, taskId: String, id: CommitmentId, complete: Boolean): IO[AgentError, Unit] =
+      (if (complete) TasksClient.completeTask(access, listId, taskId).unit
+       else TasksClient.deleteTask(access, listId, taskId)) *>
+        Clock.instant.flatMap(commitmentRepo.markProjected(id, _))
+
+    /** Pull Google-side changes back: a mapped task completed/deleted → resolve the
+     *  commitment; due-date changed → update it; an unmapped task → import as a new
+     *  commitment. Bounded to status + due. Returns (updated, imported). */
+    private def pullTasks(owner: PersonId, access: String, listId: String): IO[AgentError, (Int, Int)] =
+      TasksClient.listTasks(access, listId, showCompleted = true).flatMap { tasks =>
+        ZIO.foldLeft(tasks)((0, 0)) { case ((updated, imported), t) =>
+          commitmentRepo.findByGoogleTaskId(t.id).flatMap {
+            case Some(c) => reconcileTask(c, t).map(changed => (updated + (if (changed) 1 else 0), imported))
+            case None    => importTask(owner, listId, t).map(did => (updated, imported + (if (did) 1 else 0)))
+          }.foldZIO(_ => ZIO.succeed((updated, imported)), ZIO.succeed(_))
+        }
+      }
+
+    /** Apply a Google-side change to a mapped commitment (status, then due). */
+    private def reconcileTask(c: Commitment, t: TasksClient.GTask): IO[AgentError, Boolean] =
+      Clock.instant.flatMap { now =>
+        if ((t.completed || t.deleted) && c.status == CommitmentStatus.Open) {
+          val to = if (t.completed) CommitmentStatus.Done else CommitmentStatus.Cancelled
+          commitmentRepo.updateStatus(c.id, to, now) *>
+            audit(s"commitment.status.${CommitmentStatus.asString(to)}", "commitment", Some(c.id.value), now)
+              .as(true)
+        } else if (!t.completed && c.status == CommitmentStatus.Open && !sameDay(t.due, c.dueAt)) {
+          commitmentRepo.updateContent(c.id, c.text, c.evidence, t.due, now) *>
+            audit("commitment.sync.due", "commitment", Some(c.id.value), now).as(true)
+        } else ZIO.succeed(false)
+      }
+
+    /** Import a user-created (open) task as a new commitment, mapped back so we
+     *  don't re-import it. Skips completed/deleted tasks. */
+    private def importTask(owner: PersonId, listId: String, t: TasksClient.GTask): IO[AgentError, Boolean] =
+      if (t.completed || t.deleted || t.title.trim.isEmpty) ZIO.succeed(false)
+      else
+        Clock.instant.flatMap { now =>
+          val c = Commitment(CommitmentId(newUuid), owner, CommitmentStatus.Open,
+                             t.title, s"tasks:${t.id}", "imported from Google Tasks", t.due, now, now)
+          commitmentRepo.create(c) *>
+            commitmentRepo.setTaskMapping(c.id, listId, t.id, now) *>
+            audit("commitment.import.tasks", "commitment", Some(c.id.value), now).as(true)
+        }
+
+    /** Compare two optional instants at date granularity (Tasks `due` is date-only). */
+    private def sameDay(a: Option[Instant], b: Option[Instant]): Boolean =
+      (a, b) match {
+        case (Some(x), Some(y)) =>
+          x.atZone(java.time.ZoneOffset.UTC).toLocalDate == y.atZone(java.time.ZoneOffset.UTC).toLocalDate
+        case (None, None) => true
+        case _            => false
+      }
+
+    private def tasksScopeHint(e: AgentError): AgentError = e match {
+      case AgentError.HttpFailed(m, _) if m.contains("403") || m.toLowerCase.contains("insufficient") =>
+        AgentError.Validation("Google Tasks access not granted. The operator must re-run the Google OAuth flow to grant the tasks scope.")
+      case other => other
+    }
+
+    // --- Calendar mirror (Google Calendar → local event store) ---
+
+    def syncCalendar(ownerPersonId: PersonId): IO[AgentError, CalendarSyncResult] =
+      for {
+        now    <- Clock.instant
+        timeMin = now.minus(java.time.Duration.ofDays(1))
+        timeMax = now.plus(java.time.Duration.ofDays(90))
+        // Live events across all the owner's calendars (reuses the agenda fan-out).
+        live   <- calendarAgenda(ownerPersonId, timeMin, timeMax)
+        counts <- ZIO.foldLeft(live)((0, 0)) { case ((imp, upd), e) =>
+                    calendarEventRepo.find(ownerPersonId, e.calendarId, e.externalId).flatMap {
+                      case None =>
+                        calendarEventRepo.upsert(ownerPersonId, e, now) *>
+                          audit("calendar.event.imported", "calendar_event", Some(e.externalId), now)
+                            .as((imp + 1, upd))
+                      case Some(prev) if calendarChanged(prev, e) =>
+                        calendarEventRepo.upsert(ownerPersonId, e, now) *>
+                          audit("calendar.event.updated", "calendar_event", Some(e.externalId), now)
+                            .as((imp, upd + 1))
+                      case Some(_) =>
+                        // Unchanged — touch synced_at so it isn't seen as vanished.
+                        calendarEventRepo.upsert(ownerPersonId, e, now).as((imp, upd))
+                    }
+                  }
+        stale  <- calendarEventRepo.cancelStaleInWindow(ownerPersonId, now, timeMin, timeMax)
+        _      <- ZIO.foreachDiscard(stale) { case (_, ext, _) =>
+                    audit("calendar.event.cancelled", "calendar_event", Some(ext), now)
+                  }
+      } yield CalendarSyncResult(imported = counts._1, updated = counts._2, cancelled = stale.size)
+
+    /** A Google-side change worth mirroring: time, status, or title moved. */
+    private def calendarChanged(prev: CalendarEvent, next: CalendarEvent): Boolean =
+      prev.start != next.start || prev.end != next.end || prev.status != next.status || prev.summary != next.summary
+
+    // --- Daily briefing (agent composes via submit; person-service delivers) ---
+
+    def submitBriefing(req: SubmitBriefingRequest): IO[AgentError, Briefing] =
+      for {
+        _   <- requirePerson(req.ownerPersonId)
+        now <- Clock.instant
+        b    = Briefing(newUuid, req.ownerPersonId, req.subject, req.body, "pending", None, now, None, None)
+        _   <- briefingRepo.create(b)
+        _   <- audit("briefing.submitted", "briefing", Some(b.id), now)
+        out <- deliverOne(b)
+      } yield out
+
+    def deliverPending(ownerPersonId: PersonId): IO[AgentError, Int] =
+      for {
+        _       <- requirePerson(ownerPersonId)
+        pending <- briefingRepo.findPending(ownerPersonId)
+        results <- ZIO.foreach(pending)(deliverOne)
+      } yield results.count(_.status == "delivered")
+
+    /** Deliver one briefing on the owner's channel; record delivered/failed. A
+     *  delivery failure is recorded (stays retryable), not propagated. */
+    private def deliverOne(b: Briefing): IO[AgentError, Briefing] =
+      channelFor(b.ownerPersonId)
+        .flatMap(ch => ch.deliver(b.subject, b.body).as(ch.name))
+        .foldZIO(
+          e   => Clock.instant.flatMap(now => briefingRepo.recordDeliveryError(b.id, e.message, now))
+                   .as(b.copy(status = "pending", error = Some(e.message))),
+          chN => Clock.instant.flatMap(now => briefingRepo.markDelivered(b.id, chN, now))
+                   .as(b.copy(status = "delivered", channel = Some(chN), deliveredAt = None))
+        )
+
+    /** The owner's delivery channel. For now everyone uses email-to-self (the
+     *  credential's own account address — non-redirectable). Multi-user: resolve a
+     *  per-person preference (email / whatsapp / signal) here. */
+    private def channelFor(ownerPersonId: PersonId): IO[AgentError, DeliveryChannel] =
+      ZIO.succeed(new DeliveryChannel {
+        val name = "email"
+        def deliver(subject: String, body: String): IO[AgentError, Unit] =
+          for {
+            settings   <- ZIO.fromEither(GmailConfig.load).mapError(AgentError.Validation)
+            ownerCred  <- credentialRepo.findByOwner(GmailConfig.ProviderName, ownerPersonId)
+                            .someOrFail(AgentError.NotFound("google credential", ownerPersonId.value))
+            // Prefer the dedicated sender account (From = mycroft.agent@…); fall back
+            // to the owner sending to themselves until the sender is authorized.
+            senderCred <- credentialRepo.findByOwner(GmailConfig.SenderProvider, ownerPersonId)
+            from        = senderCred.map(_.accountEmail).getOrElse(ownerCred.accountEmail)
+            authCred    = senderCred.getOrElse(ownerCred)
+            access     <- ensureAccessToken(settings, authCred)
+            // Render the agent's markdown to HTML — Gmail doesn't show markdown.
+            _          <- GmailClient.sendMessage(access, from, ownerCred.accountEmail,
+                            subject, Markdown.toHtml(body), "text/html; charset=UTF-8")
+          } yield ()
+      })
+
+    def runDailyBriefing(ownerPersonId: PersonId): IO[AgentError, Unit] =
+      for {
+        person     <- requirePerson(ownerPersonId)
+        now        <- Clock.instant
+        // Gate on the owner's local time (DST-correct via java.time) so the poller
+        // can just check in periodically and the server decides when 7am has arrived.
+        zone        = scala.util.Try(java.time.ZoneId.of(person.timezone)).getOrElse(java.time.ZoneOffset.UTC: java.time.ZoneId)
+        local       = now.atZone(zone)
+        hour        = sys.env.get("BRIEFING_HOUR").flatMap(_.toIntOption).getOrElse(7)
+        dayStart    = local.toLocalDate.atStartOfDay(zone).toInstant   // local midnight
+        already    <- briefingRepo.existsSince(ownerPersonId, dayStart)
+        // Fire once per local day, only after the configured local hour.
+        _          <- ZIO.unless(already || local.getHour < hour) {
+                        // Fresh data first, then ask the agent to compose. Both are
+                        // best-effort: a sync hiccup shouldn't block composition.
+                        syncCalendar(ownerPersonId).ignore *>
+                          syncTasks(ownerPersonId).ignore *>
+                          triggerCompose(ownerPersonId)
+                      }
+      } yield ()
+
+    /** Ask mycroft to compose the briefing (it runs the `daily-briefing` skill and
+     *  calls `briefing submit`). Fire-and-forget; the agent has no send capability.
+     *  MYCROFT_URL is read from the environment; absent → no-op (logged). */
+    private def triggerCompose(ownerPersonId: PersonId): IO[AgentError, Unit] =
+      sys.env.get("MYCROFT_URL") match {
+        case None => ZIO.unit
+        case Some(base) =>
+          val owner = ownerPersonId.value
+          val body =
+            s"""{"channel":"$owner","from":"$owner","content":"Compose today's daily briefing for $owner.","skill":"daily-briefing","params":"{\\"owner\\":\\"$owner\\"}"}"""
+          ZIO.attemptBlocking {
+            val req = java.net.http.HttpRequest.newBuilder()
+              .uri(java.net.URI.create(s"$base/inbound"))
+              .header("Content-Type", "application/json")
+              .POST(java.net.http.HttpRequest.BodyPublishers.ofString(body))
+              .build()
+            java.net.http.HttpClient.newHttpClient()
+              .send(req, java.net.http.HttpResponse.BodyHandlers.ofString())
+            ()
+          }.ignore // fire-and-forget; the poller retries the run if needed
+      }
+
     /** Create an event on the owner's primary calendar (the `calendar.create_event`
      *  executor). Same token path as the agenda read; needs the calendar.events
      *  write scope, so a token minted before the scope bump will 403 → scopeHint. */
@@ -927,6 +1262,9 @@ object PersonService {
         event    <- CalendarClient.createEvent(access, target, req).mapError(scopeHint)
         now      <- Clock.instant
         _        <- audit("calendar.event.created", "calendar_event", Some(event.externalId), now)
+        // Write through to the local mirror so the agent's event store reflects it
+        // immediately, without waiting for the next sync.
+        _        <- calendarEventRepo.upsert(req.ownerPersonId, event, now).ignore
       } yield event
 
     /** Build the HITL calendar menu from the owner's real Google calendars.
@@ -964,7 +1302,7 @@ object PersonService {
      *  (e.g. the owner authed before calendar write was added). Actionable advice. */
     private def scopeHint(e: AgentError): AgentError = e match {
       case AgentError.HttpFailed(m, _) if m.contains("403") || m.toLowerCase.contains("insufficient") =>
-        AgentError.Validation("Calendar access not granted for this Google account. Re-run `person google auth --owner <owner>` to grant calendar access (calendar.events).")
+        AgentError.Validation("Calendar access not granted for this Google account. The operator must re-run the Gmail OAuth flow (GET /gmail/auth-url then complete consent) to grant calendar access (calendar.events).")
       case other => other
     }
 

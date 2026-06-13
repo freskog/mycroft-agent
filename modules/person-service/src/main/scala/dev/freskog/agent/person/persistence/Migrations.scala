@@ -282,7 +282,58 @@ object Migrations {
 
     // V11: parameterized-HITL decision menu (trusted-core authored). The chosen
     // option's params merge into the payload at approval.
-    "ALTER TABLE approvals ADD COLUMN options_json TEXT"
+    "ALTER TABLE approvals ADD COLUMN options_json TEXT",
+
+    // V12: commitment ↔ Google Task projection mapping. `google_task_id` /
+    // `google_task_list_id` link a commitment to its projected Task; `projected_at`
+    // is when we last pushed it (re-push when `updated_at` is newer). Bookkeeping
+    // only — kept out of the domain `Commitment` model; the sync layer reads these
+    // columns directly. Commitments are the source of truth; Tasks is the view.
+    "ALTER TABLE commitments ADD COLUMN google_task_id TEXT",
+    "ALTER TABLE commitments ADD COLUMN google_task_list_id TEXT",
+    "ALTER TABLE commitments ADD COLUMN projected_at TEXT",
+
+    // V13: local mirror of the owner's Google Calendar events (the substrate's
+    // event store). `syncCalendar` upserts live events here and marks vanished ones
+    // cancelled, so a Google-side change reaches the substrate (the symmetry to the
+    // Tasks projection). `synced_at` is the last time we saw the event in a sync.
+    """CREATE TABLE IF NOT EXISTS calendar_events (
+      |  owner_person_id TEXT NOT NULL,
+      |  calendar_id TEXT NOT NULL,
+      |  external_id TEXT NOT NULL,
+      |  summary TEXT NOT NULL,
+      |  start_at TEXT NOT NULL,
+      |  end_at TEXT NOT NULL,
+      |  all_day INTEGER NOT NULL DEFAULT 0,
+      |  location TEXT,
+      |  description TEXT,
+      |  html_link TEXT,
+      |  status TEXT NOT NULL DEFAULT 'confirmed',
+      |  synced_at TEXT NOT NULL,
+      |  PRIMARY KEY (owner_person_id, calendar_id, external_id)
+      |)""".stripMargin,
+    "CREATE INDEX IF NOT EXISTS idx_calendar_events_window ON calendar_events(owner_person_id, start_at)",
+
+    // V14: idempotency key for agent-created events. Calendar create is now direct
+    // (no approval), so the dedup key (a stable `--source`, e.g. email:gmail-msg-X)
+    // lets a retrying agent re-create the same event without producing a duplicate.
+    "ALTER TABLE calendar_events ADD COLUMN source TEXT",
+
+    // V15: daily briefings the agent composes and person-service delivers. The agent
+    // never sends — it writes a `pending` row here; delivery (per the owner's channel
+    // config) is person-service's job. `status`: pending|delivered|failed.
+    """CREATE TABLE IF NOT EXISTS briefings (
+      |  id TEXT PRIMARY KEY,
+      |  owner_person_id TEXT NOT NULL,
+      |  subject TEXT NOT NULL,
+      |  body TEXT NOT NULL,
+      |  status TEXT NOT NULL DEFAULT 'pending',
+      |  channel TEXT,
+      |  created_at TEXT NOT NULL,
+      |  delivered_at TEXT,
+      |  error TEXT
+      |)""".stripMargin,
+    "CREATE INDEX IF NOT EXISTS idx_briefings_owner ON briefings(owner_person_id, created_at)"
   )
 
   def migrate(db: Sqlite): IO[dev.freskog.agent.common.AgentError, Unit] =

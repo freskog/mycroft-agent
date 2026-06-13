@@ -1,19 +1,27 @@
 ---
 name: approvals
-description: Request human approval for a privileged action (send mail, create a calendar event, anything with outside effect). Request-only — you never approve or execute.
-version: 1.0.0
-capabilities: [person-cli, safe-run]
+description: "PARKED — not currently in use. The agent has no approval/request verb today; calendar and task writes are direct ([M]-marked, idempotent). Reserved for a future outward-email gate (sending mail to third parties will always require approval)."
+version: 2.0.0
+capabilities: [person, safe-run]
 ---
 
 # Approvals (Human-in-the-Loop)
 
-## Purpose
+> **⚠ PARKED — there is no approval action for the agent right now.**
+> Calendar events and todos are written **directly** (`person calendar create`,
+> `person commitment record`) — they're `[M]`-marked and server-side idempotent, so
+> no gate is needed; the user manages them in Google. There is **no `person approval
+> request`** and **no `person goal request`** verb. The person-service approval
+> engine remains in code, dormant, **reserved for the one thing that will always be
+> gated: sending email to third parties** — when that's built, this skill returns.
+> Until then, do not look for an approval flow; just write directly.
 
-Some actions have outside effect — sending an email, creating a calendar event,
-spending money, messaging a third party. These must never happen without a
-human's explicit consent. The approval mechanism is how you **request** such an
-action and let a human gate it. (This is the `request` half of the authority
-model; `record` is the gateless half — see `agent-protocol`.)
+## Purpose (historical — for the future outward-email gate)
+
+Some actions have outside effect — chiefly **sending email to a third party**.
+Those must never happen without a human's explicit consent, via the approval
+mechanism below. (Calendar/task writes are **not** in this category anymore — they
+are direct.) This section is retained for when the gate is reactivated.
 
 Three roles, and you only play the first:
 
@@ -28,18 +36,18 @@ continue.
 
 ## When to use
 
-Use an approval for any action with an effect outside this system, **and for
-creating a goal** (a durable, immutable contract — use the `person goal request`
-sugar, which creates a `goal.create` approval; see the `goals` skill). Do **not**
-use it for reads, for recording memory / entities / relationships / commitments
-(those are gateless — record them directly, they're reversible), or for anything
-you can just answer.
+Use an approval for any action with an effect outside this system. Do **not** use
+it for reads, for recording memory / entities / relationships / commitments (those
+are gateless — record them directly, they're reversible), or for anything you can
+just answer.
 
 Registered action types today: `calendar.create_event` (writes a Google Calendar
-event — prefer the `person calendar create` sugar, see the `calendar` skill) and
-`goal.create` (prefer `person goal request`), plus `approval.ping` (a test no-op).
-The executor for each lives in person-service. Prefer the sugar verbs over a raw
-`approval request` so you don't hand-build the payload JSON.
+event — prefer the `person calendar create` sugar, see the `calendar` skill), plus
+`approval.ping` (a test no-op). The executor for each lives in person-service.
+Prefer the sugar verbs over a raw `approval request` so you don't hand-build the
+payload JSON. (A `goal.create` action type still exists in person-service but is
+**parked** — goals are an autonomous-task construct, not user tracking; don't
+request them. See the `goals` skill.)
 
 ## The decision is gated by a one-time code you never see
 
@@ -97,8 +105,8 @@ the approval boundary** and resumes from durable state:
 2. The human approves; person-service executes the action and records its result.
 3. The continuation skill is run automatically. It must **rehydrate from durable
    state, not memory** — read the approval's recorded result (the proof the action
-   happened), any linked goal, and its `params` (e.g. a `phase`) to know where it
-   is. Then continue — requesting the next gated step if there is one.
+   happened) and its `params` (e.g. a `phase`) to know where it is. Then continue —
+   requesting the next gated step if there is one.
 
 So a gated workflow is a chain of skill segments linked by approvals. Keep the
 pre-gate steps idempotent: a segment may be re-run.

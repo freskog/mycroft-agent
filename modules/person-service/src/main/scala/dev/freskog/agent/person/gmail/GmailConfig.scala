@@ -18,20 +18,43 @@ object GmailConfig {
   // consent also covers future *gated* email actions; nothing in the code can send
   // yet (no send executor), and the token lives only in the trusted core.
   val ModifyScope = "https://www.googleapis.com/auth/gmail.modify"
+  // Read/write Google Tasks — the projection of commitments (todos) the user views
+  // and ticks on any device, with status/due synced back.
+  val TasksScope = "https://www.googleapis.com/auth/tasks"
 
   /** Scopes requested in one Google consent. A single grant yields one
-   *  access/refresh token that works against the Gmail and Calendar APIs, so we
-   *  keep a single credential row rather than a second OAuth flow. Changing this
-   *  set requires a one-time re-consent (`person google auth`): tokens minted under
-   *  the old scopes won't carry new permissions (e.g. calendar write 403s). */
-  val RequestedScopes = s"$ModifyScope $CalendarEventsScope"
+   *  access/refresh token that works against the Gmail, Calendar, and Tasks APIs,
+   *  so we keep a single credential row rather than separate OAuth flows. Changing
+   *  this set requires a one-time re-consent (operator re-runs the Gmail auth flow):
+   *  tokens minted under the old scopes won't carry new permissions (e.g. Tasks
+   *  write or calendarList read 403s). `calendar.readonly` is included so we can
+   *  enumerate the owner's calendars (the HITL picker) and fan the agenda/sync-back
+   *  across all of them — `calendar.events` alone can't list calendars. */
+  val RequestedScopes = s"$ModifyScope $CalendarEventsScope $CalendarReadonlyScope $TasksScope"
+
+  // --- Dedicated sender account (e.g. mycroft.agent@gmail.com) ---
+  // A separate, send-only credential so briefings are sent *as the agent*, not the
+  // owner. `userinfo.email` lets us read the account address (the message From must
+  // match the authenticated account). Stored under its own provider/owner so it
+  // never collides with an owner's read credential.
+  val SendScope          = "https://www.googleapis.com/auth/gmail.send"
+  val UserinfoEmailScope = "https://www.googleapis.com/auth/userinfo.email"
+  val SenderScopes       = s"$SendScope $UserinfoEmailScope"
+  // Stored as a distinct provider, keyed to a real owner (the credentials FK
+  // requires a real person). The OAuth `state` is `SenderStatePrefix + ownerId`.
+  val SenderProvider     = "gmail-sender"
+  val SenderStatePrefix  = "__sender__:"
+  val UserinfoEndpoint   = "https://www.googleapis.com/oauth2/v3/userinfo"
 
   val AuthEndpoint  = "https://accounts.google.com/o/oauth2/v2/auth"
   val TokenEndpoint = "https://oauth2.googleapis.com/token"
   val ApiBase       = "https://gmail.googleapis.com/gmail/v1"
+  val TasksApiBase  = "https://tasks.googleapis.com/tasks/v1"
 
-  /** Loopback callback used by `person google auth` (must match Google Cloud redirect URIs). */
-  val DefaultRedirectUri = "http://localhost:8765/oauth/callback"
+  /** Server-side OAuth redirect target. Google redirects the operator's browser
+   *  to person-service's `GET /gmail/oauth/callback`, which completes the exchange.
+   *  Override with GMAIL_REDIRECT_URI; must match a Google Cloud redirect URI. */
+  val DefaultRedirectUri = "http://localhost:8080/gmail/oauth/callback"
 
   final case class Settings(
     clientId: String,

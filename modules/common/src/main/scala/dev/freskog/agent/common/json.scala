@@ -228,4 +228,5 @@ object JsonCodecs {
   implicit val inboxMessageCodec: JsonCodec[InboxMessage]   = DeriveJsonCodec.gen[InboxMessage]
   implicit val inboxSummaryCodec: JsonCodec[InboxSummary]   = DeriveJsonCodec.gen[InboxSummary]
   implicit val calendarEventCodec: JsonCodec[CalendarEvent] = DeriveJsonCodec.gen[CalendarEvent]
+  implicit val briefingCodec: JsonCodec[Briefing]           = DeriveJsonCodec.gen[Briefing]
 }

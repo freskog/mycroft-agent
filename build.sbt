@@ -20,7 +20,7 @@ lazy val commonSettings = Seq(
 )
 
 lazy val root = (project in file("."))
-  .aggregate(common, safeRun, runlog, personCli, personService, runtime, mycroft, mycroftRepl)
+  .aggregate(common, safeRun, runlog, personService, runtime, mycroft, mycroftRepl)
   .settings(
     name := "personal-agent",
     publish / skip := true
@@ -53,6 +53,12 @@ lazy val safeRun = (project in file("modules/safe-run"))
     ),
     nativeImageOptions ++= Seq(
       "--no-fallback",
+      // Bake UTF-8 as the image charset. `sun.jnu.encoding` is what ProcessBuilder
+      // uses to encode child-process arguments — without this it's baked from the
+      // builder's POSIX locale (ASCII), mangling non-ASCII args (€, —, emoji) to `?`
+      // when the agent spawns `person …`. Runtime LANG does not override the baked value.
+      "-Dfile.encoding=UTF-8",
+      "-Dsun.jnu.encoding=UTF-8",
       "-H:+ReportExceptionStackTraces"
     )
   )
@@ -71,6 +77,12 @@ lazy val runlog = (project in file("modules/runlog"))
     ),
     nativeImageOptions ++= Seq(
       "--no-fallback",
+      // Bake UTF-8 as the image charset. `sun.jnu.encoding` is what ProcessBuilder
+      // uses to encode child-process arguments — without this it's baked from the
+      // builder's POSIX locale (ASCII), mangling non-ASCII args (€, —, emoji) to `?`
+      // when the agent spawns `person …`. Runtime LANG does not override the baked value.
+      "-Dfile.encoding=UTF-8",
+      "-Dsun.jnu.encoding=UTF-8",
       "-H:+ReportExceptionStackTraces"
     )
   )
@@ -90,29 +102,19 @@ lazy val personService = (project in file("modules/person-service"))
     ),
     nativeImageOptions ++= Seq(
       "--no-fallback",
+      // Bake UTF-8 as the image charset. `sun.jnu.encoding` is what ProcessBuilder
+      // uses to encode child-process arguments — without this it's baked from the
+      // builder's POSIX locale (ASCII), mangling non-ASCII args (€, —, emoji) to `?`
+      // when the agent spawns `person …`. Runtime LANG does not override the baked value.
+      "-Dfile.encoding=UTF-8",
+      "-Dsun.jnu.encoding=UTF-8",
       "--initialize-at-run-time=io.netty",
       "-H:+ReportExceptionStackTraces"
     )
   )
 
-lazy val personCli = (project in file("modules/person-cli"))
-  .dependsOn(common)
-  .enablePlugins(NativeImagePlugin)
-  .settings(commonSettings)
-  .settings(
-    name := "person-cli",
-    Compile / mainClass := Some("dev.freskog.agent.person.cli.Main"),
-    libraryDependencies ++= Seq(
-      "dev.zio" %% "zio-cli"      % zioCliVersion,
-      "dev.zio" %% "zio-json"     % zioJsonVersion,
-      "dev.zio" %% "zio-test"     % zioVersion % Test,
-      "dev.zio" %% "zio-test-sbt" % zioVersion % Test
-    ),
-    nativeImageOptions ++= Seq(
-      "--no-fallback",
-      "-H:+ReportExceptionStackTraces"
-    )
-  )
+// person-cli was removed: the `person` verbs are now a thin curl/jq script
+// (scripts/person) shipped directly into the runtime image. See docs/architecture.md.
 
 lazy val mycroft = (project in file("modules/mycroft"))
   .dependsOn(common, safeRun, runtime)
@@ -130,6 +132,12 @@ lazy val mycroft = (project in file("modules/mycroft"))
     ),
     nativeImageOptions ++= Seq(
       "--no-fallback",
+      // Bake UTF-8 as the image charset. `sun.jnu.encoding` is what ProcessBuilder
+      // uses to encode child-process arguments — without this it's baked from the
+      // builder's POSIX locale (ASCII), mangling non-ASCII args (€, —, emoji) to `?`
+      // when the agent spawns `person …`. Runtime LANG does not override the baked value.
+      "-Dfile.encoding=UTF-8",
+      "-Dsun.jnu.encoding=UTF-8",
       "--initialize-at-run-time=io.netty",
       "-H:+ReportExceptionStackTraces"
     )
@@ -178,6 +186,12 @@ lazy val runtime = (project in file("modules/runtime"))
     ),
     nativeImageOptions ++= Seq(
       "--no-fallback",
+      // Bake UTF-8 as the image charset. `sun.jnu.encoding` is what ProcessBuilder
+      // uses to encode child-process arguments — without this it's baked from the
+      // builder's POSIX locale (ASCII), mangling non-ASCII args (€, —, emoji) to `?`
+      // when the agent spawns `person …`. Runtime LANG does not override the baked value.
+      "-Dfile.encoding=UTF-8",
+      "-Dsun.jnu.encoding=UTF-8",
       "-H:+ReportExceptionStackTraces"
     )
   )

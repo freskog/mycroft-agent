@@ -2,7 +2,7 @@
 name: person-service
 description: Interact with the trusted person-service sidecar for durable household state — people, the entity/relationship graph, commitments, memory, approvals, goals, audit.
 version: 1.0.0
-capabilities: [person-cli, safe-run]
+capabilities: [person, safe-run]
 ---
 
 # Person Service

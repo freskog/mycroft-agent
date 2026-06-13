@@ -3,6 +3,7 @@ package dev.freskog.agent.person.api
 import dev.freskog.agent.common._
 import dev.freskog.agent.common.JsonCodecs._
 import dev.freskog.agent.person.domain._
+import dev.freskog.agent.person.gmail.GmailConfig
 import dev.freskog.agent.person.service.PersonService
 
 import zio._
@@ -293,6 +294,42 @@ object Routes {
       Method.POST / "gmail" / "oauth" / "exchange" -> handler { (req: Request) =>
         handlePost[GmailOAuthExchangeRequest, GmailCredentialSummary](req)(service.gmailOAuthExchange)
       },
+      // Consent URL for the dedicated send-only sender account (briefings send as it).
+      Method.GET / "gmail" / "sender-auth-url" -> handler { (req: Request) =>
+        queryParam(req, "owner") match {
+          case None    => ZIO.succeed(errorToResponse(AgentError.BadRequest("owner is required")))
+          case Some(o) => handleGet(service.senderAuthUrl(PersonId(o)))
+        }
+      },
+      // Operator-facing OAuth redirect target. Google sends the human's browser
+      // here after consent; person-service completes the exchange itself, so the
+      // agent is never involved (and no localhost socket is bound in the sandbox).
+      // `state` carries the owner (set by gmailAuthUrl); `redirectUri` in the
+      // request is unused — the exchange uses the configured GMAIL_REDIRECT_URI.
+      Method.GET / "gmail" / "oauth" / "callback" -> handler { (req: Request) =>
+        (queryParam(req, "error"), queryParam(req, "code"), queryParam(req, "state")) match {
+          case (Some(err), _, _) =>
+            ZIO.succeed(htmlResponse(oauthPage("Gmail authorization failed", err), Status.BadRequest))
+          // The dedicated sender consent carries `state = SenderStatePrefix + ownerId`.
+          case (None, Some(code), Some(st)) if st.startsWith(GmailConfig.SenderStatePrefix) =>
+            val owner = st.drop(GmailConfig.SenderStatePrefix.length)
+            service.senderOAuthExchange(PersonId(owner), code).foldZIO(
+              e => failed(e).map(_ => htmlResponse(oauthPage("Sender authorization failed", e.message), statusOf(e))),
+              summary =>
+                ZIO.succeed(htmlResponse(oauthPage("Sender connected", s"Briefings for ${summary.ownerPersonId.value} will send as ${summary.accountEmail}. You can close this tab.")))
+            )
+          case (None, Some(code), Some(owner)) =>
+            service
+              .gmailOAuthExchange(GmailOAuthExchangeRequest(PersonId(owner), code, ""))
+              .foldZIO(
+                e => failed(e).map(_ => htmlResponse(oauthPage("Gmail authorization failed", e.message), statusOf(e))),
+                summary =>
+                  ZIO.succeed(htmlResponse(oauthPage("Gmail connected", s"Connected ${summary.accountEmail} for ${summary.ownerPersonId.value}. You can close this tab.")))
+              )
+          case _ =>
+            ZIO.succeed(htmlResponse(oauthPage("Gmail authorization failed", "missing code or state"), Status.BadRequest))
+        }
+      },
       Method.POST / "gmail" / "sync" -> handler { (req: Request) =>
         queryParam(req, "owner") match {
           case None => ZIO.succeed(errorToResponse(AgentError.BadRequest("owner is required")))
@@ -321,6 +358,23 @@ object Routes {
       Method.GET / "inbox" / string("id") / "attachments" / string("attachmentId") -> handler {
         (id: String, attachmentId: String, _: Request) =>
           handleGet(service.downloadAttachment(InboxMessageId(id), attachmentId))
+      },
+      // Raw attachment bytes (base64-decoded server-side) so the thin `person`
+      // script can `curl -o` straight to a file — no base64 handling in bash.
+      Method.GET / "inbox" / string("id") / "attachments" / string("attachmentId") / "raw" -> handler {
+        (id: String, attachmentId: String, _: Request) =>
+          service.downloadAttachment(InboxMessageId(id), attachmentId).foldZIO(
+            failed,
+            dl => ZIO.attempt(java.util.Base64.getDecoder.decode(dl.dataBase64)).foldZIO(
+              t => failed(AgentError.Bug(s"decoding attachment $attachmentId: ${Option(t.getMessage).getOrElse("error")}")),
+              bytes =>
+                ZIO.succeed(
+                  Response(body = Body.fromArray(bytes))
+                    .addHeader(Header.ContentType(MediaType.forContentType(dl.mimeType).getOrElse(MediaType.application.`octet-stream`)))
+                    .addHeader("Content-Disposition", s"""attachment; filename="${dl.filename.replaceAll("[\"\\r\\n]", "_")}"""")
+                )
+            )
+          )
       },
       Method.POST / "inbox" / string("id") / "skip" -> handler { (id: String, _: Request) =>
         handleGet(service.skipInbox(InboxMessageId(id)))
@@ -355,6 +409,42 @@ object Routes {
         queryParam(req, "owner") match {
           case None    => ZIO.succeed(errorToResponse(AgentError.BadRequest("owner is required")))
           case Some(o) => handleGet(service.listCalendars(PersonId(o)))
+        }
+      },
+
+      // Direct calendar event creation ([M]-marked, idempotent — no approval).
+      Method.POST / "calendar" / "events" -> handler { (req: Request) =>
+        handlePost[CalendarCreateEventRequest, CalendarEvent](req)(service.createCalendarEventDirect)
+      },
+
+      // --- projection sync (poller-driven infrastructure) ---
+      Method.POST / "tasks" / "sync" -> handler { (req: Request) =>
+        queryParam(req, "owner") match {
+          case None    => ZIO.succeed(errorToResponse(AgentError.BadRequest("owner is required")))
+          case Some(o) => handleGet(service.syncTasks(PersonId(o)))
+        }
+      },
+      Method.POST / "calendar" / "sync" -> handler { (req: Request) =>
+        queryParam(req, "owner") match {
+          case None    => ZIO.succeed(errorToResponse(AgentError.BadRequest("owner is required")))
+          case Some(o) => handleGet(service.syncCalendar(PersonId(o)))
+        }
+      },
+
+      // --- daily briefing (agent submits; person-service delivers) ---
+      Method.POST / "briefing" -> handler { (req: Request) =>
+        handlePost[SubmitBriefingRequest, Briefing](req)(service.submitBriefing)
+      },
+      Method.POST / "briefing" / "run" -> handler { (req: Request) =>
+        queryParam(req, "owner") match {
+          case None    => ZIO.succeed(errorToResponse(AgentError.BadRequest("owner is required")))
+          case Some(o) => handleGet(service.runDailyBriefing(PersonId(o)).as(Map("status" -> "ok")))
+        }
+      },
+      Method.POST / "briefing" / "deliver" -> handler { (req: Request) =>
+        queryParam(req, "owner") match {
+          case None    => ZIO.succeed(errorToResponse(AgentError.BadRequest("owner is required")))
+          case Some(o) => handleGet(service.deliverPending(PersonId(o)).map(n => Map("delivered" -> n)))
         }
       }
     )
@@ -453,6 +543,17 @@ object Routes {
   /** Map an `AgentError` to an HTTP response with a structured JSON body. */
   private def errorToResponse(e: AgentError): Response =
     Response.json(e.toJson).status(statusOf(e))
+
+  /** A minimal text/html response for the operator-facing OAuth callback (the one
+   *  place person-service talks to a human's browser rather than to JSON clients). */
+  private def htmlResponse(body: String, status: Status = Status.Ok): Response =
+    Response(status = status, body = Body.fromString(body, StandardCharsets.UTF_8))
+      .addHeader(Header.ContentType(MediaType.text.html))
+
+  private def oauthPage(heading: String, detail: String): String =
+    s"<!doctype html><html><head><meta charset=\"utf-8\"><title>$heading</title></head>" +
+      s"<body style=\"font-family:sans-serif;max-width:32rem;margin:4rem auto\">" +
+      s"<h2>$heading</h2><p>$detail</p></body></html>"
 
   /** Log an error (5xx at error level so it surfaces in container logs, 4xx at
    *  info) and produce the corresponding response. Use this on the error branch

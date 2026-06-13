@@ -23,18 +23,27 @@ object GmailOAuth {
 
   final case class UserInfo(email: String)
 
-  def authUrl(settings: GmailConfig.Settings, state: String): String = {
+  def authUrl(settings: GmailConfig.Settings, state: String, scopes: String = GmailConfig.RequestedScopes): String = {
     val params = List(
       "client_id"     -> settings.clientId,
       "redirect_uri"  -> settings.redirectUri,
       "response_type" -> "code",
-      "scope"         -> GmailConfig.RequestedScopes,
+      "scope"         -> scopes,
       "access_type"   -> "offline",
       "prompt"        -> "consent",
       "state"         -> state
     )
     params.map { case (k, v) => s"$k=${encode(v)}" }.mkString(GmailConfig.AuthEndpoint + "?", "&", "")
   }
+
+  /** The authenticated account's email via the OpenID userinfo endpoint (works with
+   *  the `userinfo.email` scope — the Gmail profile endpoint needs a Gmail scope the
+   *  send-only sender credential doesn't have). */
+  def fetchAccountEmail(accessToken: String): IO[AgentError, UserInfo] =
+    getJson(GmailConfig.UserinfoEndpoint, accessToken).flatMap { json =>
+      ZIO.fromEither(strField(json, "email"))
+        .mapBoth(_ => AgentError.DecodeFailed("userinfo missing email"), UserInfo)
+    }
 
   def exchangeCode(settings: GmailConfig.Settings, code: String): IO[AgentError, TokenResponse] =
     postForm(

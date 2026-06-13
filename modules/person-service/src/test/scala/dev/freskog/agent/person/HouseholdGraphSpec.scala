@@ -52,6 +52,8 @@ object HouseholdGraphSpec extends ZIOSpecDefault {
           Repos.sqliteMessageRepo(db),
           Repos.sqliteCredentialRepo(db),
           Repos.sqliteInboxMessageRepo(db),
+          Repos.sqliteCalendarEventRepo(db),
+          Repos.sqliteBriefingRepo(db),
           hub
         )
         result  <- f(service)

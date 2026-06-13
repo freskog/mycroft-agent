@@ -9,7 +9,7 @@ A harness-neutral safe execution and personal authority substrate for local AI a
 | `safe-run` | Command wrapper: output mediation, logging, timeout, JSON results |
 | `runlog` | Log inspection CLI: head, tail, grep, range over command outputs |
 | `person-service` | Trusted sidecar: personal/family state, approvals, credentials, goals |
-| `person-cli` | Sandbox-safe CLI client for person-service |
+| `scripts/person` | Sandbox-safe `person` CLI — a thin `curl`/`jq` script (not a module) hitting person-service over HTTP |
 | `runtime` | Skill catalogue: `skill list`, `skill search`, `skill show` over filesystem-backed skills |
 | `mycroft` | Local-LLM agent harness: `POST /inbound` + `GET /outbound/stream` (SSE), native OpenAI tool calls, conversation state in person-service |
 | `mycroft-repl` | Thin REPL channel adapter speaking mycroft's wire protocol (stand-in for a future WhatsApp/Signal gateway) |
@@ -46,7 +46,6 @@ The module → output mapping is:
 |-----------------|---------------------------|-----------------------------------------------------|
 | `safe-run`      | `safeRun/nativeImage`     | `modules/safe-run/target/native-image/safe-run`     |
 | `runlog`        | `runlog/nativeImage`      | `modules/runlog/target/native-image/runlog`         |
-| `person-cli`    | `personCli/nativeImage`   | `modules/person-cli/target/native-image/person-cli` |
 | `person-service`| `personService/nativeImage` | `modules/person-service/target/native-image/person-service` |
 | `runtime`       | `runtime/nativeImage`     | `modules/runtime/target/native-image/runtime`       |
 | `mycroft`       | `mycroft/nativeImage`     | `modules/mycroft/target/native-image/mycroft`       |
@@ -82,20 +81,25 @@ sbt "safeRun/run --cwd /tmp --timeout 30 --shell bash -- echo hello"
 
 ### Run person CLI
 
+The `person` verbs are a thin `curl`/`jq` script (`scripts/person`) — no build
+step. Point it at a running person-service via `PERSON_SERVICE_URL` (default
+`http://127.0.0.1:8080`):
+
 ```bash
-sbt "personCli/run health"
-sbt 'personCli/run commitment record --owner fred --text "Send Graham the deck" --source email:gmail-msg-1 --evidence "by Friday"'  # gateless: live as `open`
-sbt "personCli/run commitment list --owner fred --status open"
-sbt "personCli/run commitment done <id>"   # done | ignore | cancel
+export PERSON_SERVICE_URL=http://localhost:8080
+./scripts/person health
+./scripts/person commitment record --owner fred --text "Send Graham the deck" --source email:gmail-msg-1 --evidence "by Friday"  # gateless: live as `open`
+./scripts/person commitment list --owner fred --status open
+./scripts/person commitment done <id>   # done | ignore | cancel
 # Goal creation is hard-gated: `goal request` creates a goal.create approval; the
 # goal exists only after a human approves it. (There is no `goal record`/`goal propose`.)
-sbt 'personCli/run goal request --owner fred --title "Approve Q3 report" --outcome "..." --evidence-rule "..." --channel fred'
-sbt "personCli/run goal list --owner fred --status open"
-sbt 'personCli/run memory search "morning meetings" --person fred'
-sbt "personCli/run memory context --person fred"
-sbt "personCli/run memory profile --limit 50"
-sbt 'personCli/run event record --action note.preference --category session_note --text "Fred mentioned morning meetings" --source chat'
-sbt "personCli/run memory consolidate"
+./scripts/person goal request --owner fred --title "Approve Q3 report" --outcome "..." --evidence-rule "..." --channel fred
+./scripts/person goal list --owner fred --status open
+./scripts/person memory search "morning meetings" --person fred
+./scripts/person memory context --person fred
+./scripts/person memory profile --limit 50
+./scripts/person event record --action note.preference --category session_note --text "Fred mentioned morning meetings" --source chat
+./scripts/person memory consolidate
 ```
 
 Durable state is one shared household store keyed by `person` and `entity` — there
@@ -110,14 +114,14 @@ reasoning but never silently authoritative. Build the household graph (persons,
 entities, typed relationships) with:
 
 ```bash
-sbt "personCli/run person list"
-sbt 'personCli/run person create --id liam --display-name "Liam" --timezone Europe/Dublin --locale en-IE'
-sbt 'personCli/run entity record --kind organization --name "MegaCorp" --source onboarding:work'  # live immediately
-sbt "personCli/run entity list --status accepted"
-sbt "personCli/run entity resolve megacorp"
-sbt 'personCli/run relationship record --from fred --from-kind person --type employed_by --to <entity-id> --to-kind entity --source onboarding:work --valid-from 2024-01-01T00:00:00Z'
-sbt "personCli/run relationship list --from fred --type employed_by"
-sbt "personCli/run household"   # accepted, currently-active graph
+./scripts/person person list
+./scripts/person person create --id liam --display-name "Liam" --timezone Europe/Dublin --locale en-IE
+./scripts/person entity record --kind organization --name "MegaCorp" --source onboarding:work  # live immediately
+./scripts/person entity list --status accepted
+./scripts/person entity resolve megacorp
+./scripts/person relationship record --from fred --from-kind person --type employed_by --to <entity-id> --to-kind entity --source onboarding:work --valid-from 2024-01-01T00:00:00Z
+./scripts/person relationship list --from fred --type employed_by
+./scripts/person household   # accepted, currently-active graph
 ```
 
 ### Human-in-the-loop approvals
@@ -131,8 +135,8 @@ agent-readable surface).
 
 ```bash
 # agent side (request only):
-sbt 'personCli/run approval request --action-type calendar.create_event --payload-json "{...}" --required-person fred --channel fred'
-sbt "personCli/run approval list --status requested"   # read-only; no code shown
+./scripts/person approval request --action-type calendar.create_event --payload-json "{...}" --required-person fred --channel fred
+./scripts/person approval list --status requested   # read-only; no code shown
 # (no approve/reject verb exists on the agent CLI — deciding is the human's act)
 ```
 
@@ -204,32 +208,43 @@ curl -X POST localhost:8090/inbound \
 3. Or set `GMAIL_CLIENT_SECRET_FILE=/path/to/client-secret.json`.
 
 **Scopes** are not stored in the client secret. They are requested at auth time
-(`gmail.readonly` **and** `calendar.readonly` — one consent covers both) and must be
+(`gmail.modify` **and** `calendar.events` — one consent covers both) and must be
 allowed on your OAuth consent screen in Google Cloud. Adding scopes in the Cloud
 Console after creating the client is fine — no secret edit needed. If you authed
-before calendar was added, re-run `person google auth` to grant the calendar scope.
+before calendar was added, re-run the auth flow to grant the calendar scope.
 
-**Redirect URI:** `person google auth` uses `http://localhost:8765/oauth/callback` by default.
-Add that exact URI under your OAuth client's authorized redirect URIs (desktop apps support this).
+**Authorization is operator-driven and completed server-side** — there is no agent
+auth verb. person-service builds the consent URL and hosts the redirect target
+(`GET /gmail/oauth/callback`), which exchanges the code and stores the tokens.
 
-One-time OAuth:
+**Redirect URI:** set `GMAIL_REDIRECT_URI` to person-service's callback (default
+`http://localhost:8080/gmail/oauth/callback`; the compose stack uses
+`http://localhost:8081/gmail/oauth/callback` via the published port). Add that exact
+URI under your OAuth client's authorized redirect URIs in Google Cloud.
+
+One-time OAuth (operator, in a browser):
 
 ```bash
-sbt "personService/run"   # terminal 1
+sbt "personService/run"   # terminal 1 (or: docker compose up person-service)
 
-sbt 'personCli/run google auth --owner fred'   # terminal 2 — opens browser
-sbt 'personCli/run gmail sync --owner fred'
-sbt 'personCli/run inbox list --owner fred --status pending'
-sbt 'personCli/run inbox show <inbox-id>'     # body + headers + attachment metadata
+# terminal 2 — get the consent URL and open it in a browser:
+curl -s "http://localhost:8080/gmail/auth-url?owner=fred" | jq -r .url
+# …complete consent; Google redirects to person-service, which stores the tokens.
+
+# then pull mail and triage with the person script:
+export PERSON_SERVICE_URL=http://localhost:8080
+./scripts/person gmail sync --owner fred
+./scripts/person inbox list --owner fred --status pending
+./scripts/person inbox show <inbox-id>     # body + headers + attachment metadata
 ```
 
 Attachments are synced as metadata only (filename, mimeType, size, attachmentId);
 their bytes are fetched on demand and written to disk for the agent to read:
 
 ```bash
-sbt 'personCli/run inbox download <inbox-id> --out /tmp/attachments'
+./scripts/person inbox download <inbox-id> --out /tmp/attachments
 # or just one attachment:
-sbt 'personCli/run inbox download <inbox-id> --out /tmp/attachments --attachment <attachmentId>'
+./scripts/person inbox download <inbox-id> --out /tmp/attachments --attachment <attachmentId>
 ```
 
 From the REPL, run `/triage` to sync Gmail, fetch pending messages, and start a Mycroft triage turn:
@@ -248,14 +263,14 @@ docker compose --profile inbox-sync up inbox-sync
 
 ### Calendar (read-only)
 
-The same Google authorization also grants `calendar.readonly`, so once you've run
-`person google auth` you can read the owner's primary calendar. It's on-demand
+The same Google authorization also grants calendar access, so once you've completed
+the OAuth flow you can read the owner's primary calendar. It's on-demand
 (no sync/cache in Phase 1):
 
 ```bash
-sbt 'personCli/run calendar agenda --owner fred --days 7'
+./scripts/person calendar agenda --owner fred --days 7
 # explicit window:
-sbt 'personCli/run calendar agenda --owner fred --from 2026-06-10T00:00:00Z --to 2026-06-20T00:00:00Z'
+./scripts/person calendar agenda --owner fred --from 2026-06-10T00:00:00Z --to 2026-06-20T00:00:00Z
 ```
 
 Triage uses this to ground dated items ("already on the calendar" / conflicts).
@@ -263,10 +278,10 @@ Triage uses this to ground dated items ("already on the calendar" / conflicts).
 **Writing events** is the agent's first outside-effect action, gated by HITL:
 ```bash
 # proposes a calendar.create_event approval; a human approves, then it's written.
-sbt 'personCli/run calendar create --owner fred --summary "Parents evening" --start 2026-06-20T17:00:00Z --end 2026-06-20T18:00:00Z'
+./scripts/person calendar create --owner fred --summary "Parents evening" --start 2026-06-20T17:00:00Z --end 2026-06-20T18:00:00Z
 ```
-This needs the `calendar.events` scope, so re-run `person google auth --owner fred`
-once (the consent now covers calendar write) after upgrading.
+This needs the `calendar.events` scope, so re-run the Gmail OAuth flow once (the
+consent now covers calendar write) after upgrading.
 
 ## Architecture
 

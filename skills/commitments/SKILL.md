@@ -2,7 +2,7 @@
 name: commitments
 description: Record and list durable obligations (commitments) for people via the person-service.
 version: 2.0.0
-capabilities: [person-cli, safe-run]
+capabilities: [person, safe-run]
 ---
 
 # Commitment Tracking
@@ -12,6 +12,8 @@ capabilities: [person-cli, safe-run]
 Track obligations and open loops for people. Commitments are the source of truth for what someone needs to do. Calendar events and reminders are future projections from commitments, not the source of truth.
 
 Commitments are **gateless**: recording one writes it live as `open` (tracked) and is reversible (`done` / `ignore` / `cancel`). There is no accept step. `open` means *tracked*, **not** that the person has agreed to do it.
+
+**Google Tasks is the view, not the store.** person-service projects each open commitment to the owner's Google Tasks, and syncs status/due back — ticking it off on the phone marks the commitment `done`, and a task the user adds directly in Google appears here as a commitment. You **always** read and write through `person commitment …`, **never** the Tasks API; the projection is automatic infrastructure you don't invoke. A dateless todo lives here as a commitment with no `--due` and still shows up in Google Tasks.
 
 ## Commands
 

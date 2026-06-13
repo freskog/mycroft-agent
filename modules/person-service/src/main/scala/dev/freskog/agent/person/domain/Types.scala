@@ -22,9 +22,12 @@ case class CalendarCreateEventRequest(
   allDay: Boolean = false,
   location: Option[String] = None,
   description: Option[String] = None,
-  // Target calendar. The AGENT leaves this unset — it cannot pick a calendar; the
-  // human's chosen HITL option injects it at approval time. Unset → "primary".
-  calendarId: Option[String] = None
+  // Target calendar. Unset → "primary".
+  calendarId: Option[String] = None,
+  // Idempotency key (e.g. `email:gmail-msg-X#dentist`). Creation is direct (no
+  // approval), so a stable source lets a retrying agent re-create the same event
+  // without duplicating — person-service dedups on (owner, source).
+  source: Option[String] = None
 )
 object CalendarCreateEventRequest {
   implicit val codec: JsonCodec[CalendarCreateEventRequest] = DeriveJsonCodec.gen[CalendarCreateEventRequest]
@@ -281,6 +284,32 @@ object GmailCredentialSummary {
 case class GmailSyncResult(fetched: Int, inserted: Int, pending: Int)
 object GmailSyncResult {
   implicit val codec: JsonCodec[GmailSyncResult] = DeriveJsonCodec.gen[GmailSyncResult]
+}
+
+/** Outcome of one commitments ↔ Google Tasks sync. `pushed` = commitments
+ *  projected/updated to Tasks; `pulled` = commitments updated from a Google-side
+ *  change (completed / due); `imported` = user-created tasks pulled in as new
+ *  commitments. */
+case class TaskSyncResult(pushed: Int, pulled: Int, imported: Int)
+object TaskSyncResult {
+  implicit val codec: JsonCodec[TaskSyncResult] = DeriveJsonCodec.gen[TaskSyncResult]
+}
+
+/** The agent submits a composed daily briefing (its only briefing action — there
+ *  is no send/email tool in the sandbox). person-service stores it and delivers it
+ *  on the owner's configured channel. */
+case class SubmitBriefingRequest(ownerPersonId: PersonId, subject: String, body: String)
+object SubmitBriefingRequest {
+  implicit val codec: JsonCodec[SubmitBriefingRequest] = DeriveJsonCodec.gen[SubmitBriefingRequest]
+}
+
+/** Outcome of one Google Calendar → substrate mirror sync. `imported` = events new
+ *  to the local mirror; `updated` = events whose time/summary/status changed in
+ *  Google; `cancelled` = previously-mirrored events no longer present (removed in
+ *  Google). */
+case class CalendarSyncResult(imported: Int, updated: Int, cancelled: Int)
+object CalendarSyncResult {
+  implicit val codec: JsonCodec[CalendarSyncResult] = DeriveJsonCodec.gen[CalendarSyncResult]
 }
 
 case class MarkInboxTriagedRequest(sourceEventId: Option[EventId] = None)

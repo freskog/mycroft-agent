@@ -62,6 +62,8 @@ object Main extends ZIOAppDefault {
           Repos.sqliteMessageRepo(db),
           Repos.sqliteCredentialRepo(db),
           Repos.sqliteInboxMessageRepo(db),
+          Repos.sqliteCalendarEventRepo(db),
+          Repos.sqliteBriefingRepo(db),
           approvalHub,
           codeTtl
         )

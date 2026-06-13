@@ -2,7 +2,7 @@
 name: events
 description: Episodic event log — record observations, utterances, decisions, and session notes that feed memory consolidation and provenance.
 version: 1.0.0
-capabilities: [person-cli, safe-run]
+capabilities: [person, safe-run]
 ---
 
 # Events

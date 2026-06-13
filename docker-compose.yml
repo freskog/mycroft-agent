@@ -35,21 +35,37 @@ services:
       PERSON_SERVICE_DB:   "/state/person.sqlite"
       PERSON_SERVICE_SEED: "true"
       GMAIL_CLIENT_SECRET_FILE: "/run/client-secret.json"
+      # Server-side OAuth completion: Google redirects the operator's browser here
+      # (via the host-published 8081 port). Must be registered in the Google Cloud
+      # console as an authorized redirect URI.
+      GMAIL_REDIRECT_URI: "http://localhost:8081/gmail/oauth/callback"
       # Decision endpoint bound to the approvalnet interface only — unreachable
       # from agentnet (where mycroft lives), so a compromised agent cannot decide.
       PERSON_SERVICE_PRIVATE_HOST: "172.31.7.2"
       PERSON_SERVICE_PRIVATE_PORT: "8090"
+      # Used to trigger the agent to compose the daily briefing (person-service →
+      # mycroft /inbound). person-service is the trusted sidecar; this is internal.
+      MYCROFT_URL: "http://mycroft:8090"
+      # Local hour (in each owner's own timezone, DST-correct) to send the daily
+      # briefing. person-service owns this schedule; the poller just checks in.
+      BRIEFING_HOUR: "7"
     volumes:
       - person-state:/state
       - ./modules/person-service/src/main/resources/client-secret.json:/run/client-secret.json:ro
     networks:
+      # agentnet: reached by mycroft/repl. egressnet: outbound to Google APIs +
+      # the host-published port (agentnet is internal and cannot publish ports).
+      # approvalnet: the private decision interface.
       agentnet: {}
+      egressnet: {}
       approvalnet:
         ipv4_address: 172.31.7.2
     ports: ["8081:8080"]
 
-  # Local-LLM agent harness. Talks to person-service on the internal network
-  # and to LM Studio at MYCROFT_LM_STUDIO_URL (default Fred's mac mini).
+  # Local-LLM agent harness. Lives ONLY on the internal agentnet (no internet of
+  # its own). It reaches person-service directly, and the LLM only through
+  # llm-proxy — the single controlled egress path. `person` calls from safe_run
+  # need PERSON_SERVICE_URL in mycroft's env so the subprocess inherits it.
   mycroft:
     image: personal-agent:native
     command: ["mycroft"]
@@ -57,7 +73,7 @@ services:
       MYCROFT_HOST:             "0.0.0.0"
       MYCROFT_PORT:             "8090"
       PERSON_SERVICE_URL:       "http://person-service:8080"
-      MYCROFT_LM_STUDIO_URL:    "http://fredriks-mac-mini.gledswood.org:1234"
+      MYCROFT_LM_STUDIO_URL:    "http://llm-proxy:1234"
       MYCROFT_DEFAULT_MODEL:    "Qwen3.6-35B-A3B-4bit"
       MYCROFT_DEFAULT_REASONING: "reason"
       MYCROFT_TIMEZONE:         "Europe/Dublin"
@@ -72,9 +88,13 @@ services:
       - ./skills:/workspace/skills:ro
     depends_on:
       - person-service
+      - llm-proxy
     networks:
       - agentnet
-    ports: ["8090:8090"]
+    # No host port: agentnet is internal (cannot publish), and mycroft is the
+    # untrusted-content component we are deliberately keeping off the host network.
+    # The repl (entry point, on agentnet) reaches it internally; for host debugging
+    # use `docker compose exec mycroft …`.
     # Hardening: mycroft is the component exposed to untrusted content (email/web),
     # so shrink what a hijacked agent can do at the OS level. cap_drop ALL also
     # prevents remounting the read-only skills bind. (Next step, needs a non-root
@@ -84,6 +104,21 @@ services:
       - ALL
     security_opt:
       - "no-new-privileges:true"
+
+  # Single-upstream egress proxy for the LLM. mycroft has no internet route; this
+  # is the ONLY way it reaches the inference endpoint. socat forwards 1234 to one
+  # fixed destination and nowhere else, so even a hijacked agent pointing arbitrary
+  # traffic at llm-proxy:1234 only ever reaches the configured LLM. Override the
+  # upstream with LLM_UPSTREAM=host:port (default: Fred's mac mini).
+  llm-proxy:
+    image: alpine/socat:1.8.0.0
+    command:
+      - "TCP-LISTEN:1234,fork,reuseaddr"
+      - "TCP:${LLM_UPSTREAM:-fredriks-mac-mini.gledswood.org:1234}"
+    networks:
+      - agentnet
+      - egressnet
+    restart: unless-stopped
 
   # REPL channel adapter (interactive). Runs on a JVM (JLine terminal UI), not
   # native — it is started once and latency does not matter. Build once with
@@ -108,6 +143,46 @@ services:
       approvalnet: {}
     stdin_open: true
     tty: true
+
+  # Optional: keep Google Tasks/Calendar in sync with the substrate (commitments
+  # → Tasks projection + bounded sync-back; Calendar → local mirror). person-service
+  # does the work; this only triggers it on a timer. Needs the re-consented Google
+  # grant (tasks + calendar.readonly scopes).
+  projection-sync:
+    image: curlimages/curl:8.12.1
+    entrypoint: ["/bin/sh", "/scripts/projection-poll.sh"]
+    environment:
+      PERSON_SERVICE_URL: "http://person-service:8080"
+      SYNC_OWNER:         "fred"
+      SYNC_POLL_INTERVAL_SEC: "300"
+    volumes:
+      - ./scripts/projection-poll.sh:/scripts/projection-poll.sh:ro
+    depends_on:
+      - person-service
+    networks:
+      - agentnet
+    profiles:
+      - projection-sync
+
+  # Optional: daily briefing scheduler. Once a day it asks person-service to sync +
+  # trigger the agent to compose; person-service delivers (email-to-self for now).
+  # The agent composes only — it never sends.
+  daily-briefing:
+    image: curlimages/curl:8.12.1
+    entrypoint: ["/bin/sh", "/scripts/briefing-poll.sh"]
+    environment:
+      PERSON_SERVICE_URL: "http://person-service:8080"
+      BRIEFING_OWNER:     "fred"
+      # No TZ/hour here — person-service gates the time in the owner's timezone.
+    volumes:
+      - ./scripts/briefing-poll.sh:/scripts/briefing-poll.sh:ro
+    depends_on:
+      - person-service
+      - mycroft
+    networks:
+      - agentnet
+    profiles:
+      - daily-briefing
 
   # Optional: poll Gmail and auto-trigger triage (Phase 3). Requires GMAIL_* env on person-service.
   inbox-sync:
@@ -135,8 +210,18 @@ volumes:
   person-state:
 
 networks:
-  # Agent plane: mycroft, person-service (public), and the repl all see each other.
+  # Agent plane: mycroft, person-service (public), llm-proxy, and the repl all see
+  # each other. `internal: true` removes the route off the host entirely — there is
+  # NO gateway/NAT — so a hijacked agent cannot reach the internet with ANY binary
+  # (curl, python, bash). The only outside destinations the agent can reach are the
+  # ones bridged for it: person-service (its API) and llm-proxy (the LLM upstream).
   agentnet:
+    driver: bridge
+    internal: true
+  # Egress plane: the two components that legitimately need the outside world —
+  # person-service (Google APIs) and llm-proxy (the off-host LLM). mycroft is NOT
+  # here, so it has no internet path of its own; it must go through these services.
+  egressnet:
     driver: bridge
   # Approval plane: ONLY the repl (channel client) and person-service. mycroft is
   # absent, so the agent has no route to the private decision endpoint. The static

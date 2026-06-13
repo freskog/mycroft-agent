@@ -32,7 +32,7 @@ object ApprovalSpec extends ZIOSpecDefault {
           Repos.sqliteApprovalRepo(db), Repos.sqliteAuditRepo(db), Repos.sqliteGoalRepo(db),
           Repos.sqliteGoalEvidenceRepo(db), Repos.sqliteEntityRepo(db), Repos.sqliteRelationshipRepo(db),
           Repos.sqliteChannelRepo(db), Repos.sqliteChannelMemberRepo(db), Repos.sqliteMessageRepo(db),
-          Repos.sqliteCredentialRepo(db), Repos.sqliteInboxMessageRepo(db), hub, codeTtl
+          Repos.sqliteCredentialRepo(db), Repos.sqliteInboxMessageRepo(db), Repos.sqliteCalendarEventRepo(db), Repos.sqliteBriefingRepo(db), hub, codeTtl
         )
         result  <- f(service)
       } yield result
@@ -71,7 +71,7 @@ object ApprovalSpec extends ZIOSpecDefault {
           approvalRepo, Repos.sqliteAuditRepo(db), Repos.sqliteGoalRepo(db),
           Repos.sqliteGoalEvidenceRepo(db), Repos.sqliteEntityRepo(db), Repos.sqliteRelationshipRepo(db),
           Repos.sqliteChannelRepo(db), Repos.sqliteChannelMemberRepo(db), Repos.sqliteMessageRepo(db),
-          Repos.sqliteCredentialRepo(db), Repos.sqliteInboxMessageRepo(db), hub
+          Repos.sqliteCredentialRepo(db), Repos.sqliteInboxMessageRepo(db), Repos.sqliteCalendarEventRepo(db), Repos.sqliteBriefingRepo(db), hub
         )
         result  <- f(service, approvalRepo)
       } yield result
@@ -240,7 +240,7 @@ object ApprovalSpec extends ZIOSpecDefault {
             Repos.sqliteApprovalRepo(db), Repos.sqliteAuditRepo(db), Repos.sqliteGoalRepo(db),
             Repos.sqliteGoalEvidenceRepo(db), Repos.sqliteEntityRepo(db), Repos.sqliteRelationshipRepo(db),
             Repos.sqliteChannelRepo(db), Repos.sqliteChannelMemberRepo(db), Repos.sqliteMessageRepo(db),
-            Repos.sqliteCredentialRepo(db), Repos.sqliteInboxMessageRepo(db), hub
+            Repos.sqliteCredentialRepo(db), Repos.sqliteInboxMessageRepo(db), Repos.sqliteCalendarEventRepo(db), Repos.sqliteBriefingRepo(db), hub
           )
           sub     <- hub.subscribe
           a       <- svc.requestApproval(ping("""{"n":5}"""))
@@ -338,7 +338,7 @@ object ApprovalSpec extends ZIOSpecDefault {
             Repos.sqliteApprovalRepo(db), Repos.sqliteAuditRepo(db), Repos.sqliteGoalRepo(db),
             Repos.sqliteGoalEvidenceRepo(db), Repos.sqliteEntityRepo(db), Repos.sqliteRelationshipRepo(db),
             Repos.sqliteChannelRepo(db), Repos.sqliteChannelMemberRepo(db), Repos.sqliteMessageRepo(db),
-            Repos.sqliteCredentialRepo(db), Repos.sqliteInboxMessageRepo(db), hub
+            Repos.sqliteCredentialRepo(db), Repos.sqliteInboxMessageRepo(db), Repos.sqliteCalendarEventRepo(db), Repos.sqliteBriefingRepo(db), hub
           )
           sub     <- hub.subscribe
           a       <- svc.requestApproval(ping("""{"n":7}"""))

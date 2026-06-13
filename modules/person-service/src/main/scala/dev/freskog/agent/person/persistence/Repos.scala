@@ -23,6 +23,54 @@ trait CommitmentRepo {
   def findById(id: CommitmentId): IO[AgentError, Option[Commitment]]
   def updateContent(id: CommitmentId, text: String, evidence: String, dueAt: Option[Instant], updatedAt: Instant): IO[AgentError, Unit]
   def updateStatus(id: CommitmentId, status: CommitmentStatus, updatedAt: Instant): IO[AgentError, Unit]
+
+  // --- Google Tasks projection bookkeeping (persistence-only; not on the model) ---
+  /** Commitments for an owner that are out of sync with Google Tasks: not yet
+   *  projected, or changed since the last push (`updated_at` newer than
+   *  `projected_at`). The sync layer decides insert vs patch vs complete. */
+  def findForTaskSync(ownerPersonId: PersonId): IO[AgentError, List[CommitmentSync]]
+  def findByGoogleTaskId(googleTaskId: String): IO[AgentError, Option[Commitment]]
+  def setTaskMapping(id: CommitmentId, googleTaskListId: String, googleTaskId: String, projectedAt: Instant): IO[AgentError, Unit]
+  def markProjected(id: CommitmentId, projectedAt: Instant): IO[AgentError, Unit]
+}
+
+/** A commitment plus its Google Tasks projection state (persistence-internal). */
+final case class CommitmentSync(
+  commitment: Commitment,
+  googleTaskListId: Option[String],
+  googleTaskId: Option[String],
+  projectedAt: Option[Instant]
+)
+
+/** Local mirror of the owner's Google Calendar events — the substrate's event
+ *  store, kept in sync by `syncCalendar`. Keyed by (owner, calendar, externalId). */
+trait CalendarEventRepo {
+  /** Upsert a mirrored event. `source` is the agent's idempotency key (set only on
+   *  direct create; sync passes None and the existing source is preserved). */
+  def upsert(ownerPersonId: PersonId, e: CalendarEvent, syncedAt: Instant, source: Option[String] = None): IO[AgentError, Unit]
+  def find(ownerPersonId: PersonId, calendarId: String, externalId: String): IO[AgentError, Option[CalendarEvent]]
+  /** Dedup lookups for direct create: by the agent's `source` key, or by a
+   *  (summary, start) signature when no source was supplied. Non-cancelled only. */
+  def findBySource(ownerPersonId: PersonId, source: String): IO[AgentError, Option[CalendarEvent]]
+  def findBySignature(ownerPersonId: PersonId, summary: String, startAt: Instant): IO[AgentError, Option[CalendarEvent]]
+  def findWindow(ownerPersonId: PersonId, timeMin: Instant, timeMax: Instant): IO[AgentError, List[CalendarEvent]]
+  def countForOwner(ownerPersonId: PersonId): IO[AgentError, Int]
+  /** Mark in-window mirrored events not refreshed by the latest sync as cancelled
+   *  (they vanished from Google); returns their (calendarId, externalId, summary). */
+  def cancelStaleInWindow(ownerPersonId: PersonId, syncedBefore: Instant, timeMin: Instant, timeMax: Instant): IO[AgentError, List[(String, String, String)]]
+}
+
+/** Daily briefings the agent composes; person-service delivers them. */
+trait BriefingRepo {
+  def create(b: Briefing): IO[AgentError, Unit]
+  def findPending(ownerPersonId: PersonId): IO[AgentError, List[Briefing]]
+  def markDelivered(id: String, channel: String, deliveredAt: Instant): IO[AgentError, Unit]
+  /** Record a delivery failure but keep the briefing `pending` so `findPending`
+   *  retries it on the next tick. */
+  def recordDeliveryError(id: String, error: String, at: Instant): IO[AgentError, Unit]
+  /** Whether a briefing was already created for this owner since `since` (used for
+   *  once-per-day idempotency on the daily run). */
+  def existsSince(ownerPersonId: PersonId, since: Instant): IO[AgentError, Boolean]
 }
 
 trait MemoryRepo {
@@ -163,6 +211,41 @@ object Repos {
       dueAt = optInstant(rs, "due_at"),
       createdAt = instant(rs, "created_at"),
       updatedAt = instant(rs, "updated_at")
+    )
+
+  private def extractCommitmentSync(rs: ResultSet): CommitmentSync =
+    CommitmentSync(
+      commitment = extractCommitment(rs),
+      googleTaskListId = opt(rs, "google_task_list_id"),
+      googleTaskId = opt(rs, "google_task_id"),
+      projectedAt = optInstant(rs, "projected_at")
+    )
+
+  private def extractCalendarEvent(rs: ResultSet): CalendarEvent =
+    CalendarEvent(
+      externalId = col(rs, "external_id"),
+      calendarId = col(rs, "calendar_id"),
+      summary = col(rs, "summary"),
+      start = instant(rs, "start_at"),
+      end = instant(rs, "end_at"),
+      allDay = rs.getInt("all_day") != 0,
+      location = opt(rs, "location"),
+      description = opt(rs, "description"),
+      htmlLink = opt(rs, "html_link"),
+      status = col(rs, "status")
+    )
+
+  private def extractBriefing(rs: ResultSet): Briefing =
+    Briefing(
+      id = col(rs, "id"),
+      ownerPersonId = PersonId(col(rs, "owner_person_id")),
+      subject = col(rs, "subject"),
+      body = col(rs, "body"),
+      status = col(rs, "status"),
+      channel = opt(rs, "channel"),
+      createdAt = instant(rs, "created_at"),
+      deliveredAt = optInstant(rs, "delivered_at"),
+      error = opt(rs, "error")
     )
 
   private def extractMemory(rs: ResultSet): MemoryItem =
@@ -418,6 +501,29 @@ object Repos {
         "UPDATE commitments SET status = ?, updated_at = ? WHERE id = ?",
         statusStr(status), updatedAt, id
       )
+
+    def findForTaskSync(ownerPersonId: PersonId): IO[AgentError, List[CommitmentSync]] =
+      // Not yet projected, or changed since we last pushed. String compare is valid:
+      // timestamps are fixed-precision ISO-8601 (see common.Time).
+      db.query(
+        """SELECT * FROM commitments
+          | WHERE owner_person_id = ?
+          |   AND (google_task_id IS NULL OR projected_at IS NULL OR updated_at > projected_at)
+          | ORDER BY created_at ASC""".stripMargin,
+        ownerPersonId
+      )(extractCommitmentSync)
+
+    def findByGoogleTaskId(googleTaskId: String): IO[AgentError, Option[Commitment]] =
+      db.queryOne("SELECT * FROM commitments WHERE google_task_id = ?", googleTaskId)(extractCommitment)
+
+    def setTaskMapping(id: CommitmentId, googleTaskListId: String, googleTaskId: String, projectedAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE commitments SET google_task_list_id = ?, google_task_id = ?, projected_at = ? WHERE id = ?",
+        googleTaskListId, googleTaskId, projectedAt, id
+      )
+
+    def markProjected(id: CommitmentId, projectedAt: Instant): IO[AgentError, Unit] =
+      db.execute("UPDATE commitments SET projected_at = ? WHERE id = ?", projectedAt, id)
   }
 
   def sqliteMemoryRepo(db: Sqlite): MemoryRepo = new MemoryRepo {
@@ -885,5 +991,103 @@ object Repos {
         "SELECT COUNT(*) AS cnt FROM inbox_messages WHERE owner_person_id = ? AND triage_status = 'pending'",
         ownerPersonId
       )(_.getInt("cnt")).map(_.getOrElse(0))
+  }
+
+  def sqliteCalendarEventRepo(db: Sqlite): CalendarEventRepo = new CalendarEventRepo {
+    def upsert(ownerPersonId: PersonId, e: CalendarEvent, syncedAt: Instant, source: Option[String] = None): IO[AgentError, Unit] =
+      // `source` is set on INSERT only; the ON CONFLICT update deliberately omits it
+      // so a later sync-upsert of an agent-created event preserves its dedup key.
+      db.execute(
+        """INSERT INTO calendar_events
+          | (owner_person_id, calendar_id, external_id, summary, start_at, end_at, all_day, location, description, html_link, status, synced_at, source)
+          | VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          | ON CONFLICT(owner_person_id, calendar_id, external_id) DO UPDATE SET
+          |   summary = excluded.summary, start_at = excluded.start_at, end_at = excluded.end_at,
+          |   all_day = excluded.all_day, location = excluded.location, description = excluded.description,
+          |   html_link = excluded.html_link, status = excluded.status, synced_at = excluded.synced_at""".stripMargin,
+        ownerPersonId, e.calendarId, e.externalId, e.summary, e.start, e.end, e.allDay,
+        e.location, e.description, e.htmlLink, e.status, syncedAt, source
+      )
+
+    def find(ownerPersonId: PersonId, calendarId: String, externalId: String): IO[AgentError, Option[CalendarEvent]] =
+      db.queryOne(
+        "SELECT * FROM calendar_events WHERE owner_person_id = ? AND calendar_id = ? AND external_id = ?",
+        ownerPersonId, calendarId, externalId
+      )(extractCalendarEvent)
+
+    def findBySource(ownerPersonId: PersonId, source: String): IO[AgentError, Option[CalendarEvent]] =
+      db.queryOne(
+        "SELECT * FROM calendar_events WHERE owner_person_id = ? AND source = ? AND status != 'cancelled' LIMIT 1",
+        ownerPersonId, source
+      )(extractCalendarEvent)
+
+    def findBySignature(ownerPersonId: PersonId, summary: String, startAt: Instant): IO[AgentError, Option[CalendarEvent]] =
+      db.queryOne(
+        "SELECT * FROM calendar_events WHERE owner_person_id = ? AND summary = ? AND start_at = ? AND status != 'cancelled' LIMIT 1",
+        ownerPersonId, summary, startAt
+      )(extractCalendarEvent)
+
+    def findWindow(ownerPersonId: PersonId, timeMin: Instant, timeMax: Instant): IO[AgentError, List[CalendarEvent]] =
+      db.query(
+        """SELECT * FROM calendar_events
+          | WHERE owner_person_id = ? AND status != 'cancelled' AND start_at < ? AND end_at > ?
+          | ORDER BY start_at ASC""".stripMargin,
+        ownerPersonId, timeMax, timeMin
+      )(extractCalendarEvent)
+
+    def countForOwner(ownerPersonId: PersonId): IO[AgentError, Int] =
+      db.queryOne(
+        "SELECT COUNT(*) AS cnt FROM calendar_events WHERE owner_person_id = ?",
+        ownerPersonId
+      )(_.getInt("cnt")).map(_.getOrElse(0))
+
+    def cancelStaleInWindow(ownerPersonId: PersonId, syncedBefore: Instant, timeMin: Instant, timeMax: Instant): IO[AgentError, List[(String, String, String)]] =
+      for {
+        stale <- db.query(
+                   """SELECT calendar_id, external_id, summary FROM calendar_events
+                     | WHERE owner_person_id = ? AND status != 'cancelled' AND synced_at < ?
+                     |   AND start_at >= ? AND start_at < ?""".stripMargin,
+                   ownerPersonId, syncedBefore, timeMin, timeMax
+                 )(rs => (col(rs, "calendar_id"), col(rs, "external_id"), col(rs, "summary")))
+        _     <- ZIO.when(stale.nonEmpty)(db.execute(
+                   """UPDATE calendar_events SET status = 'cancelled'
+                     | WHERE owner_person_id = ? AND status != 'cancelled' AND synced_at < ?
+                     |   AND start_at >= ? AND start_at < ?""".stripMargin,
+                   ownerPersonId, syncedBefore, timeMin, timeMax
+                 ))
+      } yield stale
+  }
+
+  def sqliteBriefingRepo(db: Sqlite): BriefingRepo = new BriefingRepo {
+    def create(b: Briefing): IO[AgentError, Unit] =
+      db.execute(
+        "INSERT INTO briefings (id, owner_person_id, subject, body, status, channel, created_at, delivered_at, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        b.id, b.ownerPersonId, b.subject, b.body, b.status, b.channel, b.createdAt, b.deliveredAt, b.error
+      )
+
+    def findPending(ownerPersonId: PersonId): IO[AgentError, List[Briefing]] =
+      db.query(
+        "SELECT * FROM briefings WHERE owner_person_id = ? AND status = 'pending' ORDER BY created_at ASC",
+        ownerPersonId
+      )(extractBriefing)
+
+    def markDelivered(id: String, channel: String, deliveredAt: Instant): IO[AgentError, Unit] =
+      db.execute(
+        "UPDATE briefings SET status = 'delivered', channel = ?, delivered_at = ?, error = NULL WHERE id = ?",
+        channel, deliveredAt, id
+      )
+
+    def recordDeliveryError(id: String, error: String, at: Instant): IO[AgentError, Unit] =
+      // Keep status 'pending' so deliverPending retries; just record why it failed.
+      db.execute(
+        "UPDATE briefings SET error = ? WHERE id = ? AND status = 'pending'",
+        error, id
+      )
+
+    def existsSince(ownerPersonId: PersonId, since: Instant): IO[AgentError, Boolean] =
+      db.queryOne(
+        "SELECT 1 FROM briefings WHERE owner_person_id = ? AND created_at >= ? LIMIT 1",
+        ownerPersonId, since
+      )(_ => 1).map(_.isDefined)
   }
 }

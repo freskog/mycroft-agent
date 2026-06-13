@@ -42,11 +42,11 @@ The agent sandbox must not have direct access to:
 - SSH keys
 - The host home directory
 
-`person-service` is a trusted sidecar that runs **outside** the sandbox. It owns credentials, database access, and policy enforcement. The agent interacts only through the `person` CLI, which makes HTTP calls to the sidecar.
+`person-service` is a trusted sidecar that runs **outside** the sandbox. It owns credentials, database access, and policy enforcement. The agent interacts only through the `person` CLI — a thin `curl`/`jq` script (`scripts/person`, not a compiled module) that makes HTTP calls to the sidecar.
 
-### person-cli vs person-service
+### person CLI (script) vs person-service
 
-| | person-cli | person-service |
+| | person CLI (script) | person-service |
 |---|---|---|
 | Runs in | Agent sandbox | Host / trusted zone |
 | Has credentials | No | Yes |
@@ -65,9 +65,19 @@ If the agent could directly write to the database, a compromised or confused age
 
 All writes go through the sidecar's API, but the gate strength is matched to risk (see "Human-in-the-Loop" below): reversible internal knowledge is written directly; durable contracts and outside-effect actions require a human decision the agent structurally cannot forge.
 
-### Human-in-the-Loop: gateless writes, gated actions & goals
+### Human-in-the-Loop: gateless writes (and a parked gate)
 
-Not everything needs the same gate. We grade by risk, and the agent's command surface mirrors it with **two verbs**: `record` (gateless) and `request` (gated).
+> **Status: the approval gate is currently parked.** The household decided not to
+> gate calendar/task creation — those are now written **directly**, made safe by an
+> `[M]` marker (so MyCroft's entries are visible and bulk-removable in Google),
+> reversibility, and server-side idempotency rather than a sign-off (see *Direct,
+> marked, idempotent writes* below). The approval **engine** — decision plane,
+> one-time codes, parameterized options, executor — remains in code, **dormant and
+> reserved for the one action that will always be gated: sending email to a third
+> party.** Goals are likewise parked. The section below describes the engine for
+> when it returns; today the agent has no `request`/approve verb.
+
+Not everything needs the same gate. We grade by risk, and the agent's command surface mirrors it with **two verbs**: `record` (gateless) and `request` (gated, currently parked).
 
 - **Gateless — `record` (memory, entities, relationships, commitments):** written **live** (`accepted`, or `open` for commitments). These are internal and reversible, so the safety net is provenance + reversibility, not a sign-off: `text`/`outcome` fields are immutable (you supersede, never edit), every item carries `origin_event_id`/`source`, a `confidence`, and a **trust level**, and a human (or the agent, on realising it erred) can `reject`/`archive`/`supersede`/`commitment cancel` after the fact. Requiring human acceptance of every learned fact was friction that fought continuous learning; we dropped it. There is no `accept`/`pending`/`accept-all`. A commitment's `open` means *tracked*, not *agreed*.
 - **Hard-gated — `request` (goals, and any outside-effect action):** these go through the **approval mechanism**. A goal is a durable, immutable contract (a wrongly-inferred one is costly); an action (send mail, create a calendar event) is irreversible and outward. The agent can only **request** — it never approves or executes.
@@ -84,18 +94,20 @@ The approval lifecycle, deliberately with **no suspended fibers** (so it survive
 
 This keeps a *compromised* agent unable to bypass the gate — it can neither route to the decision endpoint nor produce a valid code — while the gateless path keeps everyday learning autonomous.
 
+**Requests are non-blocking; batches stay decoupled from decisions.** Because a request only enqueues an `Approval` and returns, a producer like inbox triage fires *all* of a batch's calendar requests in one pass and ends with a single digest — it never waits on a human, and the next poll runs regardless of how many approvals are still pending. So a calendar HITL never blocks email triage. The only coupling risk was prompt wording telling the agent to "stop after requesting"; the skills now state that "stop" means *don't await the result*, not *end the turn*. **Reconnect backfill:** `GET /approvals/stream` only carries events from the moment of subscription, so a batch fired while the client was away would be invisible on reconnect; the REPL therefore fetches currently-`requested` approvals on connect and renders them (conflicts first), deduped against the live stream — so the returning user sees and approves the whole batch in one sitting.
+
 **Parameterized decisions (trusted-core options).** A decision can carry a *choice* — e.g. *which* calendar an event lands on — without weakening the property that makes the gate safe: **a compromised agent must never be able to disguise what it's actually doing.** That property holds because the human reviews the **literal payload that executes** and executors read only known fields from that frozen payload — no gap between shown and run. The naïve risk a menu would add is **label↔value divergence**: an agent-authored option "Family calendar" whose value pointed elsewhere could lie. So the load-bearing invariant: **the agent never authors what the human sees, nor the gated choice values.** An `Approval.optionsJson` menu (`[{id,label,params}]`) is sourced and rendered by the **trusted core** (`PersonService.optionsFor`, e.g. from the owner's real Google calendar list) — never from the agent's request. On approve, the chosen option's `params` are merged into the frozen `payloadJson` (`resolveChosenOption`); that merge is the *only* way a value enters the payload after request, and it comes from the trusted option set. With 0–1 options no choice is forced (execution defaults, e.g. `primary`); with several, approving without a valid `chosenOptionId` is a `Validation` error. The agent supplies only structured params the core validates (for calendar create it has **no** calendar flag at all); the human approves the resolved, canonical effect.
 
 ### Untrusted content & prompt injection
 
 The agent reads attacker-controllable content — email bodies, attachments, and (in future) web pages. Prompt injection is **not reliably solvable at the model layer**, so we assume the model can be fooled and defend in layers, strongest first:
 
-1. **Capability containment (primary).** A hijacked agent still can't take any outside-effect action (send mail, create events/goals) without a human approving via a one-time code on a network it can't reach. So injection can't directly cause irreversible harm — at worst it produces an approval request the human scrutinises. **The exfiltration gap opens with web fetch:** untrusted content + an agent-controlled outbound request is the channel. The fetch tool (when built) **must** have egress control from day one — fetch only via an allowlist/proxy, and the `mycroft` container's general egress locked down so the constrained tool is the only way out. Sanitisation is moot without this.
+1. **Capability containment (primary).** A hijacked agent still can't take any outside-effect action (send mail, create events/goals) without a human approving via a one-time code on a network it can't reach. So injection can't directly cause irreversible harm — at worst it produces an approval request the human scrutinises. **The exfiltration channel is closed at the network layer:** `mycroft` sits on a Docker `internal: true` network with no route off the host, so no binary it runs (`curl`, `python3`, `bash`) can reach the internet. Its only reachable destinations are `person-service` (the gated API) and `llm-proxy` (a single-upstream socat forwarder to the inference endpoint and nowhere else). A future web-fetch tool must route through this same controlled egress — there is no general outbound path to open.
 2. **Instruction/data separation (general harness rule).** Only the system prompt and the sender's messages are authoritative. **All** tool output (`safe_run`/`runlog`/`run_skill` — email, web, attachments, command output) is fenced as `<<<UNTRUSTED_TOOL_OUTPUT … >>>` (`Loop.untrusted`) and the system prompt forbids obeying instructions found inside it.
 3. **Sanitisation at the source (per-tool, covert-channel scrub).** Format-specific, so it lives in each reader: email bodies are scrubbed of invisible/format Unicode (zero-width, bidi overrides, the tag block) and hidden HTML in `MessageParser.sanitize`; a future web tool readability-extracts visible text. Kills *invisible* injection; cannot neutralise a plainly-worded one — that's what layers 1–2 are for.
 4. **Provenance at the decision point.** An approval carries its `source` (e.g. `email:gmail-msg-X`), surfaced to the human so a request that originated in untrusted content is judged accordingly. Memory written from untrusted sources stays low-confidence/observation, never silently authoritative.
 
-OS-level, `mycroft` (the component exposed to untrusted content) runs with `cap_drop: ALL` + `no-new-privileges` and skills mounted read-only; a non-root user + read-only root fs is the next hardening step.
+OS-level, `mycroft` (the component exposed to untrusted content) runs with `cap_drop: ALL` + `no-new-privileges`, skills mounted read-only, and **no host network or general egress** (internal Docker network; see layer 1); a non-root user + read-only root fs is the next hardening step.
 
 ### Why Credentials Must Not Be in the Sandbox
 
@@ -131,11 +143,24 @@ This separation means:
 - Multiple reminders can point to the same commitment
 - The agent can reason about obligations without understanding calendar semantics
 
+### The user-facing model: two tracking primitives, Google is the view
+
+The user tracks exactly **two** kinds of thing, distinguished by **attend vs do**:
+
+- **Events** — "be present at a time" (an appointment, a meeting, a child's parents' evening). Projected to **Google Calendar**.
+- **Todos (commitments)** — "complete an action", dated (a deadline) or not. Projected to **Google Tasks**. *A deadline is not an appointment* — "pay fees by the 30th" is a todo with a due date, not a calendar event.
+
+Both live in person-service with full provenance (`source`, owner, `trust`); **Google is the everyday UI, not the store.** "Primary UI = Google" is independent of "source of truth = Google": exactly as you never read the local events table but look at Google Calendar, the substrate stays authoritative and Google is a projection you view and tick. Keeping the substrate is what makes the agent's egress lockdown viable (state is local, not a Google round-trip per op), survives Google sunsetting a product, and preserves the trust/provenance model that a Google Task's title+notes can't hold. **Sync-back from Google is bounded** — todos sync status + due, events sync time + cancellation — never an arbitrary field merge (the tractable slice of conflict resolution). Both Calendar and Tasks sync back, symmetrically (the Tasks projection + Calendar event cache are the [Phase 2 work](#calendar-read-only-phase-1)).
+
+Classification, non-blocking batch triage, and the digest are codified in the `inbox-triage`, `calendar`, and `approvals` skills.
+
 ### Why We Are Not Implementing Multi-Tenancy
 
 This is a personal/family substrate. There is one deployment, one family. Multi-tenancy (separate databases, auth between tenants) adds complexity without value at this scale. Scopes and roles provide sufficient isolation within the family unit.
 
 ### Goals Are Durable; Plans Are Replaceable
+
+> **Goals are currently parked.** They model an *autonomous multi-step agent objective* (`outcome` + `evidence_rule`, gated creation, evidence accumulation), not user-facing tracking — the wrong shape for "parents' evening" or "pay the gas bill", which are events and todos (above). With no live autonomous workflow using them, triage and the user-facing skills do **not** create goals; the tables, endpoints, and the `goal.create` approval type remain in place but dormant, to be revived when a concrete autonomous-task need appears. The design below stands for that eventual use.
 
 Goals are durable completion contracts kept in `person-service`. A goal carries `title`, `outcome`, `evidence_rule`, `status`, `blocked_reason`, evidence, source, timestamps. Status and evidence are mutable. **`outcome` and `evidence_rule` are immutable once created** — there are no service operations to edit them. This is deliberate: environmental text (a README, an email reply, an injected instruction) must not silently redefine the contract. If the user actually wants a different outcome, the agent cancels the goal and requests a new one. **Goal *creation* is hard-gated** (see Human-in-the-Loop): the agent `goal request`s; the goal exists only after a human approves the `goal.create` action. Status/evidence updates are not gated.
 
@@ -183,9 +208,13 @@ The flow between them:
 tokens live only in the sidecar (in the `credentials` table); the agent never
 holds them.
 
-- `person google auth` runs a one-time OAuth loopback flow; `person gmail sync`
-  pulls recent message **metadata + plain-text body** into the `inbox_messages`
-  table and refreshes the access token as needed.
+- Gmail authorization is a one-time, operator-driven OAuth flow completed
+  **server-side**: the operator opens the consent URL (`GET /gmail/auth-url`),
+  and Google redirects the browser back to person-service's
+  `GET /gmail/oauth/callback`, which exchanges the code and stores the tokens.
+  The agent has no auth verb. `person gmail sync` then pulls recent message
+  **metadata + plain-text body** into the `inbox_messages` table and refreshes
+  the access token as needed.
 - Each inbox row carries triage state (`pending` / `triaged` / `skipped`) so the
   `inbox-triage` skill can process the oldest-pending messages and mark them.
 - **Attachments are stored as metadata only** — `attachmentId`, `filename`,
@@ -200,12 +229,15 @@ holds them.
 The agent's surface is the `person inbox` / `person gmail` CLI verbs (read +
 on-demand download); it can never send mail or mutate the mailbox.
 
-### Calendar (read-only, Phase 1)
+### Calendar & Tasks (Google projections)
 
-Calendar reuses the **same Google OAuth grant** as Gmail: the consent requests
-`gmail.readonly` + `calendar.readonly` together, yielding one access/refresh token
-(stored in the single `gmail` credential row) that works against both APIs. There
-is no separate calendar login.
+Calendar and Tasks reuse the **same Google OAuth grant** as Gmail: one consent
+requests `gmail.modify` + `calendar.events` + `calendar.readonly` + `tasks`,
+yielding one access/refresh token (stored in the single `gmail` credential row)
+that works against all three APIs. There is no separate calendar/tasks login.
+Changing the scope set requires a one-time operator re-consent (the server-side
+Gmail OAuth flow); tokens minted under the old scopes won't carry the new
+permissions.
 
 Phase 1 is **on-demand and uncached**: `person calendar agenda --owner <p>
 [--days N | --from --to]` live-queries the owner's Google calendars
@@ -220,27 +252,76 @@ during triage, grounding a date found in an email ("already on the calendar" /
 "conflicts with X"). This keeps calendar consistent with the substrate's
 tool-on-demand philosophy rather than always injecting a schedule into the prompt.
 
-This preserves the existing boundary: **calendar events are projections, not
-authoritative state**, and the agent still cannot write them. Two deliberate
-follow-ups:
+**Local mirror + sync-back (done).** `person-service` keeps a `calendar_events`
+table — the substrate's event store. `syncCalendar(owner)` (poller-driven, the
+`projection-sync` compose profile) fans the live agenda across all calendars,
+upserts events into the mirror, and marks vanished in-window events `cancelled` —
+each change recorded as an audit event (`calendar.event.imported/updated/cancelled`).
+The create write-through populates the mirror immediately. So a Google-side change
+(an event the user moves or deletes) reaches the substrate, the symmetry to the
+Tasks projection. (`calendarAgenda` still reads **live** for freshness; switching it
+to the mirror — and per-turn context injection — is a later step, deferred until the
+poller is guaranteed-on.)
 
-- **Phase 1.5 — cache + context injection**: sync events into a local
-  `calendar_events` table (like `inbox_messages`) and fold upcoming events into
-  the per-turn context bundle, so the agent always knows the schedule without a
-  tool call.
+**Write — direct, `[M]`-marked, idempotent (no approval).** `person calendar create`
+→ `POST /calendar/events` → `createCalendarEventDirect`, which writes to Google
+immediately (no gate) and write-throughs to the mirror. person-service prepends
+`[M] ` to the summary so the entry is visibly MyCroft's; the user manages it in
+Google. Creation is **idempotent**: the agent passes a stable `--source`, and
+person-service dedups on `(owner, source)` (else on `(owner, summary, start)`), so a
+retry or re-triage never duplicates. Events go to `primary`. This needs the
+`calendar.events` scope (re-consent if the token predates it). The safety here is
+the marker + reversibility + dedup, not a gate (see the parked HITL note above).
 
-**Write — done (the agent's first real outside-effect action).** The agent
-*requests* an event (`person calendar create` → an `Approval` of type
-`calendar.create_event`); a human approves with the one-time code; `performApproved`
-calls `CalendarClient.createEvent`. This needs the `calendar.events` scope (the
-`RequestedScopes` were bumped from `calendar.readonly`), so the owner must re-run
-`person google auth` once to re-consent. **The target calendar is the human's
-choice, not the agent's:** `person calendar create` has no calendar flag; when the
-owner has more than one calendar, person-service attaches a trusted-core options
-menu (their real calendar names) to the approval, and the chosen option's
-`calendarId` is merged into the payload at decision time (see *Parameterized
-decisions* above). A single-calendar owner needs no pick (defaults to `primary`).
-Linking the event back to its source commitment/goal is a later refinement.
+### Commitments ↔ Google Tasks
+
+Todos are commitments (substrate SoT); **Google Tasks is the view.**
+`syncTasks(owner)` (poller-driven, the `projection-sync` profile) reconciles the
+two: it **pushes** open commitments to the owner's default task list (insert new,
+patch changed title/due, complete/remove resolved — tracked by `google_task_id` /
+`projected_at` columns on `commitments`, kept off the domain model), and **pulls**
+Google-side changes back, bounded to **status + due** — a task ticked off on the
+phone marks the commitment `done`, a deleted task cancels it, a due change updates
+it. A task the user creates directly in Google is **imported** as a commitment
+(`--source tasks:<id>`). This is infrastructure, not a gated action: a projected
+task is the user's own already-recorded, reversible, private commitment going to
+their own list (gateless, mirroring the commitment itself). The agent always reads
+and writes through `person commitment …`, never the Tasks API. The Task title is
+`[M]`-marked like calendar events.
+
+### Daily briefing (agent composes; person-service delivers — no agent egress)
+
+The owner gets a daily summary (today's agenda, todos due soon, forward heads-ups
+like a birthday a few weeks out with a present nudge). The defining constraint:
+**the agent never sends anything.** It *composes* and hands off; person-service owns
+scheduling and delivery.
+
+- **Flow.** The `daily-briefing` compose profile (`briefing-poll.sh`) calls
+  `POST /briefing/run?owner` once a day. `runDailyBriefing` (idempotent per owner per
+  day) syncs calendar+tasks for fresh data, then pings mycroft `/inbound` to run the
+  `daily-briefing` skill. The agent reads the substrate, composes `{subject, body}`,
+  and calls its **only** briefing action — `person briefing submit` → `POST /briefing`.
+  `submitBriefing` stores the briefing `pending` and **delivers it on submit**;
+  a delivery failure keeps it `pending` (error recorded) so `deliverPending` retries
+  on the next tick.
+- **Delivery is pluggable, recipient is config.** A `DeliveryChannel` trait abstracts
+  the channel; only `email` is implemented now — `GmailClient.sendMessage`
+  (`messages.send`, `gmail.modify`) to the owner's **own account address**
+  (non-redirectable). WhatsApp/Signal are future impls behind the same trait. The
+  recipient/channel are resolved by person-service, never chosen by the agent.
+- **Why this keeps the egress lockdown intact.** The agent has no send/email/network
+  capability — it writes a row via `person briefing submit` and stops. Email send
+  lives only in person-service (the trusted sidecar, outside the sandbox), only for
+  the briefing, only to a configured/self address. It is **not** a general send verb
+  and **not** an agent egress route. (General outward email — arbitrary recipients —
+  is the future case reserved behind the dormant approval gate.)
+- **Multi-user.** Everything is per-`owner` (run, briefings, delivery config), so a
+  second user is onboarded by adding their person + delivery preference. Only Fred is
+  configured now (email-to-self).
+
+Both projections sync **bounded, not field-level**: Tasks ⇄ status+due, Calendar →
+time+cancellation. That is the tractable slice of the unavoidable conflict
+resolution — we never attempt an arbitrary two-way merge.
 
 ## Execution Model
 

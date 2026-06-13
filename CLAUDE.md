@@ -22,7 +22,7 @@ docker compose run --rm dev sbt "mycroft/test"
 docker compose run --rm dev sbt "personService/testOnly *HouseholdGraphSpec*"
 ```
 
-Module directory → sbt project name: `safe-run`→`safeRun`, `runlog`→`runlog`, `person-service`→`personService`, `person-cli`→`personCli`, `runtime`→`runtime`, `mycroft`→`mycroft`, `mycroft-repl`→`mycroftRepl`, `common`→`common`.
+Module directory → sbt project name: `safe-run`→`safeRun`, `runlog`→`runlog`, `person-service`→`personService`, `runtime`→`runtime`, `mycroft`→`mycroft`, `mycroft-repl`→`mycroftRepl`, `common`→`common`. (The `person` verbs are no longer a module — they ship as the `scripts/person` curl/jq script.)
 
 Native binaries (GraalVM, JVM-free) are built per module via `<module>/nativeImage`; `docker compose build native` bakes them all into `personal-agent:native`. `mycroft-repl` is the exception — it is **not** native (JLine needs a JVM); it ships as a fat jar via `mycroftRepl/assembly` in the `repl` image. Only hot-path binaries the agent executes need to be native.
 
@@ -35,7 +35,7 @@ common         shared model, JSON codecs, AgentError, output preview, Time (fixe
 safe-run       command wrapper: timeout + process-group kill, output→files, bounded JSON preview
 runlog         reads sections (head/tail/grep/range) of safe-run's on-disk output logs
 person-service TRUSTED SIDECAR — SQLite, OAuth tokens, approval engine; zio-http API. Runs OUTSIDE sandbox.
-person-cli     sandbox-safe HTTP client for person-service ("person" verbs)
+scripts/person sandbox-safe `person` verbs — a thin curl/jq script (NOT a module) hitting person-service over HTTP
 runtime        skill catalogue CLI (list/search/show) over filesystem skills; FTS5 BM25 search
 mycroft        local-LLM agent harness: POST /inbound + SSE GET /outbound/stream; native OpenAI tool calls
 mycroft-repl   JVM REPL channel adapter speaking mycroft's wire protocol
@@ -46,7 +46,7 @@ Dependency edges: everything depends on `common`; `mycroft` additionally depends
 ## Architecture invariants (do not violate)
 
 - **safe-run is not a sandbox.** It only mediates output (bounds previews, persists full output to disk, kills on timeout). It never restricts what a command can access — containment is a separate outer layer (Docker/nsjail). Don't add access-control logic here.
-- **The agent never holds credentials or DB handles.** Gmail/Calendar OAuth tokens live only in `person-service` (the `credentials` table); Gmail and Calendar are server-side **read-only**. The agent's only surface is `person` CLI verbs. Never thread tokens or DB access into sandbox-side modules (`safe-run`, `runlog`, `person-cli`, `mycroft`).
+- **The agent never holds credentials or DB handles.** Gmail/Calendar OAuth tokens live only in `person-service` (the `credentials` table); Gmail and Calendar are server-side **read-only**. The agent's only surface is `person` CLI verbs (the `scripts/person` curl/jq client). Never thread tokens or DB access into sandbox-side components (`safe-run`, `runlog`, the `person` script, `mycroft`).
 - **Gate by risk, not uniformly (HITL) — two verbs: `record` vs `request`.** Memory/entities/relationships/**commitments** are **gateless** — `record`ed live (`accepted`, or `open` for commitments), made safe by immutability + provenance + reversibility (`reject`/`archive`/`supersede`/`commitment cancel|ignore|done`); there is no `accept`/`pending`/`accept-all` (removed) and **no `propose` verb** (renamed to `record`). **Goals and outside-effect actions are hard-gated** through the approval mechanism: the agent only `request`s; a human decides; person-service executes (`performApproved`). Don't add a direct goal-create, a way for the agent to approve/execute, or reintroduce `propose`/an accept step.
 - **Evidence ≠ belief ≠ authority (memory provenance).** Every `memory_item` carries a typed `TrustLevel` (`user_stated`/`tool_confirmed`/`external_content`/`agent_inference`) + optional `sender`; `audit_events` carry a first-class `source`. `consolidateOne` derives trust from the origin event's `source` (`email:`/`web:`/`http` ⇒ `external_content`). External-content beliefs stay recall-visible but flagged "⚠ unverified" (see `Prompt.renderFact`), never enter the authoritative profile (`profileFacts` = onboarding-sourced), and never authorize a gated action. Memory policy is permissive; action policy is strict — keep them independent.
 - **The decision is structurally unforgeable by the agent.** `decideApproval` requires a **one-time code** (hashed, single-use, id-bound, TTL) that's issued/delivered only to the human and kept off every agent-readable surface (stream, `approval list`/`show`). person-service serves the decision + code-issuance routes (`Routes.decideRoutes`) on a **private interface** (`PERSON_SERVICE_PRIVATE_HOST`, compose `approvalnet`) that `mycroft` is not attached to. Never put a code on the shared `/approvals/stream` or in an Approval JSON, and never move `decide`/`code` onto the public routes.

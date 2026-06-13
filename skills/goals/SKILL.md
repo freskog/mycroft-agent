@@ -1,11 +1,21 @@
 ---
 name: goals
-description: Request, track, and resolve durable goals — the user-controlled completion contract that survives replanning. Goal creation is gated (request, never created directly).
-version: 1.0.0
-capabilities: [person-cli, safe-run]
+description: "PARKED — not currently in use. Goals model an autonomous multi-step agent objective (outcome + evidence rule), not user-facing tracking. Do not route user tracking here; use events (calendar) or todos (commitments). Reintroduced only when a concrete autonomous workflow needs it."
+version: 1.1.0
+capabilities: [person, safe-run]
 ---
 
 # Goals
+
+> **⚠ PARKED — do not invoke for user tracking.**
+> Goals are an *autonomous multi-step agent* construct: a durable, gated contract
+> (`outcome` + `evidence_rule`) the agent works toward and proves done. They are the
+> wrong shape for tracking what a person needs to do or attend — that's **todos
+> (commitments → Google Tasks)** and **events (calendar)**. There is **no live
+> autonomous workflow** using goals today, so triage and the user-facing skills do
+> **not** create them. The schema, endpoints, and `goal.create` approval type remain
+> in place, dormant; this skill is kept only as the design reference for when an
+> autonomous-task use case actually arrives. Until then, ignore it.
 
 ## Purpose
 

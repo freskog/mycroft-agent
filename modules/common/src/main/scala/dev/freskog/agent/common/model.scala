@@ -530,6 +530,22 @@ case class Credential(
   updatedAt: Instant
 )
 
+/** A daily briefing the agent composed and person-service delivers. The agent
+ *  writes a `pending` row (via the briefing-submit tool — its only briefing
+ *  action, no send capability); person-service delivers it on the owner's
+ *  configured channel and marks it `delivered`/`failed`. */
+case class Briefing(
+  id: String,
+  ownerPersonId: PersonId,
+  subject: String,
+  body: String,
+  status: String,            // pending | delivered | failed
+  channel: Option[String],
+  createdAt: Instant,
+  deliveredAt: Option[Instant],
+  error: Option[String]
+)
+
 /** Metadata for one attachment on an inbox message. The bytes are NOT stored;
  *  `attachmentId` is the provider-side handle used to download on demand. */
 case class InboxAttachment(

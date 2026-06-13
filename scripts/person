@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+# Thin, sandbox-safe client for person-service. Replaces the Scala person-cli
+# binary: every verb is a curl call against the person-service HTTP API. The
+# verb/flag surface mirrors the old CLI so skills need no changes.
+#
+# Egress note: this is the agent's only network tool of consequence, and it can
+# only reach PERSON_SERVICE_URL (which, in the locked-down compose topology, is
+# the sole non-LLM destination mycroft can route to anyway).
+set -uo pipefail
+
+BASE="${PERSON_SERVICE_URL:-http://127.0.0.1:8080}"
+CHANNEL_ENV="${MYCROFT_CHANNEL:-}"
+
+# --- output helpers ---------------------------------------------------------
+
+# Structured error to stdout (mirrors the old CLI, which printed AgentError JSON
+# on stdout rather than stderr) and a non-zero exit.
+err_json() {
+  jq -cn --arg type "$1" --arg message "$2" '{type:$type, message:$message}'
+  exit 1
+}
+
+# --- arg parsing ------------------------------------------------------------
+# Bash 3.2-compatible (no associative arrays): the post-group/sub args are kept
+# in the indexed array ARGS and scanned on demand. Flags are `--key value`;
+# boolean flags (see is_bool_flag) take no value. Everything else is positional.
+
+ARGS=()
+POS=()
+
+# Flags that take no value.
+is_bool_flag() { case "$1" in all-day) return 0;; *) return 1;; esac }
+
+# opt KEY [DEFAULT] -> value of --KEY (or "true" for a present boolean flag),
+# else DEFAULT.
+opt() {
+  local key="$1" def="${2:-}" i=0 n=${#ARGS[@]}
+  while [ $i -lt $n ]; do
+    if [ "${ARGS[$i]}" = "--$key" ]; then
+      if is_bool_flag "$key"; then printf 'true'; return 0; fi
+      printf '%s' "${ARGS[$((i+1))]:-}"; return 0
+    fi
+    i=$((i+1))
+  done
+  printf '%s' "$def"
+}
+
+req_opt() {
+  local v; v="$(opt "$1")"
+  if [ -z "$v" ]; then err_json "validation" "missing required --$1"; fi
+  printf '%s' "$v"
+}
+
+# Populate POS with positional args (tokens that are not flags or flag values).
+collect_positionals() {
+  local i=0 n=${#ARGS[@]} tok key
+  POS=()
+  while [ $i -lt $n ]; do
+    tok="${ARGS[$i]}"
+    case "$tok" in
+      --*)
+        key="${tok#--}"
+        if is_bool_flag "$key"; then i=$((i+1)); else i=$((i+2)); fi
+        ;;
+      *) POS+=("$tok"); i=$((i+1));;
+    esac
+  done
+}
+
+pos() {
+  local i="$1"
+  if [ "${#POS[@]}" -le "$i" ]; then err_json "validation" "missing positional argument"; fi
+  printf '%s' "${POS[$i]}"
+}
+
+# --- http helpers -----------------------------------------------------------
+
+# build_query k v k v ...  -> "?k=enc&k2=enc" (skips empty values, url-encodes)
+build_query() {
+  local q="" key val enc
+  while [ $# -gt 0 ]; do
+    key="$1"; val="${2:-}"; shift 2 || shift
+    [ -z "$val" ] && continue
+    enc="$(printf '%s' "$val" | jq -sRr @uri)"
+    if [ -z "$q" ]; then q="?$key=$enc"; else q="$q&$key=$enc"; fi
+  done
+  printf '%s' "$q"
+}
+
+# Emit the response body, then exit non-zero if the HTTP status was an error so
+# the agent can tell failure from success by exit code (person-service already
+# returns a {"type","message"} envelope on 4xx/5xx — we surface it AND fail).
+emit_and_status() {
+  local resp="$1" code body
+  code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+  printf '%s\n' "$body"
+  case "$code" in 2*) return 0 ;; *) exit 1 ;; esac
+}
+
+api_get() {
+  local path="$1"; shift
+  local qs resp rc
+  qs="$(build_query "$@")"
+  resp="$(curl -sS -w '\n%{http_code}' -H 'Accept: application/json' "${BASE}${path}${qs}" 2>&1)"; rc=$?
+  if [ $rc -ne 0 ]; then err_json "http_failed" "$resp"; fi
+  emit_and_status "$resp"
+}
+
+# api_post PATH BODY [k v k v ...]   (extra pairs become query params)
+api_post() {
+  local path="$1" body="$2"; shift 2
+  local qs resp rc
+  qs="$(build_query "$@")"
+  resp="$(curl -sS -w '\n%{http_code}' -H 'Accept: application/json' -H 'Content-Type: application/json' \
+           -d "$body" "${BASE}${path}${qs}" 2>&1)"; rc=$?
+  if [ $rc -ne 0 ]; then err_json "http_failed" "$resp"; fi
+  emit_and_status "$resp"
+}
+
+# jq helpers for optional fields: "" -> null
+J_OPT='(if . == "" then null else . end)'
+
+# --- filename sanitization for inbox download -------------------------------
+
+sanitize_filename() {
+  local name="$1" aid="$2"
+  name="${name##*/}"; name="${name##*\\}"
+  name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')"
+  if [ -z "$name" ] || [ "$name" = "." ] || [ "$name" = ".." ]; then
+    name="attachment-$(printf '%s' "$aid" | cut -c1-12 | tr -c 'A-Za-z0-9._-' '_')"
+  fi
+  printf '%s' "$name"
+}
+
+usage() {
+  cat <<'EOF'
+person — sandbox-safe client for person-service
+
+Groups: health | person | commitment | memory | entity | relationship |
+        household | event | gmail | inbox | calendar | briefing
+
+This wrapper has no per-subcommand `--help`; the exact flags for each verb are
+documented in the skills — run `skill show <name>` (e.g. `skill show commitments`,
+`skill show inbox-triage`, `skill show calendar`). Examples:
+
+  person health
+  person memory record --person fred --kind fact --text "..." --source chat
+  person memory search "dentist" --person fred --limit 5
+  person commitment record --owner fred --text "..." --source email:gmail-msg-1 --evidence "..." [--due <iso>]
+  person commitment list --owner fred --status open
+  person commitment done|ignore|cancel <id> [--reason "..."]
+  person calendar agenda --owner fred [--days 14 | --from <iso> --to <iso>]
+  person calendar list --owner fred
+  person calendar create --owner fred --summary "..." --start <iso> --end <iso> --source <stable-key> [--all-day] [--location "..."]
+  person inbox list --owner fred --status pending --order asc
+  person inbox show <id>   |   person inbox mark-triaged <id>   |   person inbox skip <id>
+  person inbox download <id> --out /workspace/attachments
+  person event record --action <a> --category observation --text "..." [--source <src>]
+  person briefing submit --owner fred --subject "..." --body "..."
+
+Note: Gmail/Calendar/Tasks authorization is an operator/server-side flow; the
+agent cannot perform it.
+EOF
+}
+
+# --- dispatch ---------------------------------------------------------------
+
+group="${1:-}"; [ $# -gt 0 ] && shift
+sub=""
+case "$group" in
+  health|household|"") : ;;
+  *) sub="${1:-}"; [ $# -gt 0 ] && shift ;;
+esac
+ARGS=("$@")
+collect_positionals
+
+# Scoped help: `person <group> --help|-h|help` has no per-subcommand parser here
+# (flags live in the skills), so print the usage overview rather than erroring on
+# the help token — otherwise discovery attempts fail and the agent guesses flags.
+case "${sub:-}" in -h|--help|help) usage; exit 0 ;; esac
+
+case "$group" in
+  ""|-h|--help|help) usage; exit 0 ;;
+
+  health)
+    api_get "/health" ;;
+
+  person)
+    case "$sub" in
+      create)
+        body="$(jq -cn \
+          --arg id "$(req_opt id)" --arg name "$(req_opt display-name)" \
+          --arg tz "$(req_opt timezone)" --arg locale "$(opt locale)" \
+          '{id:$id, displayName:$name, timezone:$tz, defaultLocale:($locale|'"$J_OPT"')}')"
+        api_post "/persons" "$body" ;;
+      update)
+        id="$(pos 0)"
+        body="$(jq -cn \
+          --arg name "$(opt display-name)" --arg tz "$(opt timezone)" --arg locale "$(opt locale)" \
+          '{displayName:($name|'"$J_OPT"'), timezone:($tz|'"$J_OPT"'), defaultLocale:($locale|'"$J_OPT"')}')"
+        api_post "/persons/$id" "$body" ;;
+      list) api_get "/persons" ;;
+      *) err_json "validation" "unknown: person $sub" ;;
+    esac ;;
+
+  commitment)
+    case "$sub" in
+      record)
+        body="$(jq -cn \
+          --arg owner "$(req_opt owner)" --arg text "$(req_opt text)" \
+          --arg source "$(req_opt source)" --arg evidence "$(req_opt evidence)" --arg due "$(opt due)" \
+          '{ownerPersonId:$owner, text:$text, source:$source, evidence:$evidence, dueAt:($due|'"$J_OPT"')}')"
+        api_post "/commitments/propose" "$body" ;;
+      list) api_get "/commitments" owner "$(opt owner)" status "$(opt status)" ;;
+      done|ignore|cancel)
+        id="$(pos 0)"
+        case "$sub" in done) st=done;; ignore) st=ignored;; cancel) st=cancelled;; esac
+        body="$(jq -cn --arg status "$st" --arg reason "$(opt reason)" \
+          '{status:$status, reason:($reason|'"$J_OPT"')}')"
+        api_post "/commitments/$id/status" "$body" ;;
+      *) err_json "validation" "unknown: commitment $sub" ;;
+    esac ;;
+
+  memory)
+    case "$sub" in
+      record)
+        body="$(jq -cn \
+          --arg person "$(req_opt person)" --arg kind "$(req_opt kind)" --arg text "$(req_opt text)" \
+          --arg source "$(req_opt source)" --arg conf "$(opt confidence)" \
+          --arg vf "$(opt valid-from)" --arg vu "$(opt valid-until)" \
+          --arg trust "$(opt trust)" --arg sender "$(opt sender)" \
+          '{personId:$person, kind:$kind, text:$text, source:$source,
+            confidence:(if $conf=="" then null else ($conf|tonumber) end),
+            validFrom:($vf|'"$J_OPT"'), validUntil:($vu|'"$J_OPT"'),
+            trust:($trust|'"$J_OPT"'), sender:($sender|'"$J_OPT"')}')"
+        api_post "/memory/propose" "$body" ;;
+      reject)
+        body="$(jq -cn --arg reason "$(opt reason)" '{reason:($reason|'"$J_OPT"')}')"
+        api_post "/memory/$(pos 0)/reject" "$body" ;;
+      archive) api_post "/memory/$(pos 0)/archive" "{}" ;;
+      supersede)
+        body="$(jq -cn --arg new "$(req_opt new)" --arg old "$(req_opt old)" '{newId:$new, oldId:$old}')"
+        api_post "/memory/supersede" "$body" ;;
+      search)
+        api_get "/memory/search" q "$(pos 0)" person "$(opt person)" kind "$(opt kind)" \
+          as_of "$(opt as-of)" limit "$(opt limit)" ;;
+      context)
+        api_get "/memory/context" person "$(opt person)" fact_limit "$(opt fact-limit)" event_limit "$(opt event-limit)" ;;
+      conflicts)
+        api_get "/memory/conflicts" person "$(opt person)" kind "$(req_opt kind)" text "$(req_opt text)" ;;
+      consolidate)
+        body="$(jq -cn --arg since "$(opt since)" '{since:($since|'"$J_OPT"')}')"
+        api_post "/memory/consolidate" "$body" ;;
+      profile) api_get "/memory/profile" limit "$(opt limit)" ;;
+      list) api_get "/memory" person "$(opt person)" kind "$(opt kind)" status "$(opt status)" ;;
+      *) err_json "validation" "unknown: memory $sub" ;;
+    esac ;;
+
+  # NOTE: `approval` and `goal` are intentionally absent. Approvals are parked
+  # (reserved for a future outward-email gate); goals are parked. Calendar/task
+  # writes are direct + [M]-marked + idempotent — no gate. The person-service
+  # approval/goal endpoints still exist (dormant) but are not agent-facing.
+
+  briefing)
+    case "$sub" in
+      # Submit a composed daily briefing. The agent's ONLY briefing action — there
+      # is no send/email verb here. person-service stores it and delivers it.
+      submit)
+        body="$(jq -cn \
+          --arg owner "$(req_opt owner)" --arg subject "$(req_opt subject)" --arg bodytext "$(req_opt body)" \
+          '{ownerPersonId:$owner, subject:$subject, body:$bodytext}')"
+        api_post "/briefing" "$body" ;;
+      *) err_json "validation" "unknown: briefing $sub" ;;
+    esac ;;
+
+  entity)
+    case "$sub" in
+      record)
+        body="$(jq -cn \
+          --arg kind "$(req_opt kind)" --arg name "$(req_opt name)" --arg attrs "$(opt attributes-json)" \
+          --arg source "$(req_opt source)" --arg conf "$(opt confidence)" \
+          '{kind:$kind, name:$name, attributesJson:($attrs|'"$J_OPT"'), source:$source,
+            confidence:(if $conf=="" then null else ($conf|tonumber) end)}')"
+        api_post "/entities/propose" "$body" ;;
+      list) api_get "/entities" kind "$(opt kind)" status "$(opt status)" ;;
+      resolve) api_get "/entities" name "$(pos 0)" ;;
+      reject)
+        body="$(jq -cn --arg reason "$(opt reason)" '{reason:($reason|'"$J_OPT"')}')"
+        api_post "/entities/$(pos 0)/reject" "$body" ;;
+      supersede)
+        body="$(jq -cn --arg new "$(req_opt new)" --arg old "$(req_opt old)" '{newId:$new, oldId:$old}')"
+        api_post "/entities/supersede" "$body" ;;
+      *) err_json "validation" "unknown: entity $sub" ;;
+    esac ;;
+
+  relationship)
+    case "$sub" in
+      record)
+        body="$(jq -cn \
+          --arg from "$(req_opt from)" --arg fk "$(req_opt from-kind)" --arg type "$(req_opt type)" \
+          --arg to "$(req_opt to)" --arg tk "$(req_opt to-kind)" --arg source "$(req_opt source)" \
+          --arg conf "$(opt confidence)" --arg note "$(opt note)" \
+          --arg vf "$(opt valid-from)" --arg vu "$(opt valid-until)" \
+          '{fromId:$from, fromKind:$fk, relType:$type, toId:$to, toKind:$tk, source:$source,
+            confidence:(if $conf=="" then null else ($conf|tonumber) end),
+            note:($note|'"$J_OPT"'), validFrom:($vf|'"$J_OPT"'), validUntil:($vu|'"$J_OPT"')}')"
+        api_post "/relationships/propose" "$body" ;;
+      list)
+        api_get "/relationships" from "$(opt from)" to "$(opt to)" type "$(opt type)" \
+          status "$(opt status)" as_of "$(opt as-of)" ;;
+      reject)
+        body="$(jq -cn --arg reason "$(opt reason)" '{reason:($reason|'"$J_OPT"')}')"
+        api_post "/relationships/$(pos 0)/reject" "$body" ;;
+      supersede)
+        body="$(jq -cn --arg new "$(req_opt new)" --arg old "$(req_opt old)" '{newId:$new, oldId:$old}')"
+        api_post "/relationships/supersede" "$body" ;;
+      *) err_json "validation" "unknown: relationship $sub" ;;
+    esac ;;
+
+  household) api_get "/household" ;;
+
+  event)
+    case "$sub" in
+      record)
+        body="$(jq -cn \
+          --arg actor "$(opt actor agent)" --arg action "$(req_opt action)" --arg category "$(req_opt category)" \
+          --arg tt "$(opt target-type)" --arg tid "$(opt target-id)" --arg text "$(opt text)" \
+          --arg payload "$(opt payload-json)" --arg source "$(opt source)" \
+          '{actor:$actor, action:$action, category:$category, targetType:($tt|'"$J_OPT"'),
+            targetId:($tid|'"$J_OPT"'), text:($text|'"$J_OPT"'), payloadJson:($payload|'"$J_OPT"'),
+            source:($source|'"$J_OPT"')}')"
+        api_post "/events" "$body" ;;
+      log) api_get "/events" category "$(opt category)" since "$(opt since)" until "$(opt until)" limit "$(opt limit)" ;;
+      search) api_get "/events/search" q "$(pos 0)" category "$(opt category)" since "$(opt since)" limit "$(opt limit)" ;;
+      *) err_json "validation" "unknown: event $sub" ;;
+    esac ;;
+
+  google)
+    case "$sub" in
+      auth) err_json "validation" "google auth is an operator/server-side flow now; the agent cannot authorize Gmail. Ask the operator to run the Gmail OAuth flow against person-service." ;;
+      *) err_json "validation" "unknown: google $sub" ;;
+    esac ;;
+
+  gmail)
+    case "$sub" in
+      sync) api_post "/gmail/sync" "{}" owner "$(req_opt owner)" since "$(opt since)" ;;
+      *) err_json "validation" "unknown: gmail $sub" ;;
+    esac ;;
+
+  inbox)
+    case "$sub" in
+      list) api_get "/inbox" owner "$(req_opt owner)" status "$(opt status)" limit "$(opt limit)" order "$(opt order)" ;;
+      show) api_get "/inbox/$(pos 0)" ;;
+      skip) api_post "/inbox/$(pos 0)/skip" "{}" ;;
+      mark-triaged)
+        body="$(jq -cn --arg sid "$(opt source-event-id)" '{sourceEventId:($sid|'"$J_OPT"')}')"
+        api_post "/inbox/$(pos 0)/mark-triaged" "$body" ;;
+      download)
+        id="$(pos 0)"; out="$(req_opt out)"; want="$(opt attachment)"
+        msg="$(curl -sS -H 'Accept: application/json' "${BASE}/inbox/${id}" 2>&1)" || err_json "http_failed" "$msg"
+        # Collect attachment ids (optionally just the requested one).
+        ids="$(printf '%s' "$msg" | jq -r --arg aid "$want" \
+          'if ($aid|length)>0 then (.attachments[]?|select(.attachmentId==$aid)|.attachmentId)
+           else (.attachments[]?|.attachmentId) end')"
+        if [ -z "$ids" ]; then
+          err_json "not_found" "no attachments on inbox message $id${want:+ matching $want}"
+        fi
+        mkdir -p "$out" || err_json "bug" "could not create $out"
+        written=()
+        while IFS= read -r aid; do
+          [ -z "$aid" ] && continue
+          fname="$(printf '%s' "$msg" | jq -r --arg aid "$aid" '.attachments[]|select(.attachmentId==$aid)|.filename')"
+          safe="$(sanitize_filename "$fname" "$aid")"
+          target="$out/$safe"
+          curl -sS -o "$target" "${BASE}/inbox/${id}/attachments/${aid}/raw" || err_json "http_failed" "downloading $aid"
+          written+=("$target")
+        done <<< "$ids"
+        printf '%s\n' "${written[@]}" | jq -R . | jq -cs \
+          --arg inboxId "$id" --arg out "$out" '{inboxId:$inboxId, out:$out, written:.}' ;;
+      *) err_json "validation" "unknown: inbox $sub" ;;
+    esac ;;
+
+  calendar)
+    case "$sub" in
+      agenda) api_get "/calendar/agenda" owner "$(req_opt owner)" days "$(opt days)" from "$(opt from)" to "$(opt to)" ;;
+      list) api_get "/calendar/calendars" owner "$(req_opt owner)" ;;
+      # Direct create ([M]-marked + idempotent server-side; no approval). Pass a
+      # stable --source so a retry doesn't duplicate. NB: jq var is `$endAt`, not
+      # `$end` — `end` is a jq reserved word ("unexpected end, expecting IDENT");
+      # the JSON key stays "end".
+      create)
+        body="$(jq -cn \
+          --arg owner "$(req_opt owner)" --arg summary "$(req_opt summary)" --arg start "$(req_opt start)" \
+          --arg endAt "$(req_opt end)" --arg allday "$(opt all-day false)" \
+          --arg location "$(opt location)" --arg description "$(opt description)" --arg source "$(opt source)" \
+          '{ownerPersonId:$owner, summary:$summary, start:$start, "end":$endAt, allDay:($allday=="true"),
+            location:($location|'"$J_OPT"'), description:($description|'"$J_OPT"'), source:($source|'"$J_OPT"')}')"
+        api_post "/calendar/events" "$body" ;;
+      *) err_json "validation" "unknown: calendar $sub" ;;
+    esac ;;
+
+  *) err_json "validation" "unknown command: $group" ;;
+esac

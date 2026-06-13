@@ -1,6 +1,6 @@
 package dev.freskog.agent.mycroft.repl
 
-import dev.freskog.agent.common.ApprovalEvent
+import dev.freskog.agent.common.{Approval, ApprovalEvent}
 import dev.freskog.agent.common.JsonCodecs._
 
 import zio._
@@ -116,9 +116,13 @@ object Main extends ZIOAppDefault {
                   else ZIO.succeed(true)
       _        <- ZIO.when(proceed) {
                     for {
+                      // Shared across the live stream and the reconnect backfill so a
+                      // pending approval is rendered exactly once.
+                      shown <- ZIO.succeed(java.util.concurrent.ConcurrentHashMap.newKeySet[String]())
                       _ <- streamEvents(cfg, queue, rt).forkScoped
-                      _ <- streamApprovals(cfg, terminal).forkScoped
+                      _ <- streamApprovals(cfg, terminal, shown).forkScoped
                       _ <- printLine(terminal, s"Connected to ${cfg.mycroftUrl} on channel '${cfg.channel}' as '${cfg.as}'. Ctrl-D twice to quit.")
+                      _ <- backfillApprovals(cfg, terminal, shown)
                       _ <- loop(cfg, terminal, reader, queue, lastWasEof = false)
                     } yield ()
                   }
@@ -515,9 +519,10 @@ object Main extends ZIOAppDefault {
 
   /** Subscribe to person-service's approval stream and surface `requested`
    *  prompts to the user. `executed` arrives separately as a normal continuation
-   *  turn over the mycroft SSE, so it isn't printed here. */
-  private def streamApprovals(cfg: Cfg, terminal: Terminal): Task[Unit] =
-    ZIO.acquireReleaseWith(openApprovalStream(cfg))(closeQuietly)(consumeApprovals(_, terminal))
+   *  turn over the mycroft SSE, so it isn't printed here. `shown` dedups against
+   *  approvals already rendered by the reconnect backfill. */
+  private def streamApprovals(cfg: Cfg, terminal: Terminal, shown: java.util.Set[String]): Task[Unit] =
+    ZIO.acquireReleaseWith(openApprovalStream(cfg))(closeQuietly)(consumeApprovals(_, terminal, shown))
       .retry(Schedule.spaced(2.seconds) && Schedule.recurs(30))
       .unit
 
@@ -530,7 +535,7 @@ object Main extends ZIOAppDefault {
       client.send(req, HttpResponse.BodyHandlers.ofInputStream()).body()
     }
 
-  private def consumeApprovals(is: InputStream, terminal: Terminal): Task[Unit] =
+  private def consumeApprovals(is: InputStream, terminal: Terminal, shown: java.util.Set[String]): Task[Unit] =
     ZIO.attemptBlockingCancelable {
       val reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))
       var line   = reader.readLine()
@@ -540,21 +545,11 @@ object Main extends ZIOAppDefault {
           data.fromJson[ApprovalEvent].toOption.foreach { ev =>
             val a = ev.approval
             val msg = ev.kind match {
-              case "requested" =>
-                val prov = a.source.map(s => s"  (from $s)").getOrElse("")
-                // Options (if any) are authored + labelled by the trusted core, never
-                // the agent. Render them as a numbered menu the human picks from.
-                val opts = a.optionsJson.toList.flatMap(parseOptionLabels)
-                val menu =
-                  if (opts.isEmpty) ""
-                  else "\n   choose: " + opts.zipWithIndex
-                    .map { case ((_, label), i) => s"[${i + 1}] $label" }.mkString("   ")
-                val approveHint =
-                  if (opts.nonEmpty) s"/approve ${a.id.value} <n>" else s"/approve ${a.id.value}"
-                Some(s"\n⚖  Approval needed [${a.id.value}]: ${a.actionType}$prov  ${a.payloadJson}$menu\n" +
-                  s"   $approveHint   |   /reject ${a.id.value} [reason]")
-              case "rejected" => Some(s"\n✗  Approval ${a.id.value} rejected.")
-              case _          => None // `executed` shows up as a continuation turn
+              // shown.add is false if the backfill already rendered this id — skip it.
+              case "requested" if shown.add(a.id.value) => Some(renderRequested(a))
+              case "requested"                          => None
+              case "rejected"                           => Some(s"\n✗  Approval ${a.id.value} rejected.")
+              case _                                    => None // `executed` shows up as a continuation turn
             }
             msg.foreach { m => terminal.writer().println(m); terminal.flush() }
           }
@@ -562,6 +557,49 @@ object Main extends ZIOAppDefault {
         line = reader.readLine()
       }
     }(closeQuietly(is))
+
+  /** Render a `requested` approval as the user-facing prompt. Options (if any) are
+   *  authored + labelled by the trusted core, never the agent — shown as a numbered
+   *  menu the human picks from. Shared by the live stream and the reconnect backfill. */
+  private def renderRequested(a: Approval): String = {
+    val prov = a.source.map(s => s"  (from $s)").getOrElse("")
+    val opts = a.optionsJson.toList.flatMap(parseOptionLabels)
+    val menu =
+      if (opts.isEmpty) ""
+      else "\n   choose: " + opts.zipWithIndex
+        .map { case ((_, label), i) => s"[${i + 1}] $label" }.mkString("   ")
+    val approveHint =
+      if (opts.nonEmpty) s"/approve ${a.id.value} <n>" else s"/approve ${a.id.value}"
+    s"\n⚖  Approval needed [${a.id.value}]: ${a.actionType}$prov  ${a.payloadJson}$menu\n" +
+      s"   $approveHint   |   /reject ${a.id.value} [reason]"
+  }
+
+  /** Does this approval's payload carry a calendar-clash warning? Such items lead
+   *  the backfill so a conflict is the first thing the returning user sees. */
+  private def isConflict(a: Approval): Boolean =
+    a.payloadJson.contains("⚠") || a.payloadJson.toLowerCase.contains("clashes")
+
+  /** On (re)connect, render approvals already awaiting this person — the live stream
+   *  only carries events from the moment of subscription, so without this a batch
+   *  fired while we were away would be invisible. Conflicts first; dedup via `shown`
+   *  so the live stream doesn't re-render them. Best-effort: failures are silent. */
+  private def backfillApprovals(cfg: Cfg, terminal: Terminal, shown: java.util.Set[String]): Task[Unit] =
+    httpGet(cfg.personServiceUrl + "/approvals?status=requested").foldZIO(
+      _ => ZIO.unit,
+      body =>
+        body.fromJson[List[Approval]] match {
+          case Left(_) => ZIO.unit
+          case Right(all) =>
+            // GET /approvals has no person filter; mirror the stream's: untargeted
+            // approvals, or those this person must decide.
+            val mine    = all.filter(a => a.requiredPersonId.forall(_.value == cfg.as))
+            val pending = mine.sortBy(a => if (isConflict(a)) 0 else 1).filter(a => shown.add(a.id.value))
+            ZIO.when(pending.nonEmpty) {
+              printLine(terminal, s"\n↺  ${pending.size} approval(s) awaiting your decision:") *>
+                ZIO.foreachDiscard(pending)(a => printLine(terminal, renderRequested(a)))
+            }.unit
+        }
+    )
 
   /** The human's decision goes straight to person-service. On approve, the action
    *  executes server-side and mycroft fires the continuation — which we render by

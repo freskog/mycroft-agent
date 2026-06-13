@@ -9,6 +9,14 @@ FROM ghcr.io/graalvm/native-image-community:21-ol9 AS base
 # can run sbt and arbitrary commands.
 ENTRYPOINT []
 
+# UTF-8 locale in the BUILDER. GraalVM bakes `sun.jnu.encoding`/`file.encoding`
+# into the native binary from the build-time locale (it is NOT re-read from the
+# runtime LANG). Building under POSIX/ASCII bakes ASCII, so mycroft mangles
+# non-ASCII child-process args (€, —, emoji) to `?` when it spawns `person …`.
+# C.UTF-8 ships with OL9's glibc.
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
 # Tell sbt-native-image to use the GraalVM already present in this image
 # (JAVA_HOME points at GraalVM) instead of downloading one via coursier.
 ENV NATIVE_IMAGE_INSTALLED=true
@@ -41,16 +49,15 @@ COPY . .
 RUN sbt \
       "safeRun/nativeImage" \
       "runlog/nativeImage" \
-      "personCli/nativeImage" \
       "personService/nativeImage" \
       "runtime/nativeImage" \
       "mycroft/nativeImage"
 
-# Collect the produced binaries into a single directory.
+# Collect the produced binaries into a single directory. There is no person-cli
+# binary anymore — the `person` verbs are a thin curl/jq script (scripts/person).
 RUN mkdir -p /out && \
     cp modules/safe-run/target/native-image/safe-run         /out/ && \
     cp modules/runlog/target/native-image/runlog             /out/ && \
-    cp modules/person-cli/target/native-image/person-cli     /out/ && \
     cp modules/person-service/target/native-image/person-service /out/ && \
     cp modules/runtime/target/native-image/runtime           /out/ && \
     cp modules/mycroft/target/native-image/mycroft           /out/
@@ -60,22 +67,33 @@ RUN mkdir -p /out && \
 # newer glibc in debian:12-slim, so the binaries run here without a JVM.
 FROM debian:12-slim AS runtime
 
+# UTF-8 locale. Without this the container defaults to POSIX/ASCII, and the GraalVM
+# native binaries encode child-process arguments via `sun.jnu.encoding` (derived
+# from the locale) — so mycroft spawning `person … --body "…€…—…🎂"` would mangle
+# every non-ASCII char to `?`. C.UTF-8 ships with glibc (no locale-gen needed).
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+# curl + jq power the `person` script (the agent's HTTP client to person-service);
+# bash runs it and the skills' shell snippets; python3 backs code-interpreter.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     util-linux \
     bash \
+    curl \
+    jq \
     python3 \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/python3 /usr/local/bin/python
 
 COPY --from=builder /out/ /usr/local/bin/
 
-# Skill docs and the agent-protocol skill reference the dossier names
-# `person` and `skill`. The native binaries are named after their modules
-# (`person-cli`, `runtime`). Symlink so both spellings work and the agent
-# does not waste turns rediscovering the right path.
-RUN ln -s /usr/local/bin/person-cli /usr/local/bin/person && \
-    ln -s /usr/local/bin/runtime    /usr/local/bin/skill
+# The `person` verbs are a thin curl/jq script (no native binary). Ship it as
+# `person` directly. `skill` is still the `runtime` native binary, symlinked so
+# skill docs can use the short name.
+COPY scripts/person /usr/local/bin/person
+RUN chmod +x /usr/local/bin/person && \
+    ln -s /usr/local/bin/runtime /usr/local/bin/skill
 
 WORKDIR /workspace
 
